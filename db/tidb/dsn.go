@@ -24,7 +24,8 @@ var requiredDSNParams = map[string]string{
 //   - 缺 user / 缺库名 → 错误（ARTEX 只连接预建库，绝不隐式建库）；
 //   - 必需参数（parseTime/loc/time_zone/charset）缺失 → 补齐；
 //     已存在但值不同 → 错误，不静默覆盖（用户显式意图冲突必须暴露）；
-//   - 其余用户参数原样保留；
+//   - 其余用户参数原样保留；重复键的多值（如 x=first&x=second）按
+//     url.Values 语义全部保留，不静默丢弃；
 //   - 幂等：对已规范化的 DSN 再次调用返回原串。
 //
 // 纯函数，无 I/O，可被 P01 OpenTiDB 与 P08 config.TiDBDSN 共用。
@@ -33,7 +34,7 @@ var requiredDSNParams = map[string]string{
 // 输出 time_zone='+00:00' 再经 ParseDSN（内部 url.ParseQuery）回读时 '+'
 // 会被解码成空格。本包因此自实现 formatDSN：params 一律用
 // url.Values.Encode 百分号编码（time_zone → time_zone=%27%2B00%3A00%27），
-// 且对 duration 类型参数（如 1µs 格式化为 1us）做 ASCII 兼容处理，
+// 且对 duration 类型参数（如 1µs / 1μs 均格式化为 1us）做 ASCII 兼容处理，
 // 库名保留 url.PathEscape，保证 ParseDSN 往返稳定、幂等成立。
 func NormalizeDSN(dsn string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
@@ -42,27 +43,25 @@ func NormalizeDSN(dsn string) (string, error) {
 	}
 	// go-sql-driver v1.9.3 的 ParseDSN 将已识别参数（parseTime/loc/charset/
 	// timeout/readTimeout 等）消费到 Config 专属字段，未识别参数才写入
-	// cfg.Params，且无 ?params 段时 Params 保持 nil。从原始 DSN 的 query
-	// 段还原用户显式参数，冲突检测与用户参数保留均依赖 cfg.Params。
-	if cfg.Params == nil {
-		cfg.Params = make(map[string]string)
+	// cfg.Params，且无 ?params 段时 Params 保持 nil。因此从原始 DSN 的
+	// query 段用 url.Values 还原用户显式参数：冲突检测、用户参数保留
+	// （含重复键多值）均依赖 params。
+	params, err := explicitParamsValues(dsn)
+	if err != nil {
+		return "", err
 	}
-	if qs := explicitParams(dsn); qs != "" {
-		extra, err := url.ParseQuery(qs)
-		if err != nil {
-			return "", fmt.Errorf("normalize DSN: parse query %q: %w", qs, err)
+	if params == nil {
+		params = url.Values{}
+	}
+	// 强制参数逐项冲突检测：重复键的每一个值都必须与强制值一致。
+	for k, vs := range params {
+		want, isReq := requiredDSNParams[k]
+		if !isReq {
+			continue
 		}
-		for k, vs := range extra {
-			// 对重复参数进行逐项冲突检测
-			if want, isReq := requiredDSNParams[k]; isReq {
-				for _, v := range vs {
-					if v != want {
-						return "", fmt.Errorf("normalize DSN: param %q=%q conflicts with required value %q", k, v, want)
-					}
-				}
-			}
-			if len(vs) > 0 {
-				cfg.Params[k] = vs[len(vs)-1]
+		for _, v := range vs {
+			if v != want {
+				return "", fmt.Errorf("normalize DSN: param %q=%q conflicts with required value %q", k, v, want)
 			}
 		}
 	}
@@ -72,25 +71,20 @@ func NormalizeDSN(dsn string) (string, error) {
 	if cfg.DBName == "" {
 		return "", fmt.Errorf("normalize DSN: missing database name — ARTEX 只连接管理员预建库，不创建数据库")
 	}
+	// 缺失的强制参数补齐；已存在的强制参数已通过冲突检测，原样保留。
 	for key, want := range requiredDSNParams {
-		got, present := cfg.Params[key]
-		if !present {
-			cfg.Params[key] = want
-			continue
-		}
-		if got != want {
-			return "", fmt.Errorf("normalize DSN: param %q=%q conflicts with required value %q", key, got, want)
+		if _, present := params[key]; !present {
+			params[key] = []string{want}
 		}
 	}
-	return formatDSN(cfg), nil
+	return formatDSN(cfg, params), nil
 }
 
-// formatDSN 把 Config 序列化为 go-sql-driver DSN。params 段用
-// url.Values.Encode（键排序、百分号编码）统一编码，保证 ParseDSN 往返稳定。
+// formatDSN 把 Config 与显式参数序列化为 go-sql-driver DSN。params 段用
+// url.Values.Encode（键排序、百分号编码）统一编码，重复键按输入顺序逐一
+// 输出，保证 ParseDSN 往返稳定且不丢弃重复参数。
 // 库名必须进行 url.PathEscape 以防止包含特殊字符截断 query。
-// 对于 duration 类参数，如含非 ASCII 单位 'µs'，转换为 ASCII 单位 'us'
-// 防止 url.QueryEscape 将其转义为 %C2%B5s 导致驱动再次 ParseDSN 时无法识别。
-func formatDSN(cfg *mysql.Config) string {
+func formatDSN(cfg *mysql.Config, params url.Values) string {
 	var sb strings.Builder
 	sb.WriteString(cfg.User)
 	if cfg.Passwd != "" {
@@ -102,28 +96,34 @@ func formatDSN(cfg *mysql.Config) string {
 	}
 	sb.WriteString("/")
 	sb.WriteString(url.PathEscape(cfg.DBName))
-	if len(cfg.Params) > 0 {
-		vals := url.Values{}
-		for k, v := range cfg.Params {
-			vals.Set(k, normalizeDurationParam(k, v))
+	if len(params) > 0 {
+		enc := url.Values{}
+		for k, vs := range params {
+			for _, v := range vs {
+				enc.Add(k, normalizeDurationParam(k, v))
+			}
 		}
-		sb.WriteString("?" + vals.Encode())
+		sb.WriteString("?" + enc.Encode())
 	}
 	return sb.String()
 }
 
-// normalizeDurationParam 将 duration 参数中的微秒字符 'µs' 转换为 'us'。
-// go-sql-driver 的 parseDSNParams 在解析 timeout/readTimeout/writeTimeout/timeTruncate
-// 时直接使用 time.ParseDuration(value)，而 value 来自 url.QueryUnescape 之前未做特殊处理，
-// 如果被 url.Values.Encode 转义为 %C2%B5s，time.ParseDuration 看到的是未解码的 %C 报错。
-// 标准库 time.ParseDuration 原生支持 "us" 作为微秒单位。
+// normalizeDurationParam 将 duration 参数值中的微秒单位规范化为 ASCII "us"。
+// go-sql-driver v1.9.3 的 parseDSNParams 解析 timeout/readTimeout/
+// writeTimeout/timeTruncate 时直接对未解码的原始 value 调 time.ParseDuration
+// （这几个 case 不做 QueryUnescape）；而 url.Values.Encode 会把非 ASCII
+// 微秒符号转义（U+00B5 → %C2%B5、U+03BC → %CE%BC），驱动二次 ParseDSN 时
+// time.ParseDuration 看到未解码的百分号序列即报 unknown unit。
+// time.ParseDuration 原生同时接受 U+00B5 MICRO SIGN 与 U+03BC GREEK SMALL
+// LETTER MU 两种微秒写法，但 Encode 转义后二者均失效，故一并替换为
+// ASCII "us"（stdlib 同样识别）。
 func normalizeDurationParam(key, val string) string {
 	switch key {
 	case "timeout", "readTimeout", "writeTimeout", "timeTruncate":
-		return strings.ReplaceAll(val, "µs", "us")
-	default:
-		return val
+		val = strings.ReplaceAll(val, "\u00b5s", "us") // µs (U+00B5 MICRO SIGN)
+		val = strings.ReplaceAll(val, "\u03bcs", "us") // μs (U+03BC GREEK SMALL LETTER MU)
 	}
+	return val
 }
 
 // explicitParams 返回 DSN 中 '?' 之后的原始 query 段（不含 '?'）。
@@ -140,13 +140,34 @@ func explicitParams(dsn string) string {
 	return ""
 }
 
+// explicitParamsValues 从原始 DSN 的 query 段还原用户显式参数，以
+// url.Values 保留重复键的多值（如 x=first&x=second）。无 ?params 段时
+// 返回 (nil, nil)；query 语法非法（如 Go 1.24+ ParseQuery 拒绝的 ';'
+// 分隔符）时 Fail Closed 返回错误。
+func explicitParamsValues(dsn string) (url.Values, error) {
+	qs := explicitParams(dsn)
+	if qs == "" {
+		return nil, nil
+	}
+	params, err := url.ParseQuery(qs)
+	if err != nil {
+		return nil, fmt.Errorf("parse DSN query %q: %w", qs, err)
+	}
+	return params, nil
+}
+
 // RedactDSN 返回脱敏 DSN（密码替换为 ****），供启动日志使用。
 // 解析失败时返回 "***unparseable-dsn***" 而不是原串，避免凭据泄漏。
+// 用户显式参数（含重复多值）经 explicitParamsValues 还原后原样保留。
 func RedactDSN(dsn string) string {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "***unparseable-dsn***"
 	}
 	cfg.Passwd = "****"
-	return formatDSN(cfg)
+	params, err := explicitParamsValues(dsn)
+	if err != nil {
+		params = url.Values{}
+	}
+	return formatDSN(cfg, params)
 }

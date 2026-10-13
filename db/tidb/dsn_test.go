@@ -3,6 +3,7 @@ package tidb_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db/tidb"
 	"github.com/go-sql-driver/mysql"
@@ -178,6 +179,98 @@ func TestNormalizeDSN_DurationRoundTrip(t *testing.T) {
 	}
 	if cfg.ReadTimeout != 100*1000*1000 {
 		t.Fatalf("cfg.ReadTimeout = %v, want 100ms", cfg.ReadTimeout)
+	}
+}
+
+// 第 2 轮修复 1：U+03BC GREEK SMALL LETTER MU 微秒单位回读兼容与幂等
+func TestNormalizeDSN_GreekMuDurationRoundTrip(t *testing.T) {
+	// \u03bc 是希腊小写字母 mu（U+03BC），与 \u00b5 MICRO SIGN（U+00B5）
+	// 同为 time.ParseDuration 合法写法；修复前仅替换 U+00B5，U+03BC 会被
+	// Encode 转义为 %CE%BC，驱动二次 ParseDSN 报 unknown unit "%CE%BCs"。
+	raw := "app:secret@tcp(127.0.0.1:4000)/artex_db?timeout=1\u03bcs&writeTimeout=2\u03bcs&timeTruncate=100\u03bcs"
+	norm, err := tidb.NormalizeDSN(raw)
+	if err != nil {
+		t.Fatalf("NormalizeDSN error: %v", err)
+	}
+	// 输出不得残留任何非 ASCII 微秒写法（含百分号转义形式）
+	for _, residue := range []string{"%CE%BC", "%C2%B5", "\u03bc", "\u00b5"} {
+		if strings.Contains(norm, residue) {
+			t.Fatalf("non-ASCII microsecond unit %q survived: %q", residue, norm)
+		}
+	}
+	if !strings.Contains(norm, "timeout=1us") {
+		t.Fatalf("expected timeout=1us in %q", norm)
+	}
+	if !strings.Contains(norm, "writeTimeout=2us") {
+		t.Fatalf("expected writeTimeout=2us in %q", norm)
+	}
+
+	// 再次 NormalizeDSN 保持完全幂等
+	norm2, err := tidb.NormalizeDSN(norm)
+	if err != nil {
+		t.Fatalf("idempotent pass error: %v", err)
+	}
+	if norm != norm2 {
+		t.Fatalf("not idempotent:\n1st: %s\n2nd: %s", norm, norm2)
+	}
+
+	// 驱动可以正常 ParseDSN 回读
+	cfg, err := mysql.ParseDSN(norm)
+	if err != nil {
+		t.Fatalf("mysql.ParseDSN failed on normalized DSN: %v", err)
+	}
+	if cfg.Timeout != time.Microsecond {
+		t.Fatalf("cfg.Timeout = %v, want 1us", cfg.Timeout)
+	}
+	if cfg.WriteTimeout != 2*time.Microsecond {
+		t.Fatalf("cfg.WriteTimeout = %v, want 2us", cfg.WriteTimeout)
+	}
+}
+
+// 第 2 轮修复 2：重复附加参数多值保留（url.Values 语义，不静默覆盖）
+func TestNormalizeDSN_PreservesMultiValueParams(t *testing.T) {
+	raw := "app:secret@tcp(127.0.0.1:4000)/artex_db?x=first&x=second&y=only"
+	norm, err := tidb.NormalizeDSN(raw)
+	if err != nil {
+		t.Fatalf("NormalizeDSN error: %v", err)
+	}
+	// 两个重复值必须都保留，且保持输入顺序
+	i1 := strings.Index(norm, "x=first")
+	if i1 < 0 {
+		t.Fatalf("first duplicate value lost: %q", norm)
+	}
+	if i2 := strings.Index(norm, "x=second"); i2 < 0 || i1 > i2 {
+		t.Fatalf("second duplicate value lost or order changed: %q", norm)
+	}
+	if !strings.Contains(norm, "y=only") {
+		t.Fatalf("single-value param lost: %q", norm)
+	}
+
+	// 再次 NormalizeDSN 保持完全幂等
+	norm2, err := tidb.NormalizeDSN(norm)
+	if err != nil {
+		t.Fatalf("idempotent pass error: %v", err)
+	}
+	if norm != norm2 {
+		t.Fatalf("not idempotent:\n1st: %s\n2nd: %s", norm, norm2)
+	}
+
+	// 驱动回读不报错；未识别参数按驱动自身语义取末值
+	cfg, err := mysql.ParseDSN(norm)
+	if err != nil {
+		t.Fatalf("mysql.ParseDSN failed on normalized DSN: %v", err)
+	}
+	if got := cfg.Params["x"]; got != "second" {
+		t.Fatalf("cfg.Params[x] = %q, want second (driver last-wins)", got)
+	}
+
+	// 重复强制参数（全部匹配）同样保留多值
+	dup, err := tidb.NormalizeDSN("app:secret@tcp(127.0.0.1:4000)/artex_db?parseTime=true&parseTime=true")
+	if err != nil {
+		t.Fatalf("NormalizeDSN duplicate required param error: %v", err)
+	}
+	if !strings.Contains(dup, "parseTime=true&parseTime=true") {
+		t.Fatalf("duplicate required param values not preserved: %q", dup)
 	}
 }
 
