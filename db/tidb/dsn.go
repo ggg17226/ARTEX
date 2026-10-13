@@ -9,10 +9,13 @@ import (
 )
 
 // requiredDSNParams 是 spec L83「DSN 每物理连接 UTC」的强制参数集合。
+// 注意：go-sql-driver 执行连接初始化时，对于 params["time_zone"] 会直接
+// 拼入 "SET time_zone = " + val。为保证符合 SQL 语法，值必须用单引号包裹：
+// 即 `'+00:00'`。
 var requiredDSNParams = map[string]string{
 	"parseTime": "true",
 	"loc":       "UTC",
-	"time_zone": "+00:00",
+	"time_zone": "'+00:00'",
 	"charset":   "utf8mb4",
 }
 
@@ -27,10 +30,11 @@ var requiredDSNParams = map[string]string{
 // 纯函数，无 I/O，可被 P01 OpenTiDB 与 P08 config.TiDBDSN 共用。
 //
 // 序列化说明：go-sql-driver 的 Config.FormatDSN 不 URL 编码 params，
-// 输出 time_zone=+00:00 再经 ParseDSN（内部 url.ParseQuery）回读时 '+'
+// 输出 time_zone='+00:00' 再经 ParseDSN（内部 url.ParseQuery）回读时 '+'
 // 会被解码成空格。本包因此自实现 formatDSN：params 一律用
-// url.Values.Encode 百分号编码（time_zone → time_zone=%2B00%3A00），
-// 保证 ParseDSN 往返稳定、幂等成立。
+// url.Values.Encode 百分号编码（time_zone → time_zone=%27%2B00%3A00%27），
+// 且对 duration 类型参数（如 1µs 格式化为 1us）做 ASCII 兼容处理，
+// 库名保留 url.PathEscape，保证 ParseDSN 往返稳定、幂等成立。
 func NormalizeDSN(dsn string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
@@ -44,11 +48,21 @@ func NormalizeDSN(dsn string) (string, error) {
 		cfg.Params = make(map[string]string)
 	}
 	if qs := explicitParams(dsn); qs != "" {
-		if extra, err := url.ParseQuery(qs); err == nil {
-			for k, vs := range extra {
-				if len(vs) > 0 {
-					cfg.Params[k] = vs[len(vs)-1]
+		extra, err := url.ParseQuery(qs)
+		if err != nil {
+			return "", fmt.Errorf("normalize DSN: parse query %q: %w", qs, err)
+		}
+		for k, vs := range extra {
+			// 对重复参数进行逐项冲突检测
+			if want, isReq := requiredDSNParams[k]; isReq {
+				for _, v := range vs {
+					if v != want {
+						return "", fmt.Errorf("normalize DSN: param %q=%q conflicts with required value %q", k, v, want)
+					}
 				}
+			}
+			if len(vs) > 0 {
+				cfg.Params[k] = vs[len(vs)-1]
 			}
 		}
 	}
@@ -73,6 +87,9 @@ func NormalizeDSN(dsn string) (string, error) {
 
 // formatDSN 把 Config 序列化为 go-sql-driver DSN。params 段用
 // url.Values.Encode（键排序、百分号编码）统一编码，保证 ParseDSN 往返稳定。
+// 库名必须进行 url.PathEscape 以防止包含特殊字符截断 query。
+// 对于 duration 类参数，如含非 ASCII 单位 'µs'，转换为 ASCII 单位 'us'
+// 防止 url.QueryEscape 将其转义为 %C2%B5s 导致驱动再次 ParseDSN 时无法识别。
 func formatDSN(cfg *mysql.Config) string {
 	var sb strings.Builder
 	sb.WriteString(cfg.User)
@@ -84,15 +101,29 @@ func formatDSN(cfg *mysql.Config) string {
 		sb.WriteString(cfg.Net + "(" + cfg.Addr + ")")
 	}
 	sb.WriteString("/")
-	sb.WriteString(cfg.DBName)
+	sb.WriteString(url.PathEscape(cfg.DBName))
 	if len(cfg.Params) > 0 {
 		vals := url.Values{}
 		for k, v := range cfg.Params {
-			vals.Set(k, v)
+			vals.Set(k, normalizeDurationParam(k, v))
 		}
 		sb.WriteString("?" + vals.Encode())
 	}
 	return sb.String()
+}
+
+// normalizeDurationParam 将 duration 参数中的微秒字符 'µs' 转换为 'us'。
+// go-sql-driver 的 parseDSNParams 在解析 timeout/readTimeout/writeTimeout/timeTruncate
+// 时直接使用 time.ParseDuration(value)，而 value 来自 url.QueryUnescape 之前未做特殊处理，
+// 如果被 url.Values.Encode 转义为 %C2%B5s，time.ParseDuration 看到的是未解码的 %C 报错。
+// 标准库 time.ParseDuration 原生支持 "us" 作为微秒单位。
+func normalizeDurationParam(key, val string) string {
+	switch key {
+	case "timeout", "readTimeout", "writeTimeout", "timeTruncate":
+		return strings.ReplaceAll(val, "µs", "us")
+	default:
+		return val
+	}
 }
 
 // explicitParams 返回 DSN 中 '?' 之后的原始 query 段（不含 '?'）。
