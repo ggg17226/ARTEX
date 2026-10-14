@@ -78,8 +78,9 @@ func AcquireMaintenance(ctx context.Context, db *sql.DB, opID string) error {
 	if err != nil {
 		return fmt.Errorf("acquire maintenance: %w", err)
 	}
-	// Fail closed：单例行缺失（表在但行不在）时条件 UPDATE 恒 0 行，若不前置
-	// 探测会陷入无限退避空转；首次查询即判定并返回 ErrMaintenanceRowMissing。
+	// Fail closed：单例行缺失（表在但行不在）时条件 UPDATE 恒 0 行，若不探测
+	// 会陷入无限退避空转；进入循环前探测覆盖「抢锁前已缺失」，循环内每次
+	// 0 行再探测覆盖「等待/退避期间被并发删除」，均返回 ErrMaintenanceRowMissing。
 	var one int
 	if err := db.QueryRowContext(ctx, `
 SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err != nil {
@@ -105,6 +106,21 @@ WHERE singleton_key = 'maintenance' AND op_id IS NULL`, op)
 		}
 		if n, _ := res.RowsAffected(); n == 1 {
 			return nil
+		}
+		// 0 行：快速轻量探测区分两种原因——
+		// 行在但 op_id 非空（被其他 owner 占用）→ 继续指数退避重试；
+		// 行在等待/退避期间被并发删除（sql.ErrNoRows / 1146）→ fail closed
+		// 立即返回 ErrMaintenanceRowMissing，终止重试，避免空转直到 ctx 超时。
+		var one int
+		if err := db.QueryRowContext(ctx, `
+SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
+				return ErrMaintenanceRowMissing
+			}
+			return fmt.Errorf("acquire maintenance: %w", err)
 		}
 		// 被占：退避后重试。递增退避 100ms→250ms→500ms→1s（封顶，见 lockBackoff），
 		// 退避用可取消的 timer，ctx 截止立即返回。

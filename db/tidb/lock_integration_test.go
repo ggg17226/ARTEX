@@ -228,6 +228,70 @@ VALUES ('maintenance', NULL, 0, 0, NOW(3))`)
 	_ = tx.Rollback()
 }
 
+// TestAcquireMaintenance_RowDeletedDuringBackoff_Real：A 持锁期间 B 抢锁进入
+// 退避重试，退避窗口内单例行被并发删除——B 必须在下次 0 行尝试时探测到缺行
+// 并 fail closed 返回 ErrMaintenanceRowMissing，而不是无限退避直到 ctx 超时
+// 误报 DeadlineExceeded（回归：循环内缺行探测）。
+func TestAcquireMaintenance_RowDeletedDuringBackoff_Real(t *testing.T) {
+	dsn := requireTiDB(t)
+	db, _, err := tidb.OpenTiDB(dsn)
+	if err != nil {
+		t.Fatalf("OpenTiDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
+	if err := tidb.EnsureLockInfrastructure(ctx, db); err != nil {
+		t.Fatalf("EnsureLockInfrastructure: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE maintenance SET op_id=NULL WHERE singleton_key='maintenance'"); err != nil {
+		t.Fatalf("reset op_id: %v", err)
+	}
+	const opIDA = "d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6"
+	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
+		t.Fatalf("acquire A: %v", err)
+	}
+	t.Cleanup(func() { _, _ = tidb.ReleaseMaintenance(ctx, db, opIDA) })
+	// 还原单例行（LIFO：先于 release A 与 db.Close 执行，以 op_id=NULL 新行
+	// 重建基础设施，等效于同时清掉 A 的残留持有）
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(ctx, `
+INSERT INTO maintenance (singleton_key, op_id, mode, revision, updated_at)
+VALUES ('maintenance', NULL, 0, 0, NOW(3))`)
+	})
+
+	// B 以 3s 截止抢锁：A 持锁使其 UPDATE 恒 0 行，进入退避重试
+	type bres struct {
+		err  error
+		took time.Duration
+	}
+	resCh := make(chan bres, 1)
+	go func() {
+		ctxB, cancelB := context.WithTimeout(ctx, 3*time.Second)
+		defer cancelB()
+		start := time.Now()
+		errB := tidb.AcquireMaintenance(ctxB, db, "e1e2e3e4e5e6e7e8e9f0f1f2f3f4f5f6")
+		resCh <- bres{err: errB, took: time.Since(start)}
+	}()
+
+	// 等 B 完成首次尝试并进入退避窗口后再删行，确保命中「退避期间删行」路径
+	time.Sleep(200 * time.Millisecond)
+	if _, err := db.ExecContext(ctx, `
+DELETE FROM maintenance WHERE singleton_key = 'maintenance'`); err != nil {
+		t.Fatalf("delete singleton row: %v", err)
+	}
+
+	res := <-resCh
+	if !errors.Is(res.err, tidb.ErrMaintenanceRowMissing) {
+		t.Fatalf("B acquire after row deleted = %v, want ErrMaintenanceRowMissing", res.err)
+	}
+	if errors.Is(res.err, context.DeadlineExceeded) {
+		t.Fatalf("B acquire after row deleted returned ctx deadline (%v), want fail-closed ErrMaintenanceRowMissing", res.err)
+	}
+	if res.took >= 2*time.Second {
+		t.Errorf("B fail-closed took %v, want < 2s (no backoff spin)", res.took)
+	}
+}
+
 // TestCoordinateMaintenance_LockedByOpID_Real：互斥完整性——A 经
 // AcquireMaintenance 持锁（autocommit 已释放行锁，但 op_id 仍非空）后，
 // B 事务的 CoordinateMaintenance 必须返回 ErrMaintenanceLocked，
