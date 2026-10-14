@@ -242,10 +242,11 @@ func BaselineTables() []*Table {
 			IX("uq_settings_key_hash", true, P("key_hash")),
 		}),
 
-		// 12. llm_profiles（one-default 部分唯一 → 生成列 is_default_key）
+		// 12. llm_profiles（one-default 部分唯一 → 生成列 is_default_key；name hash 唯一）
 		T("llm_profiles", "id", true, []Column{
 			CPK("id"),
 			TextNN("name"),
+			BinN("name_hash", 32),
 			TextNN("format"),
 			Text("base_url"),
 			Text("proxy"),
@@ -274,7 +275,7 @@ func BaselineTables() []*Table {
 			DateN("created_at"),
 			DateNOU("updated_at"),
 		}, []Index{
-			IX("uq_llm_profiles_name", true, PP("name", 191)),
+			IX("uq_llm_profiles_name_hash", true, P("name_hash")),
 			IX("uq_llm_one_default", true, P("is_default_key")),
 		}),
 

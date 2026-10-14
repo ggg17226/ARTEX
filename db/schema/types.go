@@ -139,7 +139,7 @@ func IndexBytes(t *Table, ix Index) int {
 // Validate performs the structural self-check of one declarative table:
 // PK 列存在且为 BIGINT UNSIGNED；至多 1 个 AUTO_INCREMENT 且必须是 PK 列
 // (一表两列 AUTO_INCREMENT 实测报 1075，§11.1)；列名/索引名不重复；索引 part 可解析；
-// 索引不得含 PK 列（物理 PK 单列独立）。
+// 仅禁止单列且完全由物理 PK 构成的二级索引；复合索引允许包含 PK 列（TiDB 8.5 聚簇二级索引显式含 PK 列时不重复附加 handle，非唯一索引零冗余）。
 func (t *Table) Validate() error {
 	var foundPK bool
 	for i := range t.Columns {
@@ -188,7 +188,7 @@ func (t *Table) Validate() error {
 		seenIdx[ix.Name] = true
 		// TiDB 8.5 默认聚簇表的非唯一二级索引显式包含 PK 列时物理不再重复附加 handle（非唯一索引零冗余，DESC 尾缀表达混合方向排序语义），故允许复合索引包含 PK 列；仅禁止单列索引与 PK 完全重复。
 		if len(ix.Parts) == 1 && ix.Parts[0].Column == t.PKColumn {
-			return fmt.Errorf("table %s: index %s must not contain the primary key column", t.Name, ix.Name)
+			return fmt.Errorf("table %s: index %s must not duplicate the primary key column", t.Name, ix.Name)
 		}
 		for _, p := range ix.Parts {
 			for i := range t.Columns {

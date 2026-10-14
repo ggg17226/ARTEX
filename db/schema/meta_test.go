@@ -88,7 +88,7 @@ func TestTableValidate(t *testing.T) {
 		{"dup column", T("t", "id", true, []Column{CPK("id"), CRefN("a"), CRefN("a")}, nil), "duplicate column"},
 		{"dup index", T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("u", true, P("a")), IX("u", true, P("a"))}), "duplicate index name"},
 		{"text full index", T("t", "id", true, []Column{CPK("id"), Text("note")}, []Index{IX("u", true, P("note"))}), "unbounded"},
-		{"index on pk", T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("u", true, P("id"))}), "primary key column"},
+		{"index on pk", T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("u", true, P("id"))}), "duplicate the primary key column"},
 		{"blob without prefix", T("t", "id", true, []Column{CPK("id"), Blob("payload")}, []Index{IX("ix_blob", false, P("payload"))}), "requires prefix length"},
 		{"blob prefix 3073 exceeds limit", T("t", "id", true, []Column{CPK("id"), Blob("payload")}, []Index{IX("ix_blob", false, PP("payload", 3073))}), "exceeds TiDB limit 3072"},
 	}
@@ -100,6 +100,100 @@ func TestTableValidate(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), c.wantErr) {
 			t.Errorf("%s: error %q, want containing %q", c.name, err, c.wantErr)
+		}
+	}
+
+	// M2: 收窄规则边界回归测试
+	// 负例：单列纯 PK 索引（无论唯一性、无论 ASC/DESC）均拒绝
+	negCases := []struct {
+		name    string
+		tbl     *Table
+		wantErr string
+	}{
+		{
+			name:    "single non-unique pk asc",
+			tbl:     T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("ix_id", false, P("id"))}),
+			wantErr: "duplicate the primary key column",
+		},
+		{
+			name:    "single non-unique pk desc",
+			tbl:     T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("ix_id_desc", false, PD("id"))}),
+			wantErr: "duplicate the primary key column",
+		},
+		{
+			name:    "single unique pk desc",
+			tbl:     T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("uq_id_desc", true, PD("id"))}),
+			wantErr: "duplicate the primary key column",
+		},
+	}
+	for _, c := range negCases {
+		err := c.tbl.Validate()
+		if err == nil {
+			t.Errorf("neg %s: expected error, got nil", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantErr) {
+			t.Errorf("neg %s: error %q, want containing %q", c.name, err, c.wantErr)
+		}
+	}
+
+	// 正例：复合索引包含 PK 列（PK 首位、尾位、唯一复合、非唯一复合、PK 尾位 DESC）均被接受
+	posCases := []struct {
+		name string
+		tbl  *Table
+	}{
+		{
+			name: "composite pk head unique",
+			tbl:  T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("uq_id_a", true, P("id"), P("a"))}),
+		},
+		{
+			name: "composite pk head non-unique",
+			tbl:  T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("ix_id_a", false, P("id"), P("a"))}),
+		},
+		{
+			name: "composite pk tail unique",
+			tbl:  T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("uq_a_id", true, P("a"), P("id"))}),
+		},
+		{
+			name: "composite pk tail non-unique",
+			tbl:  T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("ix_a_id", false, P("a"), P("id"))}),
+		},
+		{
+			name: "composite pk tail desc",
+			tbl:  T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("ix_a_id_desc", false, P("a"), PD("id"))}),
+		},
+	}
+	for _, c := range posCases {
+		if err := c.tbl.Validate(); err != nil {
+			t.Errorf("pos %s: unexpected error: %v", c.name, err)
+		}
+	}
+
+	// 断言复合索引含 PK 时原有检查仍执行：unbounded TEXT part 仍报错、3072 字节预算仍生效
+	compositeCheckCases := []struct {
+		name    string
+		tbl     *Table
+		wantErr string
+	}{
+		{
+			name:    "composite with pk and unbounded text",
+			tbl:     T("t", "id", true, []Column{CPK("id"), Text("note")}, []Index{IX("ix_pk_text", false, P("id"), P("note"))}),
+			wantErr: "unbounded",
+		},
+		{
+			name:    "composite with pk and blob exceeding 3072 limit",
+			tbl:     T("t", "id", true, []Column{CPK("id"), Blob("payload")}, []Index{IX("ix_pk_blob", false, P("id"), PP("payload", 3072))}),
+			wantErr: "exceeds TiDB limit 3072",
+		},
+	}
+	for _, c := range compositeCheckCases {
+		err := c.tbl.Validate()
+		if err == nil {
+			t.Errorf("composite-check %s: expected error, got nil", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantErr) {
+			t.Errorf("composite-check %s: error %q, want containing %q", c.name, err, c.wantErr)
 		}
 	}
 }
