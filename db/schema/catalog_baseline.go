@@ -211,11 +211,11 @@ func BaselineTables() []*Table {
 			Int("main_seg"),
 			DateN("created_at"),
 		}, []Index{
-			IX("idx_act_node", false, P("exploration_id"), P("node_id")),
-			IX("idx_act_since", false, P("exploration_id")),
-			IX("idx_act_tool_call", false, P("exploration_id"), PP("tool_use_id", 64)),
-			IX("idx_act_worker", false, P("exploration_id"), PP("worker", 32)),
-			IX("idx_act_main_seg", false, P("exploration_id"), P("main_seg")),
+			IX("idx_act_node", false, P("exploration_id"), P("node_id"), P("id")),
+			IX("idx_act_since", false, P("exploration_id"), P("id")),
+			IX("idx_act_tool_call", false, P("exploration_id"), PP("tool_use_id", 64), P("id")),
+			IX("idx_act_worker", false, P("exploration_id"), PP("worker", 32), P("id")),
+			IX("idx_act_main_seg", false, P("exploration_id"), P("main_seg"), P("id")),
 			IX("idx_act_result_usage", false, P("exploration_id"), P("input_tokens"), P("output_tokens"), P("cache_read_tokens"), P("cache_write_tokens")),
 			IX("idx_act_latest", false, P("exploration_id"), PD("created_at")),
 		}),
@@ -299,7 +299,7 @@ func BaselineTables() []*Table {
 			DateNOU("updated_at"),
 		}, []Index{
 			IX("uq_task_categories_nkey_hash", true, P("nkey_hash")),
-			IX("idx_task_categories_name", false, PP("name", 64)),
+			IX("idx_task_categories_name", false, PP("name", 64), P("id")),
 		}),
 
 		// 15. tasks
@@ -372,8 +372,8 @@ func BaselineTables() []*Table {
 			DateNOU("updated_at"),
 		}, []Index{
 			IX("uq_task_archives_task_id", true, P("task_id")),
-			IX("idx_task_archives_state", false, PP("state", 32), P("requested_at")),
-			IX("idx_task_archives_archived", false, PD("archived_at")),
+			IX("idx_task_archives_state", false, PP("state", 32), P("requested_at"), P("id")),
+			IX("idx_task_archives_archived", false, PD("archived_at"), PD("id")),
 		}),
 
 		// 17. task_templates（nkey hash DDL）
@@ -391,7 +391,7 @@ func BaselineTables() []*Table {
 			DateNOU("updated_at"),
 		}, []Index{
 			IX("uq_task_templates_nkey_hash", true, P("nkey_hash")),
-			IX("idx_task_templates_updated", false, PD("updated_at")),
+			IX("idx_task_templates_updated", false, PD("updated_at"), PD("id")),
 		}),
 
 		// 18. task_relations（原复合 PK → 隐藏 row_id）
@@ -661,8 +661,8 @@ func BaselineTables() []*Table {
 			Int("cache_write_tokens"),
 			DateN("created_at"),
 		}, []Index{
-			IX("idx_conv_act", false, P("conversation_id")),
-			IX("idx_conv_act_tool_call", false, P("conversation_id"), PP("tool_use_id", 64)),
+			IX("idx_conv_act", false, P("conversation_id"), P("id")),
+			IX("idx_conv_act_tool_call", false, P("conversation_id"), PP("tool_use_id", 64), P("id")),
 		}),
 
 		// 34. agent_triggers
@@ -781,7 +781,7 @@ func BaselineTables() []*Table {
 		}, []Index{
 			IX("uq_finding_retests_conversation", true, P("conversation_id")),
 			IX("uq_finding_retests_active", true, P("active_finding_id")),
-			IX("idx_finding_retests_history", false, P("finding_id")),
+			IX("idx_finding_retests_history", false, P("finding_id"), PD("id")),
 		}),
 
 		// 40. traffic_evidence_snapshots（原 TEXT PK → 隐藏 row_id；id CHAR(64) ascii_bin UNIQUE）
@@ -817,7 +817,7 @@ func BaselineTables() []*Table {
 			DateN("created_at"),
 		}, []Index{
 			IX("uq_finding_traffic_bindings", true, P("finding_id"), P("snapshot_id")),
-			IX("idx_finding_traffic_order", false, P("finding_id"), P("position")),
+			IX("idx_finding_traffic_order", false, P("finding_id"), P("position"), P("id")),
 			IX("idx_finding_traffic_snapshot", false, P("snapshot_id")),
 		}),
 
@@ -936,7 +936,7 @@ func BaselineTables() []*Table {
 			BoolN("fanned_out", false),
 			DateN("created_at"),
 		}, []Index{
-			IX("idx_notification_events_pending", false, P("fanned_out")),
+			IX("idx_notification_events_pending", false, P("fanned_out"), P("id")),
 		}),
 
 		// 49. notification_deliveries
@@ -954,7 +954,7 @@ func BaselineTables() []*Table {
 		}, []Index{
 			IX("idx_notification_deliveries_due", false, PP("state", 16), P("next_attempt_at")),
 			IX("idx_notification_deliveries_batch", false, P("batch_id")),
-			IX("idx_notification_deliveries_channel", false, P("channel_id")),
+			IX("idx_notification_deliveries_channel", false, P("channel_id"), PD("id")),
 		}),
 	}
 }
