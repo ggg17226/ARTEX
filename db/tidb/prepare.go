@@ -12,6 +12,7 @@ import (
 // P02 是全库 65 表 DDL 的唯一真实来源）：
 //   - schema_meta: row_id / key VARCHAR(64) UNIQUE / value BIGINT / updated_at（key='schema_version' 行存版本戳）
 //   - locks:       row_id / name VARCHAR(64) UNIQUE（'business_relations' 为基础设施命名行）
+//
 // 注意：`key` 是 MySQL 保留字，DDL 与所有 SQL 中一律用反引号包裹该列名。
 const (
 	schemaMetaDDL = `
@@ -53,7 +54,7 @@ func ExecutePrepare(db *sql.DB) error {
 	}
 	// 两条基础设施 seed（与 P02 `schema.PrepareInfraSQL()` 同构；DSN 强制会话 UTC，NOW(3) 即 UTC）
 	if _, err := db.ExecContext(ctx, `
-INSERT IGNORE INTO schema_meta (` + "`key`" + `, ` + "`value`" + `, updated_at)
+INSERT IGNORE INTO schema_meta (`+"`key`"+`, `+"`value`"+`, updated_at)
 VALUES ('schema_version', 0, NOW(3))`); err != nil {
 		return fmt.Errorf("seed schema_meta: %w", err)
 	}
