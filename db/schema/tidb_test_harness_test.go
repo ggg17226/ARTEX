@@ -23,10 +23,11 @@ import (
 //     对象清理先于连接关闭；错误不吞；支持幂等多次调用，已删除的不再重复删。
 //  4. ApplyIdempotentDDL: 使用原 ApplyDDL 执行，仅允许作用于本次 owned 的 65 张表。
 type tidbTestHarness struct {
-	db          *sql.DB
-	mu          sync.Mutex
-	ownedTables []string
-	cleaned     bool
+	db           *sql.DB
+	mu           sync.Mutex
+	ownedTables  []string
+	guardsPassed bool
+	cleaned      bool
 }
 
 // newTiDBTestHarness 构造私有安全测试 harness。
@@ -36,11 +37,24 @@ func newTiDBTestHarness(db *sql.DB) *tidbTestHarness {
 	}
 }
 
+// newMockGuardedHarness 构造一个 guardsPassed=true 的 harness，供底层 DDL/Cleanup 单元测试使用，
+// 无需在每个纯 DDL/Cleanup 单元测试中重复跑一遍 CheckGuards 校验逻辑。
+func newMockGuardedHarness(db *sql.DB) *tidbTestHarness {
+	h := newTiDBTestHarness(db)
+	h.guardsPassed = true
+	return h
+}
+
 // CheckGuards 检查真实 TiDB 版本、当前已选数据库非空、当前 schema 内所有对象数必须为 0。
+// 必须在开始时重置旧的 guardsPassed 许可；全部成功后才置为 true。
 func (h *tidbTestHarness) CheckGuards(ctx context.Context) error {
 	if h.db == nil {
 		return errors.New("guard check failed: nil db")
 	}
+
+	h.mu.Lock()
+	h.guardsPassed = false
+	h.mu.Unlock()
 
 	// 1. SELECT VERSION()
 	var version string
@@ -70,6 +84,10 @@ func (h *tidbTestHarness) CheckGuards(ctx context.Context) error {
 		return fmt.Errorf("guard check: target schema %q is not empty, existing object count: %d", dbName.String, objectCount)
 	}
 
+	h.mu.Lock()
+	h.guardsPassed = true
+	h.mu.Unlock()
+
 	return nil
 }
 
@@ -80,6 +98,13 @@ func (h *tidbTestHarness) CreateAllOwnedTables(ctx context.Context) error {
 	if h.db == nil {
 		return errors.New("create owned tables: nil db")
 	}
+
+	h.mu.Lock()
+	if !h.guardsPassed {
+		h.mu.Unlock()
+		return errors.New("create owned tables: guards not passed")
+	}
+	h.mu.Unlock()
 
 	all := AllTables()
 	const ifNotExistsPrefix = "CREATE TABLE IF NOT EXISTS "
@@ -113,6 +138,14 @@ func (h *tidbTestHarness) VerifyBaseTableCount(ctx context.Context, expectedCoun
 	if h.db == nil {
 		return errors.New("verify base table count: nil db")
 	}
+
+	h.mu.Lock()
+	if !h.guardsPassed {
+		h.mu.Unlock()
+		return errors.New("verify base table count: guards not passed")
+	}
+	h.mu.Unlock()
+
 	const q = "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'"
 	var count int
 	if err := h.db.QueryRowContext(ctx, q).Scan(&count); err != nil {
@@ -125,10 +158,27 @@ func (h *tidbTestHarness) VerifyBaseTableCount(ctx context.Context, expectedCoun
 }
 
 // ApplyInfraSeed 执行 PrepareInfraSQL 返回的种子数据。
+// 必须确认 guards 已通过且目标表 locks 与 schema_meta 已在本次 owned ledger 中。
 func (h *tidbTestHarness) ApplyInfraSeed(ctx context.Context) error {
 	if h.db == nil {
 		return errors.New("apply infra seed: nil db")
 	}
+
+	h.mu.Lock()
+	if !h.guardsPassed {
+		h.mu.Unlock()
+		return errors.New("apply infra seed: guards not passed")
+	}
+	ownedMap := make(map[string]bool, len(h.ownedTables))
+	for _, tbl := range h.ownedTables {
+		ownedMap[tbl] = true
+	}
+	h.mu.Unlock()
+
+	if !ownedMap["locks"] || !ownedMap["schema_meta"] {
+		return errors.New("apply infra seed: seed target tables locks/schema_meta not owned")
+	}
+
 	for _, sqlStmt := range PrepareInfraSQL() {
 		if _, err := h.db.ExecContext(ctx, sqlStmt); err != nil {
 			return fmt.Errorf("apply infra seed %q: %w", sqlStmt, err)
@@ -142,6 +192,14 @@ func (h *tidbTestHarness) VerifyInfraSeed(ctx context.Context) error {
 	if h.db == nil {
 		return errors.New("verify infra seed: nil db")
 	}
+
+	h.mu.Lock()
+	if !h.guardsPassed {
+		h.mu.Unlock()
+		return errors.New("verify infra seed: guards not passed")
+	}
+	h.mu.Unlock()
+
 	var lockName string
 	if err := h.db.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = 'business_relations'").Scan(&lockName); err != nil {
 		return fmt.Errorf("verify infra seed: lock business_relations missing: %w", err)
@@ -159,7 +217,12 @@ func (h *tidbTestHarness) ApplyIdempotentDDL(ctx context.Context, stmts []string
 	if h.db == nil {
 		return errors.New("apply idempotent DDL: nil db")
 	}
+
 	h.mu.Lock()
+	if !h.guardsPassed {
+		h.mu.Unlock()
+		return errors.New("apply idempotent DDL: guards not passed")
+	}
 	ownedMap := make(map[string]bool, len(h.ownedTables))
 	for _, tbl := range h.ownedTables {
 		ownedMap[tbl] = true
@@ -215,7 +278,7 @@ func (h *tidbTestHarness) Cleanup(ctx context.Context) error {
 	// 逆序逐一清理
 	for i := len(h.ownedTables) - 1; i >= 0; i-- {
 		tbl := h.ownedTables[i]
-		dropSQL := fmt.Sprintf("DROP TABLE `%s`", tbl)
+		dropSQL := "DROP TABLE " + quoteIdentifier(tbl)
 		if _, err := h.db.ExecContext(ctx, dropSQL); err != nil {
 			errs = append(errs, fmt.Errorf("drop owned table %q: %w", tbl, err))
 		} else {
@@ -313,7 +376,7 @@ func (c *harnessFakeConn) ExecContext(ctx context.Context, query string, args []
 	if handler != nil {
 		return handler(ctx, query, args)
 	}
-	return driver.ResultNoRows, nil
+	return nil, fmt.Errorf("harnessFakeConn: unhandled exec: %s", query)
 }
 
 func (c *harnessFakeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -472,10 +535,13 @@ func TestHarnessCreateAllOwnedTables_StrictWithoutIFNOTEXISTS(t *testing.T) {
 		if strings.Contains(query, "IF NOT EXISTS") {
 			return nil, errors.New("DDL should NOT contain IF NOT EXISTS for ownership proof")
 		}
-		return driver.ResultNoRows, nil
+		if strings.HasPrefix(query, "CREATE TABLE `") {
+			return driver.ResultNoRows, nil
+		}
+		return nil, fmt.Errorf("unexpected exec query: %s", query)
 	}, nil)
 
-	h := newTiDBTestHarness(db)
+	h := newMockGuardedHarness(db)
 	if err := h.CreateAllOwnedTables(context.Background()); err != nil {
 		t.Fatalf("CreateAllOwnedTables failed: %v", err)
 	}
@@ -519,10 +585,10 @@ func TestHarnessCreateAllOwnedTables_ConcurrentConflict_OnlyDropsOwned_NeverDrop
 			executedDrops = append(executedDrops, query)
 			return driver.ResultNoRows, nil
 		}
-		return driver.ResultNoRows, nil
+		return nil, fmt.Errorf("unexpected exec query: %s", query)
 	}, nil)
 
-	h := newTiDBTestHarness(db)
+	h := newMockGuardedHarness(db)
 	err := h.CreateAllOwnedTables(context.Background())
 	if err == nil {
 		t.Fatal("expected error on second table concurrent creation collision, got nil")
@@ -554,12 +620,18 @@ func TestHarnessCleanup_IdempotentCleanupSequenceAndInfraVerification(t *testing
 	var executedDrops []string
 
 	db, _ := newHarnessTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+		if strings.HasPrefix(query, "CREATE TABLE `") || strings.HasPrefix(query, "CREATE TABLE IF NOT EXISTS `") {
+			return driver.ResultNoRows, nil
+		}
+		if strings.HasPrefix(query, "INSERT IGNORE INTO `locks`") || strings.HasPrefix(query, "INSERT IGNORE INTO `schema_meta`") {
+			executedQueries = append(executedQueries, query)
+			return driver.ResultNoRows, nil
+		}
 		if strings.HasPrefix(query, "DROP TABLE `") {
 			executedDrops = append(executedDrops, query)
 			return driver.ResultNoRows, nil
 		}
-		executedQueries = append(executedQueries, query)
-		return driver.ResultNoRows, nil
+		return nil, fmt.Errorf("unexpected exec query: %s", query)
 	}, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 		if strings.Contains(query, "TABLE_TYPE = 'BASE TABLE'") {
 			return newSingleValueRows("COUNT(*)", int64(65)), nil
@@ -573,7 +645,7 @@ func TestHarnessCleanup_IdempotentCleanupSequenceAndInfraVerification(t *testing
 		return nil, fmt.Errorf("unhandled query: %s", query)
 	})
 
-	h := newTiDBTestHarness(db)
+	h := newMockGuardedHarness(db)
 	ctx := context.Background()
 
 	// 1. 创建 65 表
@@ -627,15 +699,19 @@ func TestHarnessCleanup_ReverseOrder65(t *testing.T) {
 	var dropped []string
 
 	db, _ := newHarnessTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+		if strings.HasPrefix(query, "CREATE TABLE `") {
+			return driver.ResultNoRows, nil
+		}
 		if strings.HasPrefix(query, "DROP TABLE `") {
 			tbl := strings.TrimPrefix(query, "DROP TABLE `")
 			tbl = strings.TrimSuffix(tbl, "`")
 			dropped = append(dropped, tbl)
+			return driver.ResultNoRows, nil
 		}
-		return driver.ResultNoRows, nil
+		return nil, fmt.Errorf("unexpected exec query: %s", query)
 	}, nil)
 
-	h := newTiDBTestHarness(db)
+	h := newMockGuardedHarness(db)
 	if err := h.CreateAllOwnedTables(context.Background()); err != nil {
 		t.Fatalf("CreateAllOwnedTables: %v", err)
 	}
@@ -668,22 +744,29 @@ func TestHarnessCleanup_ReverseOrder65(t *testing.T) {
 }
 
 func TestHarnessCleanup_ContextCancellationAndBoundedExecution(t *testing.T) {
-	db, _ := newHarnessTestDB(t, nil, nil)
-	h := newTiDBTestHarness(db)
+	db, _ := newHarnessTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+		if strings.HasPrefix(query, "CREATE TABLE `") || strings.HasPrefix(query, "DROP TABLE `") {
+			return driver.ResultNoRows, nil
+		}
+		return nil, fmt.Errorf("unexpected exec query: %s", query)
+	}, nil)
+	h := newMockGuardedHarness(db)
 	if err := h.CreateAllOwnedTables(context.Background()); err != nil {
 		t.Fatalf("CreateAllOwnedTables: %v", err)
 	}
 
-	// 模拟已取消的主 context
+	// 模拟已取消的主 context：直接调用 harness 方法应返回 context canceled
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
+	if err := h.CreateAllOwnedTables(canceledCtx); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error when invoking with canceledCtx, got: %v", err)
+	}
 
 	// 使用独立的 bounded cleanup context 进行清理
 	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cleanCancel()
 
 	// 确认在主 ctx 已取消情况下，使用 bounded ctx 清理能成功完成
-	_ = canceledCtx // 主 ctx 取消
 	if err := h.Cleanup(cleanCtx); err != nil {
 		t.Fatalf("Cleanup with bounded context failed: %v", err)
 	}
@@ -696,13 +779,16 @@ func TestHarnessCleanup_ContextCancellationAndBoundedExecution(t *testing.T) {
 func TestHarnessCleanup_ErrorsVisibleAndNotSwallowed(t *testing.T) {
 	sentinelErr := errors.New("drop table disk I/O failure")
 	db, _ := newHarnessTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+		if strings.HasPrefix(query, "CREATE TABLE `") {
+			return driver.ResultNoRows, nil
+		}
 		if strings.HasPrefix(query, "DROP TABLE `") {
 			return nil, sentinelErr
 		}
-		return driver.ResultNoRows, nil
+		return nil, fmt.Errorf("unexpected exec query: %s", query)
 	}, nil)
 
-	h := newTiDBTestHarness(db)
+	h := newMockGuardedHarness(db)
 	if err := h.CreateAllOwnedTables(context.Background()); err != nil {
 		t.Fatalf("CreateAllOwnedTables: %v", err)
 	}
@@ -723,7 +809,7 @@ func TestHarnessCleanup_ErrorsVisibleAndNotSwallowed(t *testing.T) {
 
 func TestHarnessApplyIdempotentDDL_RejectsUnownedTable(t *testing.T) {
 	db, _ := newHarnessTestDB(t, nil, nil)
-	h := newTiDBTestHarness(db)
+	h := newMockGuardedHarness(db)
 
 	// 仅注册 1 张 owned 表
 	h.ownedTables = []string{"companies"}
@@ -739,5 +825,117 @@ func TestHarnessApplyIdempotentDDL_RejectsUnownedTable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "security violation: table \"foreign_table\" is not owned") {
 		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+// --- R1 回归测试：I-1 机械守卫 与 I-2 严格 fake driver ---
+
+func TestHarnessGuards_MechanicalEnforcementOnAllEntryPoints(t *testing.T) {
+	// 验证未执行 CheckGuards 时，所有 DDL/Seed/Verify 入口直接拒绝，且执行 0 Exec/0 Query
+	db, fc := newHarnessTestDB(t, nil, nil)
+	h := newTiDBTestHarness(db)
+	ctx := context.Background()
+
+	// 1. 未 CheckGuards: CreateAllOwnedTables
+	if err := h.CreateAllOwnedTables(ctx); err == nil || !strings.Contains(err.Error(), "guards not passed") {
+		t.Fatalf("expected guards not passed error on CreateAllOwnedTables, got: %v", err)
+	}
+
+	// 2. 未 CheckGuards: VerifyBaseTableCount
+	if err := h.VerifyBaseTableCount(ctx, 65); err == nil || !strings.Contains(err.Error(), "guards not passed") {
+		t.Fatalf("expected guards not passed error on VerifyBaseTableCount, got: %v", err)
+	}
+
+	// 3. 未 CheckGuards: ApplyInfraSeed
+	if err := h.ApplyInfraSeed(ctx); err == nil || !strings.Contains(err.Error(), "guards not passed") {
+		t.Fatalf("expected guards not passed error on ApplyInfraSeed, got: %v", err)
+	}
+
+	// 4. 未 CheckGuards: VerifyInfraSeed
+	if err := h.VerifyInfraSeed(ctx); err == nil || !strings.Contains(err.Error(), "guards not passed") {
+		t.Fatalf("expected guards not passed error on VerifyInfraSeed, got: %v", err)
+	}
+
+	// 5. 未 CheckGuards: ApplyIdempotentDDL
+	if err := h.ApplyIdempotentDDL(ctx, []string{"CREATE TABLE IF NOT EXISTS `companies` (`id` BIGINT PRIMARY KEY)"}); err == nil || !strings.Contains(err.Error(), "guards not passed") {
+		t.Fatalf("expected guards not passed error on ApplyIdempotentDDL, got: %v", err)
+	}
+
+	// 断言 0 Exec / 0 Query
+	fc.mu.Lock()
+	execCount := len(fc.execCalls)
+	queryCount := len(fc.queryCalls)
+	fc.mu.Unlock()
+	if execCount != 0 || queryCount != 0 {
+		t.Fatalf("expected 0 Exec and 0 Query on guard failure, got %d execs, %d queries", execCount, queryCount)
+	}
+}
+
+func TestHarnessGuards_FailureResetsState_SeedRequiresOwnedTables(t *testing.T) {
+	var guardSuccess bool
+	db, fc := newHarnessTestDB(t, nil, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		if strings.Contains(query, "SELECT VERSION()") {
+			return newSingleValueRows("VERSION()", "5.7.25-TiDB-v8.5.8"), nil
+		}
+		if strings.Contains(query, "SELECT DATABASE()") {
+			return newSingleValueRows("DATABASE()", "test_db"), nil
+		}
+		if strings.Contains(query, "information_schema.TABLES") {
+			if guardSuccess {
+				return newSingleValueRows("COUNT(*)", int64(0)), nil
+			}
+			return newSingleValueRows("COUNT(*)", int64(5)), nil
+		}
+		return nil, fmt.Errorf("unexpected query: %s", query)
+	})
+
+	h := newTiDBTestHarness(db)
+	ctx := context.Background()
+
+	// 1. CheckGuards 成功
+	guardSuccess = true
+	if err := h.CheckGuards(ctx); err != nil {
+		t.Fatalf("CheckGuards (1st) failed: %v", err)
+	}
+
+	// 2. 此时 guardsPassed=true，但未调用 CreateAllOwnedTables（ownedTables 为空）
+	// ApplyInfraSeed 必须拦截，因为目标表 locks 和 schema_meta 还未在 owned ledger 中
+	if err := h.ApplyInfraSeed(ctx); err == nil || !strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("expected ApplyInfraSeed to fail because locks/schema_meta not owned, got: %v", err)
+	}
+
+	// 3. 再次 CheckGuards，模拟外部 schema 变成非空导致 guard 失败
+	guardSuccess = false
+	if err := h.CheckGuards(ctx); err == nil {
+		t.Fatal("expected CheckGuards to fail on non-empty schema, got nil")
+	}
+
+	// 4. 验证 guard 失败后，旧许可已失效，入口再次被阻断
+	if err := h.CreateAllOwnedTables(ctx); err == nil || !strings.Contains(err.Error(), "guards not passed") {
+		t.Fatalf("expected guards not passed error after guard failure, got: %v", err)
+	}
+
+	// 5. Cleanup 仍可正常执行（不依赖 guard 许可，且只清理 owned）
+	if err := h.Cleanup(ctx); err != nil {
+		t.Fatalf("Cleanup should succeed without guard permission: %v", err)
+	}
+
+	fc.mu.Lock()
+	execCount := len(fc.execCalls)
+	fc.mu.Unlock()
+	if execCount != 0 {
+		t.Fatalf("expected 0 Exec calls throughout this sequence, got %d", execCount)
+	}
+}
+
+func TestHarnessFakeDriver_RejectsUnknownExecByDefault(t *testing.T) {
+	// I-2: 默认 nil handler 下任意 Exec 必须返回 error，不再万能成功
+	db, _ := newHarnessTestDB(t, nil, nil)
+	_, err := db.ExecContext(context.Background(), "SELECT 1")
+	if err == nil {
+		t.Fatal("expected unhandled exec error for nil handler, got nil")
+	}
+	if !strings.Contains(err.Error(), "unhandled exec") {
+		t.Fatalf("expected 'unhandled exec' error message, got: %v", err)
 	}
 }
