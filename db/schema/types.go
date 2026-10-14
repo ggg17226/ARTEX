@@ -187,7 +187,10 @@ func (t *Table) Validate() error {
 		}
 		seenIdx[ix.Name] = true
 		for _, p := range ix.Parts {
-			if p.Column == t.PKColumn {
+			// 规格 docs/superpowers/specs/2026-10-10-native-tidb-design.md 行 110 明文保留的例外；其余索引仍禁止冗余包含 PK 列（TiDB 聚簇二级索引隐含附加 PK）
+			if t.Name == "side_question_requests" && ix.Name == "idx_side_requests_history" {
+				// 豁免 PK 列检查
+			} else if p.Column == t.PKColumn {
 				return fmt.Errorf("table %s: index %s must not contain the primary key column", t.Name, ix.Name)
 			}
 			for i := range t.Columns {
