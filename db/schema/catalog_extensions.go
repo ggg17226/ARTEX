@@ -1,9 +1,10 @@
 package schema
 
-// HashIdentityColumns maps the 12 single-key hash DDL tables to their
+// HashIdentityColumns maps the 13 single-key hash DDL tables to their
 // canonical identity/hash column names (branch tables assets/company_scope
 // and COALESCE tables task_scope/side_question_requests are covered by their
-// per-branch or identity columns in the catalog; Task 6 asserts all 16).
+// per-branch or identity columns in the catalog; together with those 4 tables,
+// there are 17 hash DDL tables in total).
 var HashIdentityColumns = map[string][2]string{
 	"companies":              {"nkey_identity", "nkey_hash"},
 	"task_categories":        {"nkey_identity", "nkey_hash"},
@@ -17,6 +18,7 @@ var HashIdentityColumns = map[string][2]string{
 	"mcp_tools_cache":        {"identity", "identity_hash"},
 	"agent_visibility":       {"identity", "identity_hash"},
 	"agent_skill_visibility": {"identity", "identity_hash"},
+	"llm_profiles":           {"name_identity", "name_hash"},
 }
 
 // ExtensionTables returns the 16 extension/traffic/infrastructure tables

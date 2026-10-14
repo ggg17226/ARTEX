@@ -246,6 +246,7 @@ func BaselineTables() []*Table {
 		T("llm_profiles", "id", true, []Column{
 			CPK("id"),
 			TextNN("name"),
+			BlobN("name_identity"),
 			BinN("name_hash", 32),
 			TextNN("format"),
 			Text("base_url"),
