@@ -27,6 +27,10 @@ web/next-env.d.ts
 # docs
 /docs/
 
+# local secrets and sdd state
+secret/
+.superpowers/
+
 # os
 .DS_Store
 Thumbs.db
