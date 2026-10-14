@@ -159,7 +159,7 @@ func newTestDB(t *testing.T, handler func(ctx context.Context, query string, arg
 
 // 1. 测试 26 四元组白名单精确性、完整性及对 AllTables 的一致性
 func TestHashArbitrationWhitelist26Exact(t *testing.T) {
-	wantTuples := []HashArbTuple{
+	wantTuples := []hashArbTuple{
 		{Table: "companies", PKCol: "id", IdentCol: "nkey_identity", HashCol: "nkey_hash"},
 		{Table: "task_categories", PKCol: "id", IdentCol: "nkey_identity", HashCol: "nkey_hash"},
 		{Table: "task_templates", PKCol: "id", IdentCol: "nkey_identity", HashCol: "nkey_hash"},
@@ -193,21 +193,21 @@ func TestHashArbitrationWhitelist26Exact(t *testing.T) {
 	}
 
 	// 检查导出白名单切片/函数 ExactTuples
-	allWhitelist := HashArbitrationWhitelist()
+	allWhitelist := hashArbitrationWhitelist()
 	if len(allWhitelist) != 26 {
-		t.Fatalf("HashArbitrationWhitelist() length = %d, want 26", len(allWhitelist))
+		t.Fatalf("hashArbitrationWhitelist() length = %d, want 26", len(allWhitelist))
 	}
 
-	wantSet := make(map[HashArbTuple]bool, 26)
+	wantSet := make(map[hashArbTuple]bool, 26)
 	for _, tup := range wantTuples {
 		wantSet[tup] = true
 	}
-	gotSet := make(map[HashArbTuple]bool, len(allWhitelist))
+	gotSet := make(map[hashArbTuple]bool, len(allWhitelist))
 	for _, tup := range allWhitelist {
 		gotSet[tup] = true
 	}
 	if !reflect.DeepEqual(gotSet, wantSet) {
-		t.Errorf("HashArbitrationWhitelist set mismatch:\ngot:  %+v\nwant: %+v", gotSet, wantSet)
+		t.Errorf("hashArbitrationWhitelist set mismatch:\ngot:  %+v\nwant: %+v", gotSet, wantSet)
 	}
 
 	// 逐项对当前 AllTables 验证 PK / identity / hash 与唯一索引
@@ -259,8 +259,7 @@ func TestHashArbitrationWhitelist26Exact(t *testing.T) {
 // 2. 拒绝未在白名单的四元组（非法表、跨表混配、SQL注入、反引号注入、不存在列），且 0 次 query
 func TestVerifyHashArbitration_UnwhitelistedTuples_ZeroQueries(t *testing.T) {
 	db, fc := newTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-		t.Fatalf("database query was called unexpectedly: %s", query)
-		return nil, nil
+		return nil, fmt.Errorf("database query was called unexpectedly: %s", query)
 	})
 
 	ctx := context.Background()
@@ -368,6 +367,9 @@ func TestVerifyHashArbitration_ExactMatchAndTxLifecycle(t *testing.T) {
 
 	// 验证没有内部 commit 或 rollback，外层事务仍然存活
 	fc.mu.Lock()
+	if fc.beginCount != 1 {
+		t.Errorf("beginCount = %d, want 1", fc.beginCount)
+	}
 	if !fc.inTx {
 		t.Errorf("inTx became false; helper must not commit or rollback caller's tx")
 	}
@@ -595,21 +597,32 @@ func TestVerifyHashArbitration_ErrorsAndEdgeCases(t *testing.T) {
 		}
 	})
 
-	// 6d. Context 取消
+	// 6d. Context 取消 (F8 修复：先通过 Background ctx 成功 BeginTx 得到有效 TX，再取消操作 ctx 验证取消语义与 TX 未被篡改)
 	t.Run("context cancelled returns error", func(t *testing.T) {
-		db, _ := newTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		db, fc := newTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 			return nil, ctx.Err()
 		})
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // 立即取消
+		// 1. 先用未取消的 Background context 开启真实有效事务
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("BeginTx failed: %v", err)
+		}
+		defer func() { _ = tx.Rollback() }()
 
-		tx, _ := db.BeginTx(ctx, nil)
-		if tx != nil {
-			defer func() { _ = tx.Rollback() }()
+		fc.mu.Lock()
+		begins := fc.beginCount
+		fc.mu.Unlock()
+		if begins != 1 {
+			t.Fatalf("expected beginCount == 1, got %d", begins)
 		}
 
-		pk, err := VerifyHashArbitration(ctx, tx, "task_scope", "id", "identity", "identity_hash", dummyHash, payload)
+		// 2. 构造操作 ctx 并取消
+		opCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// 3. 执行 VerifyHashArbitration 并断言取消错误
+		pk, err := VerifyHashArbitration(opCtx, tx, "task_scope", "id", "identity", "identity_hash", dummyHash, payload)
 		if err == nil {
 			t.Fatalf("expected error on cancelled ctx, got nil")
 		}
@@ -618,6 +631,19 @@ func TestVerifyHashArbitration_ErrorsAndEdgeCases(t *testing.T) {
 		}
 		if pk != 0 {
 			t.Fatalf("expected pk=0, got %d", pk)
+		}
+
+		// 4. 断言内部事务生命周期未被篡改 (仍处于 tx 中，commitCount == 0, rollbackCnt == 0)
+		fc.mu.Lock()
+		commits := fc.commitCount
+		rollbacks := fc.rollbackCnt
+		inTx := fc.inTx
+		fc.mu.Unlock()
+		if !inTx {
+			t.Errorf("expected tx to still be active")
+		}
+		if commits != 0 || rollbacks != 0 {
+			t.Errorf("expected 0 commits and 0 rollbacks, got commits=%d rollbacks=%d", commits, rollbacks)
 		}
 	})
 }

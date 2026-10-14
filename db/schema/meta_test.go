@@ -66,6 +66,20 @@ func TestIndexPartBytes(t *testing.T) {
 	if got := blobCol.KeyBytes(3073); got != 3073 {
 		t.Errorf("mediumblob prefix 3073 = %d, want 3073", got)
 	}
+
+	// F1: TDate3 KeyBytes 断言 (DATETIME(3) 基础 5 + 小数 2 = 7)
+	dateCol := DateN("updated_at")
+	if got := dateCol.KeyBytes(0); got != 7 {
+		t.Errorf("datetime(3) KeyBytes = %d, want 7", got)
+	}
+	// 复合索引含 TDate3 预算独立断言: id(8) + updated_at(7) = 15
+	tblWithDate := T("t_date", "id", true,
+		[]Column{CPK("id"), DateN("updated_at")},
+		[]Index{IX("ix_date_composite", false, P("id"), P("updated_at"))},
+	)
+	if got := IndexBytes(tblWithDate, tblWithDate.Indexes[0]); got != 15 {
+		t.Errorf("composite index with date3 bytes = %d, want 15 (8+7)", got)
+	}
 }
 
 func TestTableValidate(t *testing.T) {

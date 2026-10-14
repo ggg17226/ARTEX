@@ -319,7 +319,7 @@ func CheckAutoIncStep(ctx context.Context, q Querier) (retErr error) {
 
 // CheckAsciiCollision 探测 schema_meta 的 key 列 ascii_bin 大小写敏感隔离性（§7.5）：
 //
-//	前提：管理员预建独占测试schema/无外部并发写入，基线+2不是并发集群证明。
+//	前提：独占测试 schema / 无并发写入环境。
 //	1. 生成同随机 suffix 的两个 key（如 ABC_<suffix> 和 abc_<suffix>），长度 <= 64，唯一区别大小写；
 //	2. 分别插入 schema_meta (key, value, updated_at)，每条插入成功后即刻登记归属；
 //	3. 第二条若由于非大小写敏感报 1062 或驱动错误，精确清理第一条成功插入的 key；

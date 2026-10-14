@@ -12,6 +12,7 @@ import (
 
 type ddlExecCall struct {
 	query string
+	ctx   context.Context
 }
 
 type ddlFakeDriver struct {
@@ -71,7 +72,7 @@ func (c *ddlFakeConn) ExecContext(ctx context.Context, query string, args []driv
 		return nil, ctx.Err()
 	}
 	c.mu.Lock()
-	c.execCalls = append(c.execCalls, ddlExecCall{query: query})
+	c.execCalls = append(c.execCalls, ddlExecCall{query: query, ctx: ctx})
 	handler := c.execHandler
 	c.mu.Unlock()
 
@@ -268,10 +269,15 @@ func TestApplyDDL_ContextCancellation(t *testing.T) {
 
 		fc.mu.Lock()
 		numCalls := len(fc.execCalls)
+		var recordedCalls []ddlExecCall
+		recordedCalls = append(recordedCalls, fc.execCalls...)
 		fc.mu.Unlock()
-		// Only "first" was called before cancel; "second" failed on ctx or was canceled, "third" never called
-		if numCalls > 2 {
-			t.Fatalf("expected at most 2 Exec calls, got %d", numCalls)
+		// F12: 精确断言 numCalls == 1 (仅 "first" 在 cancel 前调用并记录，后续在 ctx.Err 时先返回未记录)
+		if numCalls != 1 {
+			t.Fatalf("expected exactly 1 Exec call, got %d", numCalls)
+		}
+		if recordedCalls[0].ctx == nil {
+			t.Errorf("execCall should record ctx")
 		}
 	})
 }

@@ -106,7 +106,7 @@ func ExtensionTables() []*Table {
 			Big("req_len"),
 			Big("resp_len"),
 			Text("path"),
-			VarBinN("search_bloom", 8192, "X'00'"),
+			VarBinN("search_bloom", 8192, ""),
 			IntN("search_version", "0"),
 		}, []Index{
 			IX("uq_traffic_exchanges", true, P("namespace"), P("id")),
@@ -130,7 +130,6 @@ func ExtensionTables() []*Table {
 			Column{Name: "resp_blob", Type: TChar, Length: 64, Charset: "ascii", Collation: "ascii_bin"},
 		}, []Index{
 			IX("uq_traffic_exchange_bodies", true, P("namespace"), P("exchange_id")),
-			IX("idx_traffic_bodies_blobs", false, P("namespace"), P("exchange_id")),
 			IX("idx_traffic_blobs_req", false, P("namespace"), P("req_blob")),
 			IX("idx_traffic_blobs_resp", false, P("namespace"), P("resp_blob")),
 		}),
@@ -234,7 +233,7 @@ func ExtensionTables() []*Table {
 			BinN("manifest_hash", 32),
 			IntUN("plan_version", "0"),
 			TextNN("plan_path"),
-			VarBinN("checkpoint", 1024, "X'00'"),
+			VarBinN("checkpoint", 1024, ""),
 			BigintUN("segment_seq", 0),
 			IntUN("attempt_no", "0"),
 			Tiny("mutations_started", "0"),

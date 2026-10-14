@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -22,6 +21,8 @@ const defaultCleanupTimeout = 30 * time.Second
 
 // strictTiDB85Regex 匹配 strict 8.5 LTS 版本线：
 // 必须包含 "TiDB-v8.5." 紧跟补丁版本数字，支持发行后缀（如 -dirty, -alpha 等）。
+// F18 保留说明：采用子串匹配识别发行 banner 内含 TiDB-v8.5.<patch> 即认，
+// 无匹配或未知格式 fail-closed 拒绝；不是引擎认证证明，真实 banner 仍待实测。
 // 示例：
 //   - "5.7.25-TiDB-v8.5.8" -> 匹配
 //   - "8.0.11-TiDB-v8.5.8" -> 匹配
@@ -268,210 +269,15 @@ func TestStrictTiDB85Guard_PositiveAndNegativeCases(t *testing.T) {
 
 // --- 完整的 fake driver 基础设施与 runSafeStructureWithDB 深度流程测试 ---
 
-// safeStructureFakeFixture 构造支持 runSafeStructureWithDB 完整“guard -> strict 65 CREATE -> metadata PK/FK -> allocator -> ASCII -> owned-only cleanup”的 fake 驱动配置。
+// safeStructureFakeFixture 记录 runSafeStructureWithDB 完整“guard -> strict 65 CREATE -> metadata PK/FK -> allocator -> ASCII -> owned-only cleanup”中的执行情况。
 type safeStructureFakeFixture struct {
-	mu            sync.Mutex
-	version       string
-	dbName        string
-	schemaCount   int
-	baseTableCnt  int
-	pkShapeErr    map[string]error
-	fkCheckErr    error
-	fkCheckCount  int
-	autoIncBefore uint64
-	autoIncAfter  uint64
-	autoIncErr    error
-	asciiErr      error
-	dropErrTable  map[string]error
-
-	// 记录调用
 	createdTables []string
 	droppedTables []string
 	seedExecs     []string
-	unknownExecs  []string
-	unknownQs     []string
 }
 
 func newSafeStructureFakeFixture() *safeStructureFakeFixture {
-	return &safeStructureFakeFixture{
-		version:       "8.0.11-TiDB-v8.5.8",
-		dbName:        "artex_test_schema",
-		schemaCount:   0,
-		baseTableCnt:  65,
-		fkCheckCount:  0,
-		autoIncBefore: 100,
-		autoIncAfter:  102,
-		pkShapeErr:    make(map[string]error),
-		dropErrTable:  make(map[string]error),
-	}
-}
-
-func (f *safeStructureFakeFixture) buildDB(t *testing.T) (*sql.DB, *safeStructureFakeFixture) {
-	t.Helper()
-
-	execHandler := func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		// 1. Strict 65 CREATE TABLE
-		if strings.HasPrefix(query, "CREATE TABLE `") {
-			tbl, err := extractTableNameFromDDL(query)
-			if err != nil {
-				return nil, fmt.Errorf("fake exec parse table: %w", err)
-			}
-			f.createdTables = append(f.createdTables, tbl)
-			return driver.ResultNoRows, nil
-		}
-
-		// 2. DROP TABLE
-		if strings.HasPrefix(query, "DROP TABLE `") {
-			tbl := strings.TrimPrefix(query, "DROP TABLE `")
-			tbl = strings.TrimSuffix(tbl, "`")
-			f.droppedTables = append(f.droppedTables, tbl)
-			if err, ok := f.dropErrTable[tbl]; ok && err != nil {
-				return nil, err
-			}
-			return driver.ResultNoRows, nil
-		}
-
-		// 3. ApplyInfraSeed
-		if strings.HasPrefix(query, "INSERT IGNORE INTO `locks`") || strings.HasPrefix(query, "INSERT IGNORE INTO `schema_meta`") {
-			f.seedExecs = append(f.seedExecs, query)
-			return driver.ResultNoRows, nil
-		}
-
-		// 4. CheckAutoIncStep: INSERT INTO `locks` (`name`) VALUES (?), (?)
-		if strings.HasPrefix(query, "INSERT INTO `locks` (`name`) VALUES") {
-			if f.autoIncErr != nil {
-				return nil, f.autoIncErr
-			}
-			return driver.ResultNoRows, nil
-		}
-
-		// 5. CheckAutoIncStep: DELETE FROM `locks` WHERE `name` IN (?, ?)
-		if strings.HasPrefix(query, "DELETE FROM `locks` WHERE `name` IN") {
-			return driver.ResultNoRows, nil
-		}
-
-		// 6. CheckAsciiCollision: INSERT INTO `schema_meta` (`key`, `value`, `updated_at`)
-		if strings.HasPrefix(query, "INSERT INTO `schema_meta` (`key`, `value`, `updated_at`)") {
-			if f.asciiErr != nil {
-				return nil, f.asciiErr
-			}
-			return driver.ResultNoRows, nil
-		}
-
-		// 7. CheckAsciiCollision: DELETE FROM `schema_meta` WHERE `key` IN
-		if strings.HasPrefix(query, "DELETE FROM `schema_meta` WHERE `key` IN") {
-			return driver.ResultNoRows, nil
-		}
-
-		f.unknownExecs = append(f.unknownExecs, query)
-		return nil, fmt.Errorf("safeStructureFakeFixture: unhandled exec query: %s", query)
-	}
-
-	queryHandler := func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		// 1. SELECT VERSION()
-		if strings.Contains(query, "SELECT VERSION()") {
-			return newSingleValueRows("VERSION()", f.version), nil
-		}
-
-		// 2. SELECT DATABASE()
-		if strings.Contains(query, "SELECT DATABASE()") {
-			if f.dbName == "" {
-				return newSingleValueRows("DATABASE()", nil), nil
-			}
-			return newSingleValueRows("DATABASE()", f.dbName), nil
-		}
-
-		// 3. CheckGuards: information_schema.TABLES count
-		if strings.Contains(query, "TABLE_SCHEMA = DATABASE()") && strings.Contains(query, "COUNT(*)") && !strings.Contains(query, "BASE TABLE") && !strings.Contains(query, "TABLE_CONSTRAINTS") {
-			return newSingleValueRows("COUNT(*)", int64(f.schemaCount)), nil
-		}
-
-		// 4. VerifyBaseTableCount: BASE TABLE count
-		if strings.Contains(query, "TABLE_TYPE = 'BASE TABLE'") {
-			return newSingleValueRows("COUNT(*)", int64(f.baseTableCnt)), nil
-		}
-
-		// 5. VerifyInfraSeed
-		if strings.Contains(query, "SELECT name FROM locks WHERE name = 'business_relations'") {
-			return newSingleValueRows("name", "business_relations"), nil
-		}
-		if strings.Contains(query, "SELECT `key` FROM schema_meta WHERE `key` = 'schema_version'") {
-			return newSingleValueRows("key", "schema_version"), nil
-		}
-
-		// 6. Layer 1: CheckPrimaryKeys (qPKShape)
-		if strings.Contains(query, "KEY_COLUMN_USAGE") && strings.Contains(query, "CONSTRAINT_NAME = 'PRIMARY'") {
-			if len(args) == 0 {
-				return nil, errors.New("qPKShape query missing table arg")
-			}
-			tblName := fmt.Sprint(args[0].Value)
-			if err, ok := f.pkShapeErr[tblName]; ok && err != nil {
-				return nil, err
-			}
-			// 根据 AllTables 查找真实 PK 列名
-			for _, tDef := range AllTables() {
-				if tDef.Name == tblName {
-					return &harnessFakeRows{
-						columns: []string{"COLUMN_NAME", "DATA_TYPE", "COLUMN_TYPE"},
-						rows: [][]driver.Value{
-							{tDef.PKColumn, "bigint", "bigint unsigned"},
-						},
-					}, nil
-				}
-			}
-			return nil, fmt.Errorf("table %q not in AllTables catalog", tblName)
-		}
-
-		// 7. Layer 2: CheckNoFKNoCheck (qFKCheckCount)
-		if strings.Contains(query, "TABLE_CONSTRAINTS") && strings.Contains(query, "FOREIGN KEY") {
-			if f.fkCheckErr != nil {
-				return nil, f.fkCheckErr
-			}
-			return newSingleValueRows("COUNT(*)", int64(f.fkCheckCount)), nil
-		}
-
-		// 8. Layer 3: CheckAutoIncStep (qShowLocksNextRowID)
-		if strings.HasPrefix(query, "SHOW TABLE `locks` NEXT_ROW_ID") {
-			// 根据调用次数动态返回 before / after 值
-			val := f.autoIncBefore
-			// 如果已经执行了 locks INSERT，则返回 after 值
-			if f.autoIncBefore == 0 {
-				val = 1
-			}
-			// 如果是第二次 SHOW，返回 after
-			// 简单策略：检查是否已有 Exec 调用 INSERT INTO `locks`
-			// 注意：queryHandler 在 execHandler 之后被调用
-			return &harnessFakeRows{
-				columns: []string{"NEXT_GLOBAL_ROW_ID", "ID_TYPE", "TABLE_NAME", "COLUMN_NAME"},
-				rows: [][]driver.Value{
-					{val, "AUTO_INCREMENT", "locks", "row_id"},
-				},
-			}, nil
-		}
-
-		f.unknownQs = append(f.unknownQs, query)
-		return nil, fmt.Errorf("safeStructureFakeFixture: unhandled query: %s", query)
-	}
-
-	fc := &harnessFakeConn{
-		execHandler:  execHandler,
-		queryHandler: queryHandler,
-	}
-	drv := &harnessFakeDriver{}
-	connector := &harnessFakeConnector{driver: drv, conn: fc}
-	drv.connector = connector
-	db := sql.OpenDB(connector)
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	return db, f
+	return &safeStructureFakeFixture{}
 }
 
 // TestVerify_SafeStructureFakeFlow 验证标准全流程正常通过：
@@ -480,6 +286,9 @@ func TestVerify_SafeStructureFakeFlow(t *testing.T) {
 	fixture := newSafeStructureFakeFixture()
 
 	var showCount int
+	var insertedLocksMarkers []string
+	var deletedLocksMarkers []string
+
 	// 自定义 SHOW NEXT_ROW_ID 的 query handler 使其第一次返回 100，第二次返回 102
 	db, fc := newHarnessTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 		if strings.HasPrefix(query, "CREATE TABLE `") {
@@ -497,10 +306,34 @@ func TestVerify_SafeStructureFakeFlow(t *testing.T) {
 			fixture.seedExecs = append(fixture.seedExecs, query)
 			return driver.ResultNoRows, nil
 		}
+
 		if strings.HasPrefix(query, "INSERT INTO `locks` (`name`) VALUES") {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("expected 2 insert args for locks marker, got %d", len(args))
+			}
+			for i, arg := range args {
+				s, ok := arg.Value.(string)
+				if !ok {
+					return nil, fmt.Errorf("locks insert arg[%d] not string: %T", i, arg.Value)
+				}
+				if len(s) > 64 {
+					return nil, fmt.Errorf("locks marker length exceeds 64: %d", len(s))
+				}
+				insertedLocksMarkers = append(insertedLocksMarkers, s)
+			}
 			return driver.ResultNoRows, nil
 		}
 		if strings.HasPrefix(query, "DELETE FROM `locks` WHERE `name` IN") {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("expected 2 delete args for locks marker, got %d", len(args))
+			}
+			for i, arg := range args {
+				s, ok := arg.Value.(string)
+				if !ok {
+					return nil, fmt.Errorf("locks delete arg[%d] not string: %T", i, arg.Value)
+				}
+				deletedLocksMarkers = append(deletedLocksMarkers, s)
+			}
 			return driver.ResultNoRows, nil
 		}
 		if strings.HasPrefix(query, "INSERT INTO `schema_meta` (`key`, `value`, `updated_at`)") {
@@ -568,16 +401,43 @@ func TestVerify_SafeStructureFakeFlow(t *testing.T) {
 		t.Fatalf("expected runSafeStructureWithDB to succeed, got: %v", err)
 	}
 
-	// 验证严格 65 张表创建
+	// 验证严格 65 张表创建及其与 AllTables 前 65 顺序完全一致 (F16)
 	if len(fixture.createdTables) != 65 {
 		t.Fatalf("expected 65 created tables, got %d", len(fixture.createdTables))
+	}
+	all := AllTables()
+	for i := 0; i < 65; i++ {
+		if fixture.createdTables[i] != all[i].Name {
+			t.Fatalf("createdTables[%d] = %q, want %q (exact AllTables order)", i, fixture.createdTables[i], all[i].Name)
+		}
+	}
+
+	// 验证 seedExecs 逐条与 PrepareInfraSQL() 两条原文严格一致 (F16)
+	wantSeeds := PrepareInfraSQL()
+	if len(fixture.seedExecs) != len(wantSeeds) {
+		t.Fatalf("expected %d seed statements, got %d", len(wantSeeds), len(fixture.seedExecs))
+	}
+	for i := range wantSeeds {
+		if fixture.seedExecs[i] != wantSeeds[i] {
+			t.Fatalf("seedExecs[%d] = %q, want %q", i, fixture.seedExecs[i], wantSeeds[i])
+		}
+	}
+
+	// 验证 locks probe markers 存在、非空、成对清理 (F16)
+	if len(insertedLocksMarkers) != 2 || len(deletedLocksMarkers) != 2 {
+		t.Fatalf("locks markers count mismatch: inserted=%d, deleted=%d", len(insertedLocksMarkers), len(deletedLocksMarkers))
+	}
+	if insertedLocksMarkers[0] == insertedLocksMarkers[1] {
+		t.Errorf("locks markers must be distinct: %v", insertedLocksMarkers)
+	}
+	if deletedLocksMarkers[0] != insertedLocksMarkers[0] || deletedLocksMarkers[1] != insertedLocksMarkers[1] {
+		t.Errorf("deleted locks markers %v mismatch inserted %v", deletedLocksMarkers, insertedLocksMarkers)
 	}
 
 	// 验证逆序删除 65 张表
 	if len(fixture.droppedTables) != 65 {
 		t.Fatalf("expected 65 dropped tables on cleanup, got %d", len(fixture.droppedTables))
 	}
-	all := AllTables()
 	for i := 0; i < 65; i++ {
 		wantTable := all[64-i].Name
 		if fixture.droppedTables[i] != wantTable {
@@ -714,8 +574,8 @@ func TestVerify_SafeStructureFakeFlow_RejectionCases(t *testing.T) {
 		}
 	})
 
-	// Case 4: Probe 失败与 Cleanup 失败双错链（errors.Join 保留两者）
-	t.Run("probe_error_and_cleanup_error_dual_chain", func(t *testing.T) {
+	// Case 4: Layer 1 PK 元数据查询失败与 Cleanup 失败双错链（errors.Join 保留两者，F17 准确更名）
+	t.Run("metadata_error_and_cleanup_error_dual_chain", func(t *testing.T) {
 		sentinelCleanupErr := errors.New("drop failed: disk full")
 		db, _ := newHarnessTestDB(t, func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 			if strings.HasPrefix(query, "CREATE TABLE `") {

@@ -11,16 +11,16 @@ import (
 // ErrIdentityHashCollision 是 hash 命中但完整 identity 不字节相等时的显式错误（spec §3.2）。
 var ErrIdentityHashCollision = errors.New("identity hash collision")
 
-// HashArbTuple 定义仲裁白名单四元组结构（表名、主键列、完整 identity 列、hash 列）。
-type HashArbTuple struct {
+// hashArbTuple 定义仲裁白名单四元组结构（表名、主键列、完整 identity 列、hash 列）。
+type hashArbTuple struct {
 	Table    string
 	PKCol    string
 	IdentCol string
 	HashCol  string
 }
 
-// rawHashArbTuples 是仲裁四元组的完整 26 项白名单（15 项普通/复合 + assets 8 项分支 + company_scope 3 项分支 + llm_profiles）。
-var rawHashArbTuples = []HashArbTuple{
+// rawHashArbTuples 是仲裁四元组的完整 26 项白名单（14 项普通/复合 + assets 8 项分支 + company_scope 3 项分支 + llm_profiles 1 项 = 26）。
+var rawHashArbTuples = []hashArbTuple{
 	// 1-3. companies, task_categories, task_templates (nkey)
 	{Table: "companies", PKCol: "id", IdentCol: "nkey_identity", HashCol: "nkey_hash"},
 	{Table: "task_categories", PKCol: "id", IdentCol: "nkey_identity", HashCol: "nkey_hash"},
@@ -70,9 +70,9 @@ var hashArbWhitelistMap = func() map[string]struct{} {
 	return m
 }()
 
-// HashArbitrationWhitelist 返回所有 26 项仲裁四元组的副本。
-func HashArbitrationWhitelist() []HashArbTuple {
-	cp := make([]HashArbTuple, len(rawHashArbTuples))
+// hashArbitrationWhitelist 返回所有 26 项仲裁四元组的副本（同包测试使用）。
+func hashArbitrationWhitelist() []hashArbTuple {
+	cp := make([]hashArbTuple, len(rawHashArbTuples))
 	copy(cp, rawHashArbTuples)
 	return cp
 }

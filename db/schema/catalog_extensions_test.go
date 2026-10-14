@@ -1,6 +1,9 @@
 package schema
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 var wantExtensionPKs = map[string]string{
 	"llm_records": "id", "llm_usage": "id", "finding_assets": "id",
@@ -208,6 +211,76 @@ func TestExtensionColumnContracts(t *testing.T) {
 			}
 			if c.Default != "" {
 				t.Errorf("%s Default = %q, want empty", name, c.Default)
+			}
+		}
+	})
+
+	// F2 回归: search_bloom 与 checkpoint 无 DEFAULT
+	t.Run("F2_no_default_on_search_bloom_and_checkpoint", func(t *testing.T) {
+		tbTraffic := byName["traffic_exchanges"]
+		if tbTraffic == nil {
+			t.Fatalf("traffic_exchanges missing")
+		}
+		cBloom := findCol(tbTraffic, "search_bloom")
+		if cBloom == nil {
+			t.Fatalf("search_bloom missing")
+		}
+		if cBloom.Default != "" {
+			t.Errorf("traffic_exchanges.search_bloom must NOT have default, got %q", cBloom.Default)
+		}
+		ddlTraffic, err := GenerateDDL(tbTraffic)
+		if err != nil {
+			t.Fatalf("GenerateDDL(traffic_exchanges): %v", err)
+		}
+		if strings.Contains(ddlTraffic, "`search_bloom` VARBINARY(8192) NOT NULL DEFAULT") {
+			t.Errorf("GenerateDDL(traffic_exchanges) should not contain DEFAULT for search_bloom: %s", ddlTraffic)
+		}
+
+		tbStorage := byName["storage_jobs"]
+		if tbStorage == nil {
+			t.Fatalf("storage_jobs missing")
+		}
+		cCheckpoint := findCol(tbStorage, "checkpoint")
+		if cCheckpoint == nil {
+			t.Fatalf("checkpoint missing")
+		}
+		if cCheckpoint.Default != "" {
+			t.Errorf("storage_jobs.checkpoint must NOT have default, got %q", cCheckpoint.Default)
+		}
+		ddlStorage, err := GenerateDDL(tbStorage)
+		if err != nil {
+			t.Fatalf("GenerateDDL(storage_jobs): %v", err)
+		}
+		if strings.Contains(ddlStorage, "`checkpoint` VARBINARY(1024) NOT NULL DEFAULT") {
+			t.Errorf("GenerateDDL(storage_jobs) should not contain DEFAULT for checkpoint: %s", ddlStorage)
+		}
+	})
+
+	// F3 回归: idx_traffic_bodies_blobs 冗余索引已删除，但保持 uq_traffic_exchange_bodies 及 req/resp 索引
+	t.Run("F3_redundant_index_deleted_and_identity_preserved", func(t *testing.T) {
+		tb := byName["traffic_exchange_bodies"]
+		if tb == nil {
+			t.Fatalf("traffic_exchange_bodies missing")
+		}
+		for _, ix := range tb.Indexes {
+			if ix.Name == "idx_traffic_bodies_blobs" {
+				t.Fatalf("redundant index idx_traffic_bodies_blobs must be deleted")
+			}
+		}
+		// 断言 uq_traffic_exchange_bodies, idx_traffic_blobs_req, idx_traffic_blobs_resp 均完好
+		expectedIndexes := map[string]bool{
+			"uq_traffic_exchange_bodies": false,
+			"idx_traffic_blobs_req":      false,
+			"idx_traffic_blobs_resp":     false,
+		}
+		for _, ix := range tb.Indexes {
+			if _, ok := expectedIndexes[ix.Name]; ok {
+				expectedIndexes[ix.Name] = true
+			}
+		}
+		for name, found := range expectedIndexes {
+			if !found {
+				t.Errorf("expected index %s was not found", name)
 			}
 		}
 	})

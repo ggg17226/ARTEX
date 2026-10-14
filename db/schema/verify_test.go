@@ -241,8 +241,6 @@ func TestCheckPrimaryKeys_Success(t *testing.T) {
 					{pkCol, "bigint", "bigint unsigned"},
 				},
 			)
-			origClose := rows.closeErr
-			_ = origClose
 			rows.closeErr = nil
 
 			// 包装一下以监控 activeOpenRows
@@ -457,6 +455,46 @@ func TestCheckPrimaryKeys_DualErrors_PreservesBoth(t *testing.T) {
 	}
 }
 
+// F5 回归: Scan 错误 + Rows.Err 驱动错误 + Close 错误三错共存时全量 errors.Is 保留
+func TestCheckPrimaryKeys_TripleErrors_PreservesAll(t *testing.T) {
+	ctx := context.Background()
+	scanSentinel := errors.New("scan failed sentinel")
+	rowsErrSentinel := errors.New("driver rows error sentinel")
+	closeSentinel := errors.New("close failed sentinel")
+
+	var capturedRows *verifyFakeRows
+	fq := &verifyFakeQuerier{
+		queryHandler: func(ctx context.Context, query string, args ...any) (Rows, error) {
+			r := newVerifyFakeRows([]string{"COLUMN_NAME", "DATA_TYPE", "COLUMN_TYPE"}, [][]any{
+				{"id", "bigint", "bigint unsigned"},
+			})
+			r.scanErr = scanSentinel
+			r.errVal = rowsErrSentinel
+			r.closeErr = closeSentinel
+			capturedRows = r
+			return r, nil
+		},
+	}
+
+	err := CheckPrimaryKeys(ctx, fq, []*Table{{Name: "t1", PKColumn: "id"}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if !errors.Is(err, scanSentinel) {
+		t.Errorf("expected errors.Is(err, scanSentinel), got %v", err)
+	}
+	if !errors.Is(err, rowsErrSentinel) {
+		t.Errorf("expected errors.Is(err, rowsErrSentinel), got %v", err)
+	}
+	if !errors.Is(err, closeSentinel) {
+		t.Errorf("expected errors.Is(err, closeSentinel), got %v", err)
+	}
+	if capturedRows != nil && !capturedRows.closed {
+		t.Error("rows was not closed")
+	}
+}
+
 func TestCheckPrimaryKeys_NilInputs(t *testing.T) {
 	ctx := context.Background()
 	if err := CheckPrimaryKeys(ctx, nil, []*Table{{Name: "t1"}}); err == nil {
@@ -610,8 +648,10 @@ func TestCheckNoFKNoCheck_NilInputs(t *testing.T) {
 type verifySqlDriverConn struct {
 	lastQuery string
 	lastArgs  []driver.NamedValue
+	queryCtx  context.Context
 	lastExec  string
 	execArgs  []driver.NamedValue
+	execCtx   context.Context
 }
 
 func (c *verifySqlDriverConn) Prepare(query string) (driver.Stmt, error) {
@@ -630,6 +670,7 @@ func (c *verifySqlDriverConn) QueryContext(ctx context.Context, query string, ar
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	c.queryCtx = ctx
 	c.lastQuery = query
 	c.lastArgs = args
 	return &verifySqlDriverRows{
@@ -644,6 +685,7 @@ func (c *verifySqlDriverConn) ExecContext(ctx context.Context, query string, arg
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	c.execCtx = ctx
 	c.lastExec = query
 	c.execArgs = args
 	return driver.RowsAffected(1), nil
@@ -718,6 +760,9 @@ func TestDBQuerier_DatabaseSqlBoundary(t *testing.T) {
 	if conn.lastQuery != "SELECT * FROM t WHERE id = ? AND name = ?" {
 		t.Errorf("Query query mismatch: got %q", conn.lastQuery)
 	}
+	if conn.queryCtx == nil || conn.queryCtx.Value(ctxKey{}) != "ctx-val" {
+		t.Errorf("Query ctx value mismatch: got %v", conn.queryCtx)
+	}
 	if len(conn.lastArgs) != 2 || conn.lastArgs[0].Value != int64(123) || conn.lastArgs[1].Value != "test_name" {
 		t.Errorf("Query args mismatch: got %+v", conn.lastArgs)
 	}
@@ -758,6 +803,9 @@ func TestDBQuerier_DatabaseSqlBoundary(t *testing.T) {
 	}
 	if conn.lastExec != "UPDATE t SET name = ? WHERE id = ?" {
 		t.Errorf("Exec query mismatch: got %q", conn.lastExec)
+	}
+	if conn.execCtx == nil || conn.execCtx.Value(ctxKey{}) != "ctx-val" {
+		t.Errorf("Exec ctx value mismatch: got %v", conn.execCtx)
 	}
 	if len(conn.execArgs) != 2 || conn.execArgs[0].Value != "new_name" || conn.execArgs[1].Value != int64(456) {
 		t.Errorf("Exec args mismatch: got %+v", conn.execArgs)

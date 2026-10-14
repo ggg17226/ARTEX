@@ -131,7 +131,7 @@ func SideQuestionRequestsIdentity(sessionKey string, generation uint64, clientID
 }
 
 // 10. TaskScopeIdentity 是 task_scope 的 canonical identity（分支 task_scope）。
-// 调用方先按原 uq_task_scope_v2 表达式 COALESCE：domain/net/value NULL→”、company_id NULL→0；
+// 调用方先按原 uq_task_scope_v2 表达式 COALESCE：domain/net/value NULL→''、company_id NULL→0；
 // kind 无 COALESCE（NOT NULL）。
 func TaskScopeIdentity(taskID uint64, kind, domain, net string, companyID uint64, value string) []byte {
 	return CanonicalIdentity("task_scope",
@@ -169,7 +169,7 @@ func AssetsIPIdentity(ip string) []byte {
 }
 
 // 16. AssetsSubdomainIdentity 是 assets subdomain 分支的 canonical identity。
-// 调用方对 record_type 先 COALESCE 为 ”（原表达式含 COALESCE）；domain 不适用分支时不写该分支对。
+// 调用方对 record_type 先 COALESCE 为 ''（原表达式含 COALESCE）；domain 不适用分支时不写该分支对。
 func AssetsSubdomainIdentity(domain, recordType string) []byte {
 	return CanonicalIdentity("assets_subdomain", FieldBytes(domain, false), FieldBytes(recordType, false))
 }
@@ -190,7 +190,7 @@ func AssetsServiceHTTPIdentity(url string) []byte {
 }
 
 // 20. AssetsServiceOtherIdentity 是 assets service_other 分支的 canonical identity。
-// 调用方对 domain/ip 先 COALESCE 为 ”；port/service_name 无 COALESCE，NULL 保留 NULL 语义。
+// 调用方对 domain/ip 先 COALESCE 为 ''；port/service_name 无 COALESCE，NULL 保留 NULL 语义。
 func AssetsServiceOtherIdentity(domain, ip string, port uint64, portNull bool, serviceName string, serviceNameNull bool) []byte {
 	return CanonicalIdentity("assets_service_other",
 		FieldBytes(domain, false),

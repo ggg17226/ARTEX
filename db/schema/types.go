@@ -76,7 +76,7 @@ func (c Column) KeyBytes(prefix int) int {
 	case TDouble:
 		return 8
 	case TDate3:
-		return 5
+		return 7
 	case TBinary, TVarbinary:
 		n := c.Length
 		if prefix > 0 && prefix < n {

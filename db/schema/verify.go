@@ -112,9 +112,11 @@ func CheckPrimaryKeys(ctx context.Context, q Querier, tables []*Table) error {
 				}
 			}
 
-			// 检查驱动迭代错误（优先于行数/形状断言）
-			if loopErr == nil {
-				if err := rows.Err(); err != nil {
+			// 检查驱动迭代错误（Scan/loop 错误后也读取 Rows.Err 并 Join，保主要/迭代/Close 全部 errors.Is）
+			if err := rows.Err(); err != nil {
+				if loopErr != nil {
+					loopErr = errors.Join(loopErr, err)
+				} else {
 					loopErr = err
 				}
 			}
@@ -171,8 +173,11 @@ func CheckNoFKNoCheck(ctx context.Context, q Querier) error {
 		}
 	}
 
-	if loopErr == nil {
-		if err := rows.Err(); err != nil {
+	// Scan/loop 错误后也读取 Rows.Err 并 Join，保主要/迭代/Close 全部 errors.Is
+	if err := rows.Err(); err != nil {
+		if loopErr != nil {
+			loopErr = errors.Join(loopErr, err)
+		} else {
 			loopErr = err
 		}
 	}

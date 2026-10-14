@@ -659,4 +659,62 @@ func TestCharsetGuardrails(t *testing.T) {
 				check.table, check.col, c.Charset, c.Collation)
 		}
 	}
+
+	// F4 闭包修订: 精确检查 Type == TText (MEDIUMTEXT) 的显式 charset 字段集合
+	// Unicode 允许集合 = target33Manifest 中 32 个 utf8mb4 身份列 + 已按 spec 获准的 traffic_index_chunks.text = 33
+	// ASCII 无界 TEXT 仅 task_archives.sha256 = 1
+	var actualUnicodeTTexts []string
+	var actualAsciiTTexts []string
+	for _, tbl := range AllTables() {
+		for _, c := range tbl.Columns {
+			if c.Type == TText {
+				if c.Charset == "utf8mb4" && c.Collation == "utf8mb4_bin" {
+					actualUnicodeTTexts = append(actualUnicodeTTexts, tbl.Name+"."+c.Name)
+				} else if c.Charset == "ascii" && c.Collation == "ascii_bin" {
+					actualAsciiTTexts = append(actualAsciiTTexts, tbl.Name+"."+c.Name)
+				} else if c.Charset != "" || c.Collation != "" {
+					t.Errorf("unexpected explicit charset/collation on TText %s.%s: %q/%q",
+						tbl.Name, c.Name, c.Charset, c.Collation)
+				}
+			}
+		}
+	}
+
+	// 期望的 33 个 Unicode TText 列集合 (32 个 target33Manifest 列 + traffic_index_chunks.text)
+	expectedUnicodeTTexts := make(map[string]bool)
+	for _, m := range target33Manifest {
+		if m.Charset == "utf8mb4" {
+			expectedUnicodeTTexts[m.Table+"."+m.Column] = true
+		}
+	}
+	expectedUnicodeTTexts["traffic_index_chunks.text"] = true
+
+	if len(actualUnicodeTTexts) != len(expectedUnicodeTTexts) {
+		t.Errorf("actual unicode TText count = %d, want %d", len(actualUnicodeTTexts), len(expectedUnicodeTTexts))
+	}
+	for _, key := range actualUnicodeTTexts {
+		if !expectedUnicodeTTexts[key] {
+			t.Errorf("unexpected unicode TText column in catalog: %s", key)
+		}
+	}
+	for key := range expectedUnicodeTTexts {
+		found := false
+		for _, actualKey := range actualUnicodeTTexts {
+			if actualKey == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing expected unicode TText column: %s", key)
+		}
+	}
+
+	// 期望的 ASCII 无界 TEXT 列仅 task_archives.sha256 1 项
+	if len(actualAsciiTTexts) != 1 {
+		t.Fatalf("actual ascii TText count = %d, want 1", len(actualAsciiTTexts))
+	}
+	if actualAsciiTTexts[0] != "task_archives.sha256" {
+		t.Errorf("actual ascii TText = %q, want task_archives.sha256", actualAsciiTTexts[0])
+	}
 }

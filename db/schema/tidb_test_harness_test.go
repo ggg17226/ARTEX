@@ -37,8 +37,8 @@ func newTiDBTestHarness(db *sql.DB) *tidbTestHarness {
 	}
 }
 
-// newMockGuardedHarness 构造一个 guardsPassed=true 的 harness，供底层 DDL/Cleanup 单元测试使用，
-// 无需在每个纯 DDL/Cleanup 单元测试中重复跑一遍 CheckGuards 校验逻辑。
+// newMockGuardedHarness 构造一个 guardsPassed=true 的 harness，仅限纯 DDL/Cleanup unit fixture，
+// 禁止用于集成真路径；真路径测试必须使用 newTiDBTestHarness 配合 CheckGuards 校验。
 func newMockGuardedHarness(db *sql.DB) *tidbTestHarness {
 	h := newTiDBTestHarness(db)
 	h.guardsPassed = true

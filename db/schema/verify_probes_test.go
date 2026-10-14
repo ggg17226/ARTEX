@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -321,6 +322,22 @@ func TestCheckAutoIncStep_ColumnPermutationsAndFilters(t *testing.T) {
 			cols:    []string{"ID_TYPE", "NEXT_GLOBAL_ROW_ID", "TABLE_NAME", "COLUMN_NAME"},
 			rowsData: [][]any{
 				{"AUTO_INCREMENT", []byte("100"), "locks", "row_id"},
+			},
+		},
+		{
+			name:    "f14_highbyte_max_uint64_minus_2_success",
+			baseVal: math.MaxUint64 - 2, // 18446744073709551613 -> +2 -> MaxUint64 (18446744073709551615) 合法成功
+			cols:    []string{"TABLE_NAME", "COLUMN_NAME", "NEXT_ROW_ID"},
+			rowsData: [][]any{
+				{"locks", "row_id", []byte("18446744073709551613")},
+			},
+		},
+		{
+			name:    "f14_highbyte_max_uint64_minus_2_rawbytes_success",
+			baseVal: math.MaxUint64 - 2,
+			cols:    []string{"TABLE_NAME", "COLUMN_NAME", "NEXT_ROW_ID"},
+			rowsData: [][]any{
+				{"locks", "row_id", sql.RawBytes("18446744073709551613")},
 			},
 		},
 		{
@@ -804,6 +821,18 @@ func TestCheckAutoIncStep_NegativeCases_SHOWParsing(t *testing.T) {
 			cols:     []string{"TABLE_NAME", "COLUMN_NAME", "NEXT_ROW_ID"},
 			rowsData: [][]any{{"locks", "row_id", "not_a_number"}},
 			wantErr:  "invalid syntax",
+		},
+		{
+			name:     "f14_21digit_overflow_string_fails_before_insert",
+			cols:     []string{"TABLE_NAME", "COLUMN_NAME", "NEXT_ROW_ID"},
+			rowsData: [][]any{{"locks", "row_id", "999999999999999999999"}}, // 21位溢出文本
+			wantErr:  "value out of range",
+		},
+		{
+			name:     "f14_21digit_overflow_bytes_fails_before_insert",
+			cols:     []string{"TABLE_NAME", "COLUMN_NAME", "NEXT_ROW_ID"},
+			rowsData: [][]any{{"locks", "row_id", []byte("999999999999999999999")}}, // 21位溢出字节
+			wantErr:  "value out of range",
 		},
 	}
 
