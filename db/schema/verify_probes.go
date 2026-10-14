@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -36,17 +37,50 @@ func boundedCleanupCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
+// normalizeDriverValue 将数据库驱动返回的原始列值归一化为字符串，用于大小写/前后缀过滤。
+// 规则：
+//   - nil -> ""
+//   - string -> 原字符串
+//   - []byte -> 原字节切片转为字符串
+//   - sql.RawBytes -> 原字节切片转为字符串
+//   - 其他类型 -> fmt.Sprint(v)
+func normalizeDriverValue(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case []byte:
+		return string(val)
+	case sql.RawBytes:
+		return string(val)
+	default:
+		return fmt.Sprint(val)
+	}
+}
+
 // parseShowAutoIncValue 从 SHOW TABLE NEXT_ROW_ID 结果中解析 AUTO_INCREMENT 目标值。
-func parseShowAutoIncValue(ctx context.Context, q Querier) (uint64, error) {
+func parseShowAutoIncValue(ctx context.Context, q Querier) (val uint64, retErr error) {
 	rows, err := q.Query(ctx, qShowLocksNextRowID)
 	if err != nil {
 		return 0, fmt.Errorf("query %s: %w", qShowLocksNextRowID, err)
 	}
+	defer func() {
+		closeErr := rows.Close()
+		if closeErr != nil {
+			if retErr != nil {
+				retErr = errors.Join(retErr, closeErr)
+			} else {
+				retErr = closeErr
+			}
+		}
+	}()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		_ = rows.Close()
-		return 0, fmt.Errorf("columns: %w", err)
+		retErr = fmt.Errorf("columns: %w", err)
+		return 0, retErr
 	}
 
 	// 查找列索引（大小写不敏感）
@@ -60,8 +94,8 @@ func parseShowAutoIncValue(ctx context.Context, q Querier) (uint64, error) {
 		switch upper {
 		case "NEXT_GLOBAL_ROW_ID", "NEXT_ROW_ID":
 			if valColIdx != -1 {
-				_ = rows.Close()
-				return 0, fmt.Errorf("ambiguous value columns in SHOW result: %s and %s", cols[valColIdx], c)
+				retErr = fmt.Errorf("ambiguous value columns in SHOW result: %s and %s", cols[valColIdx], c)
+				return 0, retErr
 			}
 			valColIdx = i
 		case "ID_TYPE":
@@ -74,8 +108,8 @@ func parseShowAutoIncValue(ctx context.Context, q Querier) (uint64, error) {
 	}
 
 	if valColIdx == -1 {
-		_ = rows.Close()
-		return 0, errors.New("no value column (NEXT_GLOBAL_ROW_ID or NEXT_ROW_ID) found in SHOW result")
+		retErr = errors.New("no value column (NEXT_GLOBAL_ROW_ID or NEXT_ROW_ID) found in SHOW result")
+		return 0, retErr
 	}
 
 	type candidateRow struct {
@@ -99,7 +133,7 @@ func parseShowAutoIncValue(ctx context.Context, q Querier) (uint64, error) {
 		// 检查 TABLE_NAME 是否为 locks（若存在该列）
 		if tblNameIdx != -1 {
 			valPtr := dest[tblNameIdx].(*any)
-			valStr := strings.TrimSpace(fmt.Sprint(*valPtr))
+			valStr := strings.TrimSpace(normalizeDriverValue(*valPtr))
 			if !strings.EqualFold(valStr, "locks") {
 				continue
 			}
@@ -108,17 +142,17 @@ func parseShowAutoIncValue(ctx context.Context, q Querier) (uint64, error) {
 		// 检查 ID_TYPE 是否为 AUTO_INCREMENT（若存在该列）
 		if idTypeIdx != -1 {
 			valPtr := dest[idTypeIdx].(*any)
-			valStr := strings.TrimSpace(fmt.Sprint(*valPtr))
+			valStr := strings.TrimSpace(normalizeDriverValue(*valPtr))
 			if !strings.EqualFold(valStr, "AUTO_INCREMENT") {
 				continue
 			}
 		}
 
-		// 检查 COLUMN_NAME 是否为 row_id 或非 _tidb_rowid（若存在该列）
+		// 检查 COLUMN_NAME 是否为 row_id（若存在该列）
 		if colNameIdx != -1 {
 			valPtr := dest[colNameIdx].(*any)
-			valStr := strings.TrimSpace(fmt.Sprint(*valPtr))
-			if strings.EqualFold(valStr, "_tidb_rowid") {
+			valStr := strings.TrimSpace(normalizeDriverValue(*valPtr))
+			if !strings.EqualFold(valStr, "row_id") {
 				continue
 			}
 		}
@@ -127,32 +161,31 @@ func parseShowAutoIncValue(ctx context.Context, q Querier) (uint64, error) {
 		candidates = append(candidates, candidateRow{rawVal: *valPtr})
 	}
 
-	if loopErr == nil {
-		if err := rows.Err(); err != nil {
-			loopErr = fmt.Errorf("rows err: %w", err)
-		}
-	}
-
-	closeErr := rows.Close()
-	if loopErr != nil && closeErr != nil {
-		return 0, errors.Join(loopErr, closeErr)
-	}
 	if loopErr != nil {
-		return 0, loopErr
+		retErr = loopErr
+		return 0, retErr
 	}
-	if closeErr != nil {
-		return 0, closeErr
+	if err := rows.Err(); err != nil {
+		retErr = fmt.Errorf("rows err: %w", err)
+		return 0, retErr
 	}
 
 	if len(candidates) == 0 {
-		return 0, errors.New("no target row found in SHOW result for locks AUTO_INCREMENT")
+		retErr = errors.New("no target row found in SHOW result for locks AUTO_INCREMENT")
+		return 0, retErr
 	}
 	if len(candidates) > 1 {
-		return 0, fmt.Errorf("multiple target rows (%d) found in SHOW result for locks AUTO_INCREMENT", len(candidates))
+		retErr = fmt.Errorf("multiple target rows (%d) found in SHOW result for locks AUTO_INCREMENT", len(candidates))
+		return 0, retErr
 	}
 
 	// 解析 uint64 计数器
-	return parseUint64Exact(candidates[0].rawVal)
+	v, err := parseUint64Exact(candidates[0].rawVal)
+	if err != nil {
+		retErr = err
+		return 0, retErr
+	}
+	return v, nil
 }
 
 func parseUint64Exact(v any) (uint64, error) {
@@ -179,6 +212,16 @@ func parseUint64Exact(v any) (uint64, error) {
 			return 0, fmt.Errorf("failed to parse counter []byte %q as uint64: %w", s, err)
 		}
 		return u, nil
+	case sql.RawBytes:
+		s := strings.TrimSpace(string(val))
+		if strings.HasPrefix(s, "-") {
+			return 0, fmt.Errorf("negative counter value string: %s", s)
+		}
+		u, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse counter sql.RawBytes %q as uint64: %w", s, err)
+		}
+		return u, nil
 	case string:
 		s := strings.TrimSpace(val)
 		if strings.HasPrefix(s, "-") {
@@ -203,12 +246,14 @@ func parseUint64Exact(v any) (uint64, error) {
 }
 
 // CheckAutoIncStep 探测 TiDB locks 表自增步长（§7.5）：
-//  1. 生成 crypto 随机 markers（前缀+suffix+_a/_b <= 64）；
-//  2. SHOW TABLE `locks` NEXT_ROW_ID 取得基线 uint64（检查 +2 是否溢出 MaxUint64）；
-//  3. INSERT INTO `locks` (`name`) VALUES (?), (?) 单列插入两行；
-//  4. 只有 INSERT 成功后才登记 owned markers；
-//  5. 再次 SHOW TABLE `locks` NEXT_ROW_ID 验证 target == baseline + 2；
-//  6. 所有后续失败路径均精确清理本次 owned markers，使用独立 bounded cleanup ctx，并通过 errors.Join 合并错误。
+//
+//	前提：管理员预建独占测试schema/无外部并发写入，基线+2不是并发集群证明。
+//	1. 生成 crypto 随机 markers（前缀+suffix+_a/_b <= 64）；
+//	2. SHOW TABLE `locks` NEXT_ROW_ID 取得基线 uint64（检查 +2 是否溢出 MaxUint64）；
+//	3. INSERT INTO `locks` (`name`) VALUES (?), (?) 单列插入两行；
+//	4. 只有 INSERT 成功后才登记 owned markers；
+//	5. 再次 SHOW TABLE `locks` NEXT_ROW_ID 验证 target == baseline + 2；
+//	6. 所有后续失败路径均精确清理本次 owned markers，使用独立 bounded cleanup ctx，并通过 errors.Join 合并错误。
 func CheckAutoIncStep(ctx context.Context, q Querier) (retErr error) {
 	if q == nil {
 		return errors.New("CheckAutoIncStep: querier is nil")
@@ -273,10 +318,12 @@ func CheckAutoIncStep(ctx context.Context, q Querier) (retErr error) {
 }
 
 // CheckAsciiCollision 探测 schema_meta 的 key 列 ascii_bin 大小写敏感隔离性（§7.5）：
-//  1. 生成同随机 suffix 的两个 key（如 ABC_<suffix> 和 abc_<suffix>），长度 <= 64，唯一区别大小写；
-//  2. 分别插入 schema_meta (key, value, updated_at)，每条插入成功后即刻登记归属；
-//  3. 第二条若由于非大小写敏感报 1062 或驱动错误，精确清理第一条成功插入的 key；
-//  4. 资源清理使用独立 bounded ctx，清理错误与主错误 errors.Join。
+//
+//	前提：管理员预建独占测试schema/无外部并发写入，基线+2不是并发集群证明。
+//	1. 生成同随机 suffix 的两个 key（如 ABC_<suffix> 和 abc_<suffix>），长度 <= 64，唯一区别大小写；
+//	2. 分别插入 schema_meta (key, value, updated_at)，每条插入成功后即刻登记归属；
+//	3. 第二条若由于非大小写敏感报 1062 或驱动错误，精确清理第一条成功插入的 key；
+//	4. 资源清理使用独立 bounded ctx，清理错误与主错误 errors.Join。
 func CheckAsciiCollision(ctx context.Context, q Querier) (retErr error) {
 	if q == nil {
 		return errors.New("CheckAsciiCollision: querier is nil")
