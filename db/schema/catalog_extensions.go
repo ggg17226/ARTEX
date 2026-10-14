@@ -23,6 +23,15 @@ var HashIdentityColumns = map[string][2]string{
 
 // ExtensionTables returns the 16 extension/traffic/infrastructure tables
 // (3 dynamic id tables + 5 traffic tables + 8 infrastructure/arbitration tables).
+//
+// withExtensionIdentityCollation wraps a Column with explicit utf8mb4 / utf8mb4_bin charset/collation,
+// keeping all other column properties intact. Scoped strictly to authorized identity columns.
+func withExtensionIdentityCollation(c Column) Column {
+	c.Charset = "utf8mb4"
+	c.Collation = "utf8mb4_bin"
+	return c
+}
+
 func ExtensionTables() []*Table {
 	return []*Table{
 		// 50. llm_records（db/commands.go:156–199 动态表）
@@ -31,8 +40,8 @@ func ExtensionTables() []*Table {
 			DateN("ts"),
 			Text("model"),
 			Text("profile_name"),
-			Text("session_id"),
-			Text("task_id"),
+			withExtensionIdentityCollation(Text("session_id")),
+			withExtensionIdentityCollation(Text("task_id")),
 			Text("worker"),
 			Int("latency_ms"),
 			Int("input_tokens"),
@@ -54,7 +63,7 @@ func ExtensionTables() []*Table {
 		T("llm_usage", "id", true, []Column{
 			CPK("id"),
 			DateN("ts"),
-			Text("task_id"),
+			withExtensionIdentityCollation(Text("task_id")),
 			CRef("exploration_id"),
 			Text("worker"),
 			Text("model"),
@@ -155,8 +164,8 @@ func ExtensionTables() []*Table {
 			BinN("store_id", 16),
 			VarcharAN("role", 8, ""),
 			VarcharAN("relative_dir", 128, ""),
-			TextNN("directory_identity"),
-			TextNN("node_identity"),
+			withExtensionIdentityCollation(TextNN("directory_identity")),
+			withExtensionIdentityCollation(TextNN("node_identity")),
 		}, []Index{
 			IX("uq_traffic_stores_namespace", true, P("namespace")),
 			IX("uq_traffic_stores_store", true, P("store_id")),
@@ -187,9 +196,9 @@ func ExtensionTables() []*Table {
 			VarcharAN("deployment_id", 16, ""),
 			BinN("deployment_uuid", 16),
 			BinN("root_uuid", 16),
-			TextNN("node_identity"),
-			TextNN("canonical_root"),
-			TextNN("root_identity"),
+			withExtensionIdentityCollation(TextNN("node_identity")),
+			withExtensionIdentityCollation(TextNN("canonical_root")),
+			withExtensionIdentityCollation(TextNN("root_identity")),
 			BigNN("version"),
 			TinyNN("state"),
 			Bin("relocation_op_id", 16),

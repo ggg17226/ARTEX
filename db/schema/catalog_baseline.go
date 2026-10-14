@@ -7,13 +7,30 @@ package schema
 // JSONB/数组→MEDIUMTEXT(JSON)；CIDR→TEXT；TIMESTAMPTZ→DATETIME(3)；
 // BOOLEAN→TINYINT(1)；外键/CHECK 全部下推入口（无 FK/CHECK）；
 // hash DDL 16 表中的基线 12 表单键表 + assets/company_scope 分支表在此列全。
+
+// withIdentityCollation wraps a Column with explicit utf8mb4 / utf8mb4_bin charset/collation,
+// keeping all other column properties intact. Scoped strictly to authorized identity columns.
+func withIdentityCollation(c Column) Column {
+	c.Charset = "utf8mb4"
+	c.Collation = "utf8mb4_bin"
+	return c
+}
+
+// withIdentityAsciiCollation wraps a Column with explicit ascii / ascii_bin charset/collation,
+// keeping all other column properties intact. Scoped strictly to authorized identity columns.
+func withIdentityAsciiCollation(c Column) Column {
+	c.Charset = "ascii"
+	c.Collation = "ascii_bin"
+	return c
+}
+
 func BaselineTables() []*Table {
 	return []*Table{
 		// 1. companies（nkey hash DDL）
 		T("companies", "id", true, []Column{
 			CPK("id"),
 			TextN("name", ""),
-			TextN("nkey", ""),
+			withIdentityCollation(TextN("nkey", "")),
 			BlobN("nkey_identity"),
 			BinN("nkey_hash", 32),
 			Text("logo"),
@@ -233,7 +250,7 @@ func BaselineTables() []*Table {
 		// 11. settings（原 TEXT PK → 隐藏 row_id；key hash DDL）
 		T("settings", "row_id", true, []Column{
 			CPK("row_id"),
-			TextNN("key"),
+			withIdentityCollation(TextNN("key")),
 			BlobN("key_identity"),
 			BinN("key_hash", 32),
 			TextNN("value"),
@@ -245,7 +262,7 @@ func BaselineTables() []*Table {
 		// 12. llm_profiles（one-default 部分唯一 → 生成列 is_default_key；name hash 唯一）
 		T("llm_profiles", "id", true, []Column{
 			CPK("id"),
-			TextNN("name"),
+			withIdentityCollation(TextNN("name")),
 			BlobN("name_identity"),
 			BinN("name_hash", 32),
 			TextNN("format"),
@@ -294,7 +311,7 @@ func BaselineTables() []*Table {
 		T("task_categories", "id", true, []Column{
 			CPK("id"),
 			TextNN("name"),
-			TextNN("nkey"),
+			withIdentityCollation(TextNN("nkey")),
 			BlobN("nkey_identity"),
 			BinN("nkey_hash", 32),
 			DateN("created_at"),
@@ -355,7 +372,7 @@ func BaselineTables() []*Table {
 			JSONN("warnings", "[]"),
 			IntN("format_version", "2"),
 			TextN("archive_path", ""),
-			TextN("sha256", ""),
+			withIdentityAsciiCollation(TextN("sha256", "")),
 			BigN("original_size", "0"),
 			BigN("compressed_size", "0"),
 			TextN("task_name", ""),
@@ -382,7 +399,7 @@ func BaselineTables() []*Table {
 		T("task_templates", "id", true, []Column{
 			CPK("id"),
 			TextNN("name"),
-			TextNN("nkey"),
+			withIdentityCollation(TextNN("nkey")),
 			BlobN("nkey_identity"),
 			BinN("nkey_hash", 32),
 			TextNN("description"),
@@ -463,7 +480,7 @@ func BaselineTables() []*Table {
 		// 22. agents（key hash DDL）
 		T("agents", "id", true, []Column{
 			CPK("id"),
-			TextNN("key"),
+			withIdentityCollation(TextNN("key")),
 			BlobN("key_identity"),
 			BinN("key_hash", 32),
 			TextNN("name"),
@@ -508,7 +525,7 @@ func BaselineTables() []*Table {
 		T("agent_prompt_vars", "id", true, []Column{
 			CPK("id"),
 			CRefN("agent_id"),
-			TextNN("var_name"),
+			withIdentityCollation(TextNN("var_name")),
 			BlobN("identity"),
 			BinN("identity_hash", 32),
 			Text("description"),
@@ -521,7 +538,7 @@ func BaselineTables() []*Table {
 		// 25. mcp_servers（name hash DDL）
 		T("mcp_servers", "id", true, []Column{
 			CPK("id"),
-			TextNN("name"),
+			withIdentityCollation(TextNN("name")),
 			BlobN("name_identity"),
 			BinN("name_hash", 32),
 			TextNN("transport"),
@@ -541,7 +558,7 @@ func BaselineTables() []*Table {
 		T("mcp_tools_cache", "id", true, []Column{
 			CPK("id"),
 			CRefN("server_id"),
-			TextNN("tool_name"),
+			withIdentityCollation(TextNN("tool_name")),
 			BlobN("identity"),
 			BinN("identity_hash", 32),
 			Text("description"),
@@ -555,9 +572,9 @@ func BaselineTables() []*Table {
 		T("agent_visibility", "row_id", true, []Column{
 			CPK("row_id"),
 			CRefN("agent_id"),
-			TextNN("resource_kind"),
+			withIdentityCollation(TextNN("resource_kind")),
 			CRefN("resource_id"),
-			TextN("mcp_tool_name", ""),
+			withIdentityCollation(TextN("mcp_tool_name", "")),
 			BlobN("identity"),
 			BinN("identity_hash", 32),
 			BoolN("enabled", true),
@@ -571,7 +588,7 @@ func BaselineTables() []*Table {
 		T("agent_skill_visibility", "row_id", true, []Column{
 			CPK("row_id"),
 			CRefN("agent_id"),
-			TextNN("skill_name"),
+			withIdentityCollation(TextNN("skill_name")),
 			BlobN("identity"),
 			BinN("identity_hash", 32),
 			BoolN("enabled", true),
@@ -586,11 +603,11 @@ func BaselineTables() []*Table {
 			CPK("id"),
 			DateN("ts"),
 			TextNN("skill"),
-			Text("agent_key"),
+			withIdentityCollation(Text("agent_key")),
 			CRef("task_id"),
 			CRef("exploration_id"),
 			CRef("intent_id"),
-			Text("session_id"),
+			withIdentityCollation(Text("session_id")),
 			IntN("args_len", "0"),
 			BoolN("found", true),
 		}, []Index{
@@ -602,12 +619,12 @@ func BaselineTables() []*Table {
 		T("tool_usage", "id", true, []Column{
 			CPK("id"),
 			DateN("ts"),
-			TextNN("tool_key"),
-			Text("agent_key"),
+			withIdentityCollation(TextNN("tool_key")),
+			withIdentityCollation(Text("agent_key")),
 			CRef("task_id"),
 			CRef("exploration_id"),
 			CRef("intent_id"),
-			Text("session_id"),
+			withIdentityCollation(Text("session_id")),
 		}, []Index{
 			IX("idx_tool_usage_tool", false, PP("tool_key", 64), PD("ts")),
 			IX("idx_tool_usage_task", false, P("task_id")),
@@ -616,7 +633,7 @@ func BaselineTables() []*Table {
 		// 31. tools（原 TEXT PK → 隐藏 row_id；key hash DDL）
 		T("tools", "row_id", true, []Column{
 			CPK("row_id"),
-			TextNN("key"),
+			withIdentityCollation(TextNN("key")),
 			BlobN("key_identity"),
 			BinN("key_hash", 32),
 			BoolN("system", true),
@@ -635,7 +652,7 @@ func BaselineTables() []*Table {
 		// 32. conversations
 		T("conversations", "id", true, []Column{
 			CPK("id"),
-			TextNN("agent_key"),
+			withIdentityCollation(TextNN("agent_key")),
 			TextN("title", ""),
 			CRef("llm_profile_id"),
 			Date("pinned_at"),
@@ -670,7 +687,7 @@ func BaselineTables() []*Table {
 		// 34. agent_triggers
 		T("agent_triggers", "id", true, []Column{
 			CPK("id"),
-			TextNN("agent_key"),
+			withIdentityCollation(TextNN("agent_key")),
 			BoolN("enabled", true),
 			IntN("interval_sec", "0"),
 			BoolN("on_finding", false),
@@ -695,7 +712,7 @@ func BaselineTables() []*Table {
 		// 35. scheduler_state（原 TEXT PK → 隐藏 row_id；key hash DDL）
 		T("scheduler_state", "row_id", true, []Column{
 			CPK("row_id"),
-			TextNN("key"),
+			withIdentityCollation(TextNN("key")),
 			BlobN("key_identity"),
 			BinN("key_hash", 32),
 			TextN("value", ""),
@@ -726,7 +743,7 @@ func BaselineTables() []*Table {
 			CPK("id"),
 			CRef("rule_id"),
 			CRef("conversation_id"),
-			Text("task_id"),
+			withIdentityCollation(Text("task_id")),
 			TextN("agent_name", ""),
 			TextNN("tool_name"),
 			JSONN("tool_input", "{}"),
@@ -790,7 +807,7 @@ func BaselineTables() []*Table {
 		T("traffic_evidence_snapshots", "row_id", true, []Column{
 			CPK("row_id"),
 			CharA("id", 64),
-			TextNN("source_traffic_id"),
+			withIdentityCollation(TextNN("source_traffic_id")),
 			BigNN("captured_at"),
 			TextNN("url"),
 			TextNN("method"),
@@ -860,7 +877,7 @@ func BaselineTables() []*Table {
 			VarcharAN("id", 64, ""),
 			VarcharAN("session_key", 128, ""),
 			BigNN("generation"),
-			TextNN("client_id"),
+			withIdentityCollation(TextNN("client_id")),
 			BlobN("identity"),
 			BinN("identity_hash", 32),
 			TextNN("question"),
