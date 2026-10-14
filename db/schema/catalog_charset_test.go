@@ -607,14 +607,15 @@ func TestCharsetGuardrails(t *testing.T) {
 	for _, check := range nonIdentityChecks {
 		tbl := getTableByName(check.table)
 		if tbl == nil {
-			continue
+			t.Fatalf("non-identity check table %s missing", check.table)
 		}
 		c := findColumn(tbl, check.col)
-		if c != nil {
-			if c.Charset != "" || c.Collation != "" {
-				t.Errorf("non-identity column %s.%s should have empty charset/collation, got %q/%q",
-					check.table, check.col, c.Charset, c.Collation)
-			}
+		if c == nil {
+			t.Fatalf("non-identity check column %s.%s missing", check.table, check.col)
+		}
+		if c.Charset != "" || c.Collation != "" {
+			t.Errorf("non-identity column %s.%s should have empty charset/collation, got %q/%q",
+				check.table, check.col, c.Charset, c.Collation)
 		}
 	}
 
