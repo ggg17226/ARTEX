@@ -3,6 +3,7 @@ package tidb
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +15,16 @@ import (
 // ErrMaintenanceRowMissing 表示 maintenance 表或 singleton 行不存在：
 // 先由 ExecutePrepare / EnsureLockInfrastructure 建立基础设施。
 var ErrMaintenanceRowMissing = errors.New("maintenance row missing: run ExecutePrepare (or EnsureLockInfrastructure) first")
+
+// ErrMaintenanceLocked 表示 maintenance 单例行当前被持有（op_id 非空）。
+// CoordinateMaintenance 在事务内检测到该状态时返回：持有方的行锁已随其
+// autocommit 释放，互斥只能靠 op_id 判定，故 fail closed 不静默通过，
+// 调用方应退避重试或按维护窗口语义处理。
+var ErrMaintenanceLocked = errors.New("maintenance lock is held by another op")
+
+// ErrInvalidOpID 表示 opID 不是合法 16 字节 UUID（32 位 hex，连字符可选）。
+// Fail closed：阻止非 hex 字符串到达 SQL 端 UNHEX 后隐式得到 NULL 写入。
+var ErrInvalidOpID = errors.New("invalid opID")
 
 // MaintenanceTableDDL 是 P01 自有的基础设施 DDL（幂等；TiDB DDL 自动提交）。
 // 红线：无 FOREIGN KEY、无 CHECK；物理主键单列 BIGINT UNSIGNED + AUTO_ID_CACHE=1。
@@ -67,6 +78,16 @@ func AcquireMaintenance(ctx context.Context, db *sql.DB, opID string) error {
 	if err != nil {
 		return fmt.Errorf("acquire maintenance: %w", err)
 	}
+	// Fail closed：单例行缺失（表在但行不在）时条件 UPDATE 恒 0 行，若不前置
+	// 探测会陷入无限退避空转；首次查询即判定并返回 ErrMaintenanceRowMissing。
+	var one int
+	if err := db.QueryRowContext(ctx, `
+SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
+			return ErrMaintenanceRowMissing
+		}
+		return fmt.Errorf("acquire maintenance: %w", err)
+	}
 	attempt := 0
 	for {
 		res, err := db.ExecContext(ctx, `
@@ -103,6 +124,7 @@ WHERE singleton_key = 'maintenance' AND op_id IS NULL`, op)
 }
 
 // ReleaseMaintenance 以 opID 条件释放锁；幂等（锁已不在自己手里返回 false）。
+// 单例行缺失时返回 ErrMaintenanceRowMissing（fail closed）。
 // 返回 (是否实际释放, error)。
 func ReleaseMaintenance(ctx context.Context, db *sql.DB, opID string) (bool, error) {
 	op, err := normalizeOpID(opID)
@@ -123,24 +145,46 @@ WHERE singleton_key = 'maintenance' AND op_id = UNHEX(?)`, op)
 	if err != nil {
 		return false, fmt.Errorf("release maintenance: %w", err)
 	}
-	return n == 1, nil
+	if n == 1 {
+		return true, nil
+	}
+	// 0 行：区分「单例行缺失」（fail closed）与「被他人持有」（幂等 false）。
+	var one int
+	if err := db.QueryRowContext(ctx, `
+SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
+			return false, ErrMaintenanceRowMissing
+		}
+		return false, fmt.Errorf("release maintenance: %w", err)
+	}
+	return false, nil
 }
 
 // CoordinateMaintenance 在调用方事务内对 maintenance 单例行加 FOR UPDATE 行锁，
-// 使该事务与 AcquireMaintenance 抢占方互斥；行锁随 tx commit/rollback 原子释放。
+// 并检查 op_id 判定互斥：
+//   - 行缺失（含表缺失）→ ErrMaintenanceRowMissing；
+//   - op_id 非空（已被 AcquireMaintenance 持有）→ ErrMaintenanceLocked
+//     （持有方 autocommit 已释放行锁，互斥只能靠 op_id 判定，fail closed
+//     不静默通过，调用方应退避重试）；
+//   - op_id 为空 → 加行锁成功，该事务与后续抢占方互斥，行锁随
+//     tx commit/rollback 原子释放。
+//
 // 语义对齐既有 db.coordinateWithSchemaMigration（PG advisory xact lock，db/db.go:82）。
 // 注意：tx 必须持有真实事务；DDL 不得出现在该 tx 内（TiDB DDL 自动提交）。
 func CoordinateMaintenance(ctx context.Context, db *sql.DB, tx *sql.Tx) error {
 	if tx == nil {
 		return fmt.Errorf("coordinate maintenance: nil tx")
 	}
-	var one int
+	var opID sql.Null[string]
 	if err := tx.QueryRowContext(ctx, `
-SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance' FOR UPDATE`).Scan(&one); err != nil {
-		if isTableMissing(err) {
+SELECT op_id FROM maintenance WHERE singleton_key = 'maintenance' FOR UPDATE`).Scan(&opID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
 			return ErrMaintenanceRowMissing
 		}
 		return fmt.Errorf("coordinate maintenance: %w", err)
+	}
+	if opID.Valid {
+		return ErrMaintenanceLocked
 	}
 	return nil
 }
@@ -155,12 +199,17 @@ func isTableMissing(err error) bool {
 }
 
 // normalizeOpID 把 16 字节 UUID 字符串（32 位 hex 或带连字符 36 位）归一为
-// 32 位 hex，供 SQL 端 UNHEX 写入/比对 BINARY(16) 的 op_id 列；长度不符 →
-// 显式错误（fail closed，与 P01 其余入口一致）。
+// 32 位 hex，供 SQL 端 UNHEX 写入/比对 BINARY(16) 的 op_id 列；长度不符或
+// 含非 hex 字符 → ErrInvalidOpID（fail closed，与 P01 其余入口一致）。
+// 严格用 hex.DecodeString 逐字符校验：非 hex 字符串若漏过，SQL 端 UNHEX
+// 会隐式返回 NULL，污染 BINARY(16) 列与比对语义。
 func normalizeOpID(opID string) (string, error) {
 	s := strings.ReplaceAll(opID, "-", "")
 	if len(s) != 32 {
-		return "", fmt.Errorf("opID %q: expected 16-byte UUID (32 hex chars, dashes optional)", opID)
+		return "", fmt.Errorf("opID %q: expected 16-byte UUID (32 hex chars, dashes optional): %w", opID, ErrInvalidOpID)
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return "", fmt.Errorf("opID %q: expected 32 hex chars: %w", opID, ErrInvalidOpID)
 	}
 	return s, nil
 }
