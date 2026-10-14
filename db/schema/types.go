@@ -77,12 +77,17 @@ func (c Column) KeyBytes(prefix int) int {
 		return 8
 	case TDate3:
 		return 5
-	case TBinary, TVarbinary, TMediumBlob:
+	case TBinary, TVarbinary:
 		n := c.Length
 		if prefix > 0 && prefix < n {
 			n = prefix
 		}
 		return n
+	case TMediumBlob:
+		if prefix <= 0 {
+			return -1
+		}
+		return prefix
 	case TVarchar, TChar:
 		w := 4
 		if c.Charset == "ascii" {
@@ -181,19 +186,28 @@ func (t *Table) Validate() error {
 			return fmt.Errorf("table %s: duplicate index name %s", t.Name, ix.Name)
 		}
 		seenIdx[ix.Name] = true
-		if IndexBytes(t, ix) < 0 {
-			return fmt.Errorf("table %s: index %s has an unbounded or unresolvable part", t.Name, ix.Name)
-		}
 		for _, p := range ix.Parts {
 			if p.Column == t.PKColumn {
 				return fmt.Errorf("table %s: index %s must not contain the primary key column", t.Name, ix.Name)
 			}
 			for i := range t.Columns {
 				c := &t.Columns[i]
-				if c.Name == p.Column && (c.Type == TText || c.Type == TJSON) && p.Prefix == 0 {
-					return fmt.Errorf("table %s: index %s part %s is TEXT without prefix (unbounded)", t.Name, ix.Name, p.Column)
+				if c.Name == p.Column {
+					if c.Type == TMediumBlob && p.Prefix <= 0 {
+						return fmt.Errorf("table %s index %s: BLOB column %s requires prefix length", t.Name, ix.Name, p.Column)
+					}
+					if (c.Type == TText || c.Type == TJSON) && p.Prefix == 0 {
+						return fmt.Errorf("table %s: index %s part %s is TEXT without prefix (unbounded)", t.Name, ix.Name, p.Column)
+					}
 				}
 			}
+		}
+		totalBytes := ix.IndexBytes(t)
+		if totalBytes < 0 {
+			return fmt.Errorf("table %s: index %s has an unbounded or unresolvable part", t.Name, ix.Name)
+		}
+		if totalBytes > 3072 {
+			return fmt.Errorf("table %s index %s: index bytes %d exceeds TiDB limit 3072", t.Name, ix.Name, totalBytes)
 		}
 	}
 	return nil

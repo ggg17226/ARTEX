@@ -54,12 +54,24 @@ func TestIndexPartBytes(t *testing.T) {
 	if got := IndexBytes(T("t", "id", true, []Column{CPK("id"), CRef("a"), VarcharAN("k", 64, ""), Text("note"), BinN("h", 32)}, nil), IX("x", false, P("missing"))); got != -1 {
 		t.Errorf("unknown column part = %d, want -1", got)
 	}
+
+	// TMediumBlob tests
+	blobCol := Blob("b")
+	if got := blobCol.KeyBytes(0); got != -1 {
+		t.Errorf("mediumblob prefix 0 = %d, want -1", got)
+	}
+	if got := blobCol.KeyBytes(191); got != 191 {
+		t.Errorf("mediumblob prefix 191 = %d, want 191", got)
+	}
+	if got := blobCol.KeyBytes(3073); got != 3073 {
+		t.Errorf("mediumblob prefix 3073 = %d, want 3073", got)
+	}
 }
 
 func TestTableValidate(t *testing.T) {
 	ok := T("t", "id", true,
-		[]Column{CPK("id"), CRef("a"), TextN("note", "x")},
-		[]Index{IX("uq_t_a", true, P("a"))},
+		[]Column{CPK("id"), CRef("a"), TextN("note", "x"), Blob("body")},
+		[]Index{IX("uq_t_a", true, P("a")), IX("ix_t_blob", false, PP("body", 191))},
 	)
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("valid table rejected: %v", err)
@@ -77,6 +89,8 @@ func TestTableValidate(t *testing.T) {
 		{"dup index", T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("u", true, P("a")), IX("u", true, P("a"))}), "duplicate index name"},
 		{"text full index", T("t", "id", true, []Column{CPK("id"), Text("note")}, []Index{IX("u", true, P("note"))}), "unbounded"},
 		{"index on pk", T("t", "id", true, []Column{CPK("id"), CRefN("a")}, []Index{IX("u", true, P("id"))}), "primary key column"},
+		{"blob without prefix", T("t", "id", true, []Column{CPK("id"), Blob("payload")}, []Index{IX("ix_blob", false, P("payload"))}), "requires prefix length"},
+		{"blob prefix 3073 exceeds limit", T("t", "id", true, []Column{CPK("id"), Blob("payload")}, []Index{IX("ix_blob", false, PP("payload", 3073))}), "exceeds TiDB limit 3072"},
 	}
 	for _, c := range cases {
 		err := c.tbl.Validate()

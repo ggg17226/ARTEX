@@ -60,6 +60,11 @@ type Index struct {
 	Parts  []IndexPart
 }
 
+// IndexBytes calculates the total byte budget of this index on the given table.
+func (ix Index) IndexBytes(t *Table) int {
+	return IndexBytes(t, ix)
+}
+
 // Table is one declarative table (单列 BIGINT UNSIGNED 物理主键).
 type Table struct {
 	Name          string
