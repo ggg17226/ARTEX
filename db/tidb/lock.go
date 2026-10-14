@@ -34,7 +34,7 @@ var ErrInvalidOpID = errors.New("invalid opID")
 // `schema_meta` 的 `key='schema_version'` 行。
 const MaintenanceTableDDL = `
 CREATE TABLE IF NOT EXISTS ` + "`maintenance`" + ` (
-  ` + "`row_id`" + ` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT AUTO_ID_CACHE=1,
+  ` + "`row_id`" + ` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   ` + "`singleton_key`" + ` VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
   ` + "`op_id`" + ` BINARY(16) NULL,
   ` + "`mode`" + ` TINYINT NOT NULL,
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS ` + "`maintenance`" + ` (
   ` + "`updated_at`" + ` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (` + "`row_id`" + `),
   UNIQUE KEY ` + "`uq_maintenance_singleton`" + ` (` + "`singleton_key`" + `)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_ID_CACHE=1;
 `
 
 // lockBackoff 序列：100ms 起、上限 1s（对齐既有 applySchemaWithRetry 的节奏）。

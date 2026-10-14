@@ -16,21 +16,21 @@ import (
 const (
 	schemaMetaDDL = `
 CREATE TABLE IF NOT EXISTS ` + "`schema_meta`" + ` (
-  ` + "`row_id`" + ` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT AUTO_ID_CACHE=1,
+  ` + "`row_id`" + ` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   ` + "`key`" + ` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
   ` + "`value`" + ` BIGINT NOT NULL,
   ` + "`updated_at`" + ` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (` + "`row_id`" + `),
   UNIQUE KEY ` + "`uq_schema_meta_key`" + ` (` + "`key`" + `)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_ID_CACHE=1;
 `
 	locksDDL = `
 CREATE TABLE IF NOT EXISTS ` + "`locks`" + ` (
-  ` + "`row_id`" + ` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT AUTO_ID_CACHE=1,
+  ` + "`row_id`" + ` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   ` + "`name`" + ` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
   PRIMARY KEY (` + "`row_id`" + `),
   UNIQUE KEY ` + "`uq_locks_name`" + ` (` + "`name`" + `)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_ID_CACHE=1;
 `
 )
 
