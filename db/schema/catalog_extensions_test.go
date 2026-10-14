@@ -154,3 +154,165 @@ func joinCols(cols []string) string {
 	}
 	return s
 }
+
+func TestExtensionColumnContracts(t *testing.T) {
+	byName := map[string]*Table{}
+	for _, tb := range ExtensionTables() {
+		byName[tb.Name] = tb
+	}
+
+	findCol := func(tb *Table, colName string) *Column {
+		if tb == nil {
+			return nil
+		}
+		for i := range tb.Columns {
+			if tb.Columns[i].Name == colName {
+				return &tb.Columns[i]
+			}
+		}
+		return nil
+	}
+
+	t.Run("I2_traffic_exchange_bodies_blob_refs", func(t *testing.T) {
+		tb := byName["traffic_exchange_bodies"]
+		if tb == nil {
+			t.Fatalf("traffic_exchange_bodies missing")
+		}
+		// req_body / resp_body 原始正文保持 MEDIUMBLOB NULL
+		for _, name := range []string{"req_body", "resp_body"} {
+			c := findCol(tb, name)
+			if c == nil {
+				t.Fatalf("column %s missing", name)
+			}
+			if c.Type != TMediumBlob {
+				t.Errorf("%s type = %v, want TMediumBlob", name, c.Type)
+			}
+			if c.NotNull {
+				t.Errorf("%s NotNull = %v, want false", name, c.NotNull)
+			}
+		}
+		// req_blob / resp_blob 必须为 CHAR(64) ascii_bin, 可空 NotNull=false, 无默认值
+		for _, name := range []string{"req_blob", "resp_blob"} {
+			c := findCol(tb, name)
+			if c == nil {
+				t.Fatalf("column %s missing", name)
+			}
+			if c.Type != TChar || c.Length != 64 {
+				t.Errorf("%s Type=%v Length=%d, want TChar(64)", name, c.Type, c.Length)
+			}
+			if c.Charset != "ascii" || c.Collation != "ascii_bin" {
+				t.Errorf("%s Charset=%q Collation=%q, want ascii/ascii_bin", name, c.Charset, c.Collation)
+			}
+			if c.NotNull {
+				t.Errorf("%s NotNull = true, want false (nullable hash)", name)
+			}
+			if c.Default != "" {
+				t.Errorf("%s Default = %q, want empty", name, c.Default)
+			}
+		}
+	})
+
+	t.Run("I3_storage_job_pins_size_bytes_unsigned", func(t *testing.T) {
+		tb := byName["storage_job_pins"]
+		if tb == nil {
+			t.Fatalf("storage_job_pins missing")
+		}
+		c := findCol(tb, "size_bytes")
+		if c == nil {
+			t.Fatalf("size_bytes missing")
+		}
+		if c.Type != TBigUnsigned {
+			t.Errorf("size_bytes Type = %v, want TBigUnsigned", c.Type)
+		}
+		if !c.NotNull {
+			t.Errorf("size_bytes NotNull = false, want true")
+		}
+		if c.Default != "0" {
+			t.Errorf("size_bytes Default = %q, want '0'", c.Default)
+		}
+		if sql := c.SQLType(); sql != "BIGINT UNSIGNED" {
+			t.Errorf("size_bytes SQLType = %q, want 'BIGINT UNSIGNED'", sql)
+		}
+	})
+
+	t.Run("I4_traffic_index_chunks_text_utf8mb4", func(t *testing.T) {
+		tb := byName["traffic_index_chunks"]
+		if tb == nil {
+			t.Fatalf("traffic_index_chunks missing")
+		}
+		c := findCol(tb, "text")
+		if c == nil {
+			t.Fatalf("text missing")
+		}
+		if c.Type != TText {
+			t.Errorf("text Type = %v, want TText (MEDIUMTEXT)", c.Type)
+		}
+		if !c.NotNull {
+			t.Errorf("text NotNull = false, want true")
+		}
+		if c.Default != "" {
+			t.Errorf("text Default = %q, want empty", c.Default)
+		}
+		if c.Charset != "utf8mb4" || c.Collation != "utf8mb4_bin" {
+			t.Errorf("text Charset=%q Collation=%q, want utf8mb4/utf8mb4_bin", c.Charset, c.Collation)
+		}
+		wantSQL := "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+		if sql := c.SQLType(); sql != wantSQL {
+			t.Errorf("text SQLType = %q, want %q", sql, wantSQL)
+		}
+	})
+
+	t.Run("I5_llm_cache_column_names", func(t *testing.T) {
+		// llm_records: cache_read / cache_write 为 INTEGER NULL, 绝无 _tokens 别名
+		records := byName["llm_records"]
+		if records == nil {
+			t.Fatalf("llm_records missing")
+		}
+		for _, bad := range []string{"cache_read_tokens", "cache_write_tokens"} {
+			if findCol(records, bad) != nil {
+				t.Errorf("llm_records should not contain %q", bad)
+			}
+		}
+		for _, name := range []string{"cache_read", "cache_write"} {
+			c := findCol(records, name)
+			if c == nil {
+				t.Fatalf("llm_records missing column %s", name)
+			}
+			if c.Type != TInt {
+				t.Errorf("llm_records.%s Type = %v, want TInt", name, c.Type)
+			}
+			if c.NotNull {
+				t.Errorf("llm_records.%s NotNull = true, want false", name)
+			}
+			if c.Default != "" {
+				t.Errorf("llm_records.%s Default = %q, want empty", name, c.Default)
+			}
+		}
+
+		// llm_usage: cache_read / cache_write 为 INTEGER NOT NULL DEFAULT 0, 绝无 _tokens 别名
+		usage := byName["llm_usage"]
+		if usage == nil {
+			t.Fatalf("llm_usage missing")
+		}
+		for _, bad := range []string{"cache_read_tokens", "cache_write_tokens"} {
+			if findCol(usage, bad) != nil {
+				t.Errorf("llm_usage should not contain %q", bad)
+			}
+		}
+		for _, name := range []string{"cache_read", "cache_write"} {
+			c := findCol(usage, name)
+			if c == nil {
+				t.Fatalf("llm_usage missing column %s", name)
+			}
+			if c.Type != TInt {
+				t.Errorf("llm_usage.%s Type = %v, want TInt", name, c.Type)
+			}
+			if !c.NotNull {
+				t.Errorf("llm_usage.%s NotNull = false, want true", name)
+			}
+			if c.Default != "0" {
+				t.Errorf("llm_usage.%s Default = %q, want '0'", name, c.Default)
+			}
+		}
+	})
+}
