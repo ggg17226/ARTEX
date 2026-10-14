@@ -288,7 +288,18 @@ func TestRedactDSN(t *testing.T) {
 	// 非法 DSN 测试
 	bad := "invalid-dsn"
 	redactedBad := tidb.RedactDSN(bad)
-	if redactedBad != "***unparseable-dsn***" {
-		t.Fatalf("expected ***unparseable-dsn***, got %q", redactedBad)
+	if redactedBad != "[redacted-invalid-dsn]" {
+		t.Fatalf("expected [redacted-invalid-dsn], got %q", redactedBad)
+	}
+
+	// 针对触发驱动底层 panic 的废弃参数（如 strict=true）测试
+	panicDSN := "app:secret@tcp(127.0.0.1:4000)/artex_db?strict=true"
+	if _, err := tidb.NormalizeDSN(panicDSN); err == nil {
+		t.Fatal("NormalizeDSN with strict=true should return error, got nil")
+	} else if !strings.Contains(err.Error(), "invalid DSN") {
+		t.Fatalf("NormalizeDSN error should wrap panic msg, got %v", err)
+	}
+	if got := tidb.RedactDSN(panicDSN); got != "[redacted-invalid-dsn]" {
+		t.Fatalf("RedactDSN(panicDSN) = %q, want [redacted-invalid-dsn]", got)
 	}
 }

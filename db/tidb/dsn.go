@@ -19,6 +19,18 @@ var requiredDSNParams = map[string]string{
 	"charset":   "utf8mb4",
 }
 
+// safeParseDSN 包装 mysql.ParseDSN 并使用 recover 捕获 panic。
+// go-sql-driver/mysql v1.9.3 在遇到已废弃参数（如 strict=true）时会直接 panic，
+// 本函数确保将 panic 优雅转换为 error，防止进程崩溃（Fail Closed）。
+func safeParseDSN(dsn string) (cfg *mysql.Config, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("tidb: invalid DSN: %v", r)
+		}
+	}()
+	return mysql.ParseDSN(dsn)
+}
+
 // NormalizeDSN 解析并规范化 TiDB DSN（go-sql-driver 语法
 // user:password@tcp(host:port)/dbname?params）：
 //   - 缺 user / 缺库名 → 错误（ARTEX 只连接预建库，绝不隐式建库）；
@@ -37,7 +49,7 @@ var requiredDSNParams = map[string]string{
 // 且对 duration 类型参数（如 1µs / 1μs 均格式化为 1us）做 ASCII 兼容处理，
 // 库名保留 url.PathEscape，保证 ParseDSN 往返稳定、幂等成立。
 func NormalizeDSN(dsn string) (string, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+	cfg, err := safeParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("normalize DSN: %w", err)
 	}
@@ -157,12 +169,12 @@ func explicitParamsValues(dsn string) (url.Values, error) {
 }
 
 // RedactDSN 返回脱敏 DSN（密码替换为 ****），供启动日志使用。
-// 解析失败时返回 "***unparseable-dsn***" 而不是原串，避免凭据泄漏。
+// 解析失败时返回安全占位符 "[redacted-invalid-dsn]" 而不是原串，避免凭据泄漏或 panic。
 // 用户显式参数（含重复多值）经 explicitParamsValues 还原后原样保留。
 func RedactDSN(dsn string) string {
-	cfg, err := mysql.ParseDSN(dsn)
+	cfg, err := safeParseDSN(dsn)
 	if err != nil {
-		return "***unparseable-dsn***"
+		return "[redacted-invalid-dsn]"
 	}
 	cfg.Passwd = "****"
 	params, err := explicitParamsValues(dsn)

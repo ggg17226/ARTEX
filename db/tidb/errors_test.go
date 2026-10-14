@@ -2,6 +2,7 @@ package tidb_test
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net"
@@ -44,6 +45,27 @@ func TestClassify_DriverPreflightError(t *testing.T) {
 	}
 	if !tidb.IsRetryable(wrapped) {
 		t.Fatal("connection-level driver error should be retryable")
+	}
+}
+
+func TestClassify_DriverBadConnSentinels(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"mysql.ErrInvalidConn", mysql.ErrInvalidConn},
+		{"wrapped mysql.ErrInvalidConn", fmt.Errorf("transport failed: %w", mysql.ErrInvalidConn)},
+		{"driver.ErrBadConn", driver.ErrBadConn},
+		{"wrapped driver.ErrBadConn", fmt.Errorf("connection dead: %w", driver.ErrBadConn)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tidb.Classify(tc.err); got != tidb.KindConnError {
+				t.Fatalf("Classify(%s) = %v, want KindConnError", tc.name, got)
+			}
+			if !tidb.IsRetryable(tc.err) {
+				t.Fatalf("IsRetryable(%s) = false, want true", tc.name)
+			}
+		})
 	}
 }
 

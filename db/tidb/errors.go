@@ -2,6 +2,7 @@ package tidb
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"net"
 
@@ -17,11 +18,11 @@ const (
 	KindDeadlock                   // 1213 死锁（可重试）
 	KindLockTimeout                // 1205 锁等待超时（可重试）
 	KindConnectionLost             // 2006/2013 连接断开（可重试）
-	KindConnError                  // driver 前置错误（拨号/认证/握手），区别于业务错误
+	KindConnError                  // driver 前置/底层连接错误（拨号/认证/握手/ErrInvalidConn/driver.ErrBadConn），区别于业务错误
 	KindCancelled                  // context 取消/超时，不重试、不掩盖
 )
 
-// Classify 按 driver 错误类型归类。errors.As 兼容任意包装层。
+// Classify 按 driver 错误类型归类。errors.As / errors.Is 兼容任意包装层。
 func Classify(err error) Kind {
 	if err == nil {
 		return KindUnknown
@@ -43,6 +44,12 @@ func Classify(err error) Kind {
 		default:
 			return KindUnknown
 		}
+	}
+	// 驱动底层连接断开/坏连接判定：
+	// go-sql-driver/mysql v1.9.3 连接断开或握手失败时返回 mysql.ErrInvalidConn
+	// 标准库 database/sql/driver 定义 driver.ErrBadConn
+	if errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, driver.ErrBadConn) {
+		return KindConnError
 	}
 	// v1.9.3 最小偏差：driver 已无 MySQLDriverError 类型，前置 dial 错误实测为 *net.OpError（见 task-4-report.md 顾虑 1）
 	var drvErr *net.OpError

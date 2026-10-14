@@ -25,6 +25,11 @@ func TestAcquireReleaseMaintenance_Real(t *testing.T) {
 	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = tidb.ReleaseMaintenance(cleanCtx, db, opIDA)
+	})
 	// 竞争方在 300ms 截止内必须失败（A 持锁）
 	ctxB, cancelB := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancelB()
@@ -50,6 +55,11 @@ func TestAcquireReleaseMaintenance_Real(t *testing.T) {
 	if err := tidb.AcquireMaintenance(ctx, db, opIDC); err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = tidb.ReleaseMaintenance(cleanCtx, db, opIDC)
+	})
 	_, _ = tidb.ReleaseMaintenance(ctx, db, opIDC)
 }
 
@@ -72,13 +82,13 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
+	t.Cleanup(func() { _ = tx.Rollback() })
 	if err := tidb.CoordinateMaintenance(ctx, db, tx); err != nil {
 		t.Fatalf("CoordinateMaintenance: %v", err)
 	}
 	ctxB, cancelB := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancelB()
 	if err := tidb.AcquireMaintenance(ctxB, db, "b1b2b3b4b5b6b7b8b9b0c1c2c3c4c5c6"); err == nil {
-		_ = tx.Rollback()
 		t.Fatal("acquire should be blocked by coordinating tx")
 	}
 	if err := tx.Commit(); err != nil {
@@ -89,6 +99,11 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 	if err := tidb.AcquireMaintenance(ctx, db, opIDAft); err != nil {
 		t.Fatalf("acquire after commit: %v", err)
 	}
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = tidb.ReleaseMaintenance(cleanCtx, db, opIDAft)
+	})
 	_, _ = tidb.ReleaseMaintenance(ctx, db, opIDAft)
 }
 
@@ -222,6 +237,7 @@ VALUES ('maintenance', NULL, 0, 0, NOW(3))`)
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
+	t.Cleanup(func() { _ = tx.Rollback() })
 	if err := tidb.CoordinateMaintenance(ctxTO, db, tx); !errors.Is(err, tidb.ErrMaintenanceRowMissing) {
 		t.Fatalf("CoordinateMaintenance (row missing) err = %v, want ErrMaintenanceRowMissing", err)
 	}
@@ -250,11 +266,17 @@ func TestAcquireMaintenance_RowDeletedDuringBackoff_Real(t *testing.T) {
 	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
-	t.Cleanup(func() { _, _ = tidb.ReleaseMaintenance(ctx, db, opIDA) })
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = tidb.ReleaseMaintenance(cleanCtx, db, opIDA)
+	})
 	// 还原单例行（LIFO：先于 release A 与 db.Close 执行，以 op_id=NULL 新行
 	// 重建基础设施，等效于同时清掉 A 的残留持有）
 	t.Cleanup(func() {
-		_, _ = db.ExecContext(ctx, `
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = db.ExecContext(cleanCtx, `
 INSERT INTO maintenance (singleton_key, op_id, mode, revision, updated_at)
 VALUES ('maintenance', NULL, 0, 0, NOW(3))`)
 	})
@@ -311,13 +333,18 @@ func TestCoordinateMaintenance_LockedByOpID_Real(t *testing.T) {
 	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
-	t.Cleanup(func() { _, _ = tidb.ReleaseMaintenance(ctx, db, opIDA) })
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = tidb.ReleaseMaintenance(cleanCtx, db, opIDA)
+	})
 
 	// B 事务必须检测到被占用
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
+	t.Cleanup(func() { _ = tx.Rollback() })
 	if err := tidb.CoordinateMaintenance(ctx, db, tx); !errors.Is(err, tidb.ErrMaintenanceLocked) {
 		_ = tx.Rollback()
 		t.Fatalf("CoordinateMaintenance (op_id held) err = %v, want ErrMaintenanceLocked", err)
@@ -332,6 +359,7 @@ func TestCoordinateMaintenance_LockedByOpID_Real(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx(2): %v", err)
 	}
+	t.Cleanup(func() { _ = tx2.Rollback() })
 	if err := tidb.CoordinateMaintenance(ctx, db, tx2); err != nil {
 		_ = tx2.Rollback()
 		t.Fatalf("CoordinateMaintenance after release = %v, want nil", err)
