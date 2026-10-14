@@ -805,6 +805,19 @@ func TestDDLHashDDLLayout(t *testing.T) {
 		if !strings.Contains(ddlAssets, wantUQ) {
 			t.Errorf("assets DDL missing %q", wantUQ)
 		}
+		// Full rendered column-line boundary check: the identity line must be
+		// exactly "  `<col>` MEDIUMBLOB,\n" and the hash line exactly
+		// "  `<col>` BINARY(32),\n" (nullable, no NOT NULL/DEFAULT/charset drift).
+		// Expected lines are built from the independent pair literals above,
+		// never from Column.SQLType() or renderColumnFor.
+		wantIdentLine := fmt.Sprintf("  `%s` MEDIUMBLOB,\n", pair.identCol)
+		if !strings.Contains(ddlAssets, wantIdentLine) {
+			t.Errorf("assets DDL missing identity column line %q\n%s", wantIdentLine, ddlAssets)
+		}
+		wantHashLine := fmt.Sprintf("  `%s` BINARY(32),\n", pair.hashCol)
+		if !strings.Contains(ddlAssets, wantHashLine) {
+			t.Errorf("assets DDL missing hash column line %q\n%s", wantHashLine, ddlAssets)
+		}
 	}
 
 	// company_scope: 3 pairs
@@ -837,6 +850,16 @@ func TestDDLHashDDLLayout(t *testing.T) {
 		wantUQ := fmt.Sprintf("UNIQUE KEY `%s` (`%s`)", pair.uqIndex, pair.hashCol)
 		if !strings.Contains(ddlCScope, wantUQ) {
 			t.Errorf("company_scope DDL missing %q", wantUQ)
+		}
+		// Full rendered column-line boundary check, same contract as assets:
+		// identity "  `<col>` MEDIUMBLOB,\n", hash "  `<col>` BINARY(32),\n".
+		wantIdentLine := fmt.Sprintf("  `%s` MEDIUMBLOB,\n", pair.identCol)
+		if !strings.Contains(ddlCScope, wantIdentLine) {
+			t.Errorf("company_scope DDL missing identity column line %q\n%s", wantIdentLine, ddlCScope)
+		}
+		wantHashLine := fmt.Sprintf("  `%s` BINARY(32),\n", pair.hashCol)
+		if !strings.Contains(ddlCScope, wantHashLine) {
+			t.Errorf("company_scope DDL missing hash column line %q\n%s", wantHashLine, ddlCScope)
 		}
 	}
 }
@@ -873,6 +896,24 @@ func TestDDLUniqueStringPartsAsciiBin(t *testing.T) {
 			}
 		}
 	}
+}
+
+// expectedInfraIndexLine builds the expected rendered index line from
+// independent name/parts literals (test-only helper; deliberately does NOT
+// call the production renderIndex). kind is "UNIQUE KEY" or "KEY".
+func expectedInfraIndexLine(kind, name string, parts []string) string {
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = "`" + p + "`"
+	}
+	return "  " + kind + " `" + name + "` (" + strings.Join(quoted, ", ") + ")"
+}
+
+// containsFullLine reports whether line appears in ddl as a complete line:
+// terminated by ",\n" (followed by another definition) or "\n" (last line
+// before the closing parenthesis), so no trailing prefix/DESC can hide.
+func containsFullLine(ddl, line string) bool {
+	return strings.Contains(ddl, line+",\n") || strings.Contains(ddl, line+"\n")
 }
 
 // 10. TestDDLInfraTables
@@ -955,6 +996,23 @@ func TestDDLInfraTables(t *testing.T) {
 		}
 	}
 
+	// Rendered DDL evidence for all 10 UNIQUE indexes: each expected full line
+	// is built from the independent exp.parts literals above.
+	infraDDL := make(map[string]string, len(infraTableNames))
+	for _, tblName := range infraTableNames {
+		ddl, err := GenerateDDL(byName[tblName])
+		if err != nil {
+			t.Fatalf("GenerateDDL(%s): %v", tblName, err)
+		}
+		infraDDL[tblName] = ddl
+	}
+	for _, exp := range expected10UQ {
+		wantLine := expectedInfraIndexLine("UNIQUE KEY", exp.name, exp.parts)
+		if !containsFullLine(infraDDL[exp.table], wantLine) {
+			t.Errorf("%s DDL missing unique index line %q\n%s", exp.table, wantLine, infraDDL[exp.table])
+		}
+	}
+
 	// 4 Non-unique KEYs across 8 infra tables
 	type expectedKEY struct {
 		table string
@@ -1007,6 +1065,15 @@ func TestDDLInfraTables(t *testing.T) {
 			if found.Parts[i].Prefix != 0 || found.Parts[i].Desc {
 				t.Errorf("index %s part %s: prefix=%d, desc=%v, want 0/false", exp.name, found.Parts[i].Column, found.Parts[i].Prefix, found.Parts[i].Desc)
 			}
+		}
+	}
+
+	// Rendered DDL evidence for all 4 non-unique KEYs: each expected full line
+	// is built from the independent exp.parts literals above.
+	for _, exp := range expected4KEY {
+		wantLine := expectedInfraIndexLine("KEY", exp.name, exp.parts)
+		if !containsFullLine(infraDDL[exp.table], wantLine) {
+			t.Errorf("%s DDL missing index line %q\n%s", exp.table, wantLine, infraDDL[exp.table])
 		}
 	}
 
@@ -1155,6 +1222,18 @@ func TestDDLTrafficUniqueLayout(t *testing.T) {
 			parts:   []string{"namespace"},
 			wantDDL: "UNIQUE KEY `uq_traffic_stores_namespace` (`namespace`)",
 		},
+		{
+			table:   "traffic_stores",
+			uqName:  "uq_traffic_stores_store",
+			parts:   []string{"store_id"},
+			wantDDL: "UNIQUE KEY `uq_traffic_stores_store` (`store_id`)",
+		},
+		{
+			table:   "traffic_stores",
+			uqName:  "uq_traffic_stores_role",
+			parts:   []string{"role"},
+			wantDDL: "UNIQUE KEY `uq_traffic_stores_role` (`role`)",
+		},
 	}
 
 	for _, exp := range expectedTraffic {
@@ -1184,6 +1263,9 @@ func TestDDLTrafficUniqueLayout(t *testing.T) {
 			}
 			if found.Parts[i].Prefix != 0 {
 				t.Errorf("table %s index %s part %s must not have prefix, got %d", exp.table, exp.uqName, found.Parts[i].Column, found.Parts[i].Prefix)
+			}
+			if found.Parts[i].Desc {
+				t.Errorf("table %s index %s part %s must not be DESC", exp.table, exp.uqName, found.Parts[i].Column)
 			}
 		}
 
