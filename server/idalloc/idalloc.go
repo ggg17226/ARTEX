@@ -20,7 +20,7 @@ var (
 	ErrOutOfSafeRange = errors.New("idalloc: id 超出 1..MaxInt64 兼容域")
 	// ErrReadbackZero：LAST_INSERT_ID()/identity 回读为 0（TiDB 对 >MaxInt64
 	// 高值、INSERT IGNORE miss、upsert 均返回 0，见 spec §11.1）。
-	ErrReadbackZero = errors.New("idalloc: 回读为 0，分配失败")
+	ErrReadbackZero = errors.New("idalloc: LAST_INSERT_ID() 回读为 0，分配失败")
 )
 
 // ValidateUint64 校验 id 落在兼容域 1..math.MaxInt64。
