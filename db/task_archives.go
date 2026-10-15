@@ -51,8 +51,8 @@ var (
 // TaskArchive is the compact PostgreSQL record retained while a task is cold.
 // Sensitive profile configuration and API keys are intentionally absent.
 type TaskArchive struct {
-	ID                      int64           `json:"id"`
-	TaskID                  int64           `json:"task_id"`
+	ID                      int64           `json:"id,string"`
+	TaskID                  int64           `json:"task_id,string"`
 	State                   string          `json:"state"`
 	Phase                   string          `json:"phase"`
 	Progress                int             `json:"progress"`
@@ -67,7 +67,7 @@ type TaskArchive struct {
 	TaskDescription         string          `json:"task_description"`
 	TaskGoal                string          `json:"task_goal"`
 	OriginalStatus          string          `json:"original_status"`
-	CategoryIDSnapshot      *int64          `json:"category_id,omitempty"`
+	CategoryIDSnapshot      *int64          `json:"category_id,string,omitempty"`
 	CategoryNameSnapshot    string          `json:"category_name,omitempty"`
 	SourceTaskIDs           []int64         `json:"source_task_ids"`
 	RemainingTimeoutSeconds int64           `json:"remaining_timeout_seconds"`

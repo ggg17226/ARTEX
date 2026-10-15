@@ -12,7 +12,7 @@ import (
 // ---------- LLM profiles ----------
 
 type LLMProfile struct {
-	ID            int64   `json:"id"`
+	ID            int64   `json:"id,string"`
 	Name          string  `json:"name"`
 	Format        string  `json:"format"`
 	BaseURL       string  `json:"base_url,omitempty"`

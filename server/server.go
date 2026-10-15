@@ -1368,19 +1368,24 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
-		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
-		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		Provider         string          `json:"provider"`
+		Model            string          `json:"model"`
+		BaseURL          string          `json:"base_url"`
+		Proxy            string          `json:"proxy"`
+		APIKey           string          `json:"api_key"`
+		ThinkingType     string          `json:"thinking_type"`
+		ReasoningEffort  string          `json:"reasoning_effort"`
+		ProfileID        json.RawMessage `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
+		Streaming        *bool           `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
+		SessionHeaderKey string          `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	profileID, err := parseOptionalIDRaw(req.ProfileID)
+	if err != nil {
+		writeErr(w, 400, "profile_id 无效: "+err.Error())
 		return
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
@@ -1400,8 +1405,8 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+	if profileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+		if p, err := s.m.pg.ProfileByID(*profileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}
@@ -1446,18 +1451,18 @@ func truncateReply(s string) string {
 }
 
 type createTaskReq struct {
-	Name                 string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
-	CategoryID           *int64   `json:"category_id,omitempty"`
-	Description          string   `json:"description"`
-	Goal                 string   `json:"goal"`
-	LLMProfileID         *string  `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []string `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
-	TimeoutSeconds       int      `json:"timeout_seconds"`           // 任务级超时(秒);0/省略=不限时
-	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`    // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
-	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
-	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	Name                 string            `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
+	CategoryID           json.RawMessage   `json:"category_id,omitempty"`
+	Description          string            `json:"description"`
+	Goal                 string            `json:"goal"`
+	LLMProfileID         *string           `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs        []string          `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs        []string          `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
+	CompanyIDs           []json.RawMessage `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	TimeoutSeconds       int               `json:"timeout_seconds"`           // 任务级超时(秒);0/省略=不限时
+	PlanHeartbeatSeconds int               `json:"plan_heartbeat_seconds"`    // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	SeedFirstIntent      *bool             `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
+	CoverageEnabled      *bool             `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1501,20 +1506,33 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		seenSources[id] = true
 		sourceIDs = append(sourceIDs, id)
 	}
-	companyIDs, err := db.NormalizeTaskCompanyIDs(req.CompanyIDs)
+	categoryID, err := parseOptionalIDRaw(req.CategoryID)
+	if err != nil {
+		writeErr(w, 400, "category_id 无效: "+err.Error())
+		return
+	}
+	companyIDList := make([]int64, 0, len(req.CompanyIDs))
+	for _, raw := range req.CompanyIDs {
+		id, err := parseRequiredIDRaw(raw)
+		if err != nil {
+			writeErr(w, 400, "company_ids 包含无效企业 id: "+err.Error())
+			return
+		}
+		companyIDList = append(companyIDList, id)
+	}
+	companyIDs, err := db.NormalizeTaskCompanyIDs(companyIDList)
 	if err != nil {
 		writeErr(w, 400, fmt.Sprintf("关联企业无效：最多选择 %d 个有效企业", db.MaxTaskCompanyCount))
 		return
 	}
-	req.CompanyIDs = companyIDs
 	interceptRules, err := buildTaskInterceptRules(req.InterceptRules)
 	if err != nil {
 		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
 		return
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
-		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
-		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: profileIDs,
+		Name: strings.TrimSpace(req.Name), CategoryID: categoryID,
+		SourceTaskIDs: sourceIDs, CompanyIDs: companyIDs, LLMProfileIDs: profileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
 		InterceptRules:  interceptRules,

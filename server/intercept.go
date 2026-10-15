@@ -421,11 +421,21 @@ func (s *Server) interceptGetJudgeConfig(w http.ResponseWriter, r *http.Request)
 
 // interceptSetJudgeConfig persists the judge configuration.
 func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request) {
-	var req intercept.JudgeConfig
-	if err := decode(r, &req); err != nil {
+	var body struct {
+		intercept.JudgeConfig
+		ProfileID json.RawMessage `json:"profile_id"`
+	}
+	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	profileID, err := parseJudgeProfileID(body.ProfileID)
+	if err != nil {
+		writeErr(w, 400, "profile_id 无效: "+err.Error())
+		return
+	}
+	req := body.JudgeConfig
+	req.ProfileID = profileID
 	switch req.FailAction {
 	case "allow", "ask", "deny":
 	default:

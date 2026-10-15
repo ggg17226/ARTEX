@@ -322,7 +322,7 @@ const (
 // non-empty (falls back to DefaultJudgePrompt).
 type JudgeConfig struct {
 	Enabled           bool   `json:"enabled"`
-	ProfileID         int64  `json:"profile_id"` // 0 = follow active/default
+	ProfileID         int64  `json:"profile_id,string"` // 0 = follow active/default
 	Prompt            string `json:"prompt"`
 	TimeoutSeconds    int    `json:"timeout_seconds"`
 	FailAction        string `json:"fail_action"` // allow|ask|deny

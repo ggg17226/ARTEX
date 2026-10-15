@@ -1803,14 +1803,21 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// would get wrong — legacy/partial clients that never send it stay streaming.
 	var body struct {
 		db.LLMProfile
-		APIKey    string `json:"api_key"`
-		Streaming *bool  `json:"streaming"`
+		ID        json.RawMessage `json:"id"`
+		APIKey    string          `json:"api_key"`
+		Streaming *bool           `json:"streaming"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	profileID, err := parseProfileSaveID(body.ID)
+	if err != nil {
+		writeErr(w, 400, "id 无效: "+err.Error())
+		return
+	}
 	p := body.LLMProfile
+	p.ID = profileID
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
 	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
@@ -1835,7 +1842,7 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// profile's key/model/priority/pool_exclude edit reshapes the chain, so the
 	// engine's provider has to be rebuilt either way.
 	s.reapplyActiveProfile()
-	writeJSON(w, 200, map[string]any{"id": id})
+	writeJSON(w, 200, map[string]any{"id": strconv.FormatInt(id, 10)})
 }
 
 // pgGetLLMRetryPolicy 返回全局重试策略(五层各自的次数+间隔)。未配置过 → 全零，
@@ -1931,13 +1938,18 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ID int64 `json:"id"`
+		ID json.RawMessage `json:"id"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.SetActiveProfile(body.ID); err != nil {
+	id, err := parseRequiredIDRaw(body.ID)
+	if err != nil {
+		writeErr(w, 400, "id 无效: "+err.Error())
+		return
+	}
+	if err := pg.SetActiveProfile(id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -1996,20 +2008,25 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		Provider  string          `json:"provider"` // "openai" | "anthropic"
+		BaseURL   string          `json:"base_url"`
+		APIKey    string          `json:"api_key"`
+		Proxy     string          `json:"proxy"`
+		ProfileID json.RawMessage `json:"profile_id"` // fallback: use stored key from this profile
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	profileID, err := parseOptionalIDRaw(req.ProfileID)
+	if err != nil {
+		writeErr(w, 400, "profile_id 无效: "+err.Error())
+		return
+	}
 	// Resolve API key: form input > profile stored key.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+	if apiKey == "" && profileID != nil {
+		if p, err := s.m.pg.ProfileByID(*profileID); err == nil && p != nil {
 			apiKey = p.APIKey
 		}
 	}

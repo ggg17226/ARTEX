@@ -1,14 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/server/idalloc"
 	"github.com/Autumn-27/artex/traffic"
 )
 
@@ -696,4 +699,110 @@ func parseIDFieldLenient(s string) *int64 {
 		return nil
 	}
 	return &v
+}
+
+// parseRequiredIDRaw 严格解析必填的 ID（支持 string 或 number 兼容格式）。
+// 必须为 1..math.MaxInt64 正整数。未提供、null、空串、0、负数、小数、非数字、越界均报错。
+func parseRequiredIDRaw(raw json.RawMessage) (int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, errors.New("id is required")
+	}
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return 0, fmt.Errorf("id 非法: %w", err)
+		}
+		return parseIDField(strings.TrimSpace(s))
+	}
+	var num uint64
+	if err := json.Unmarshal(trimmed, &num); err != nil {
+		return 0, fmt.Errorf("id 非法: %w", err)
+	}
+	if err := idalloc.ValidateUint64(num); err != nil {
+		return 0, err
+	}
+	return int64(num), nil
+}
+
+// parseOptionalIDRaw 解析可选 ID（如 /api/llm/test 的 ProfileID 等）。
+// 未提供、null 返回 nil, nil；非空时必须为合法 1..MaxInt64 正整数。
+func parseOptionalIDRaw(raw json.RawMessage) (*int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	id, err := parseRequiredIDRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
+}
+
+// parseProfileSaveID 解析 profile 保存请求中的 ID（支持新建 0 / 空串 与编辑更新）。
+// 允许新建：未传、null、""、"0"、0 均解析为 0；
+// 若传非空字符串且非 "0"，经 parseIDField 校验解析；
+// 若传数字 >0，经 idalloc.ValidateUint64 校验；
+// 负数、小数、非数字、>MaxInt64 均返回错误。
+func parseProfileSaveID(raw json.RawMessage) (int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, nil
+	}
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return 0, fmt.Errorf("id 非法: %w", err)
+		}
+		s = strings.TrimSpace(s)
+		if s == "" || s == "0" {
+			return 0, nil
+		}
+		return parseIDField(s)
+	}
+	var num uint64
+	if err := json.Unmarshal(trimmed, &num); err != nil {
+		return 0, fmt.Errorf("id 非法: %w", err)
+	}
+	if num == 0 {
+		return 0, nil
+	}
+	if err := idalloc.ValidateUint64(num); err != nil {
+		return 0, err
+	}
+	return int64(num), nil
+}
+
+// parseJudgeProfileID 解析 judge 审查配置中的 profile_id（支持 "0" / 0 跟随激活 sentinel）。
+// 未传、null、"0"、0 均保持为 0；
+// 若传非空字符串且非 "0"，经 parseIDField 校验解析；传空串 "" 经 parseIDField 报错；
+// 若传数字 >0，经 idalloc.ValidateUint64 校验；
+// 负数、小数、非数字、>MaxInt64、空串均返回错误。
+func parseJudgeProfileID(raw json.RawMessage) (int64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0, nil
+	}
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return 0, fmt.Errorf("profile_id 非法: %w", err)
+		}
+		s = strings.TrimSpace(s)
+		if s == "0" {
+			return 0, nil
+		}
+		return parseIDField(s)
+	}
+	var num uint64
+	if err := json.Unmarshal(trimmed, &num); err != nil {
+		return 0, fmt.Errorf("profile_id 非法: %w", err)
+	}
+	if num == 0 {
+		return 0, nil
+	}
+	if err := idalloc.ValidateUint64(num); err != nil {
+		return 0, err
+	}
+	return int64(num), nil
 }

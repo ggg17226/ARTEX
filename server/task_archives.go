@@ -21,8 +21,8 @@ import (
 const taskArchivePollInterval = 2 * time.Second
 
 type archiveBatchRequest struct {
-	TaskIDs    []string `json:"task_ids"`
-	ArchiveIDs []int64  `json:"archive_ids"`
+	TaskIDs    []string          `json:"task_ids"`
+	ArchiveIDs []json.RawMessage `json:"archive_ids"`
 }
 
 type archiveBatchItem struct {
@@ -30,7 +30,7 @@ type archiveBatchItem struct {
 	OK      bool   `json:"ok"`
 	Queued  bool   `json:"queued"`
 	Error   string `json:"error,omitempty"`
-	Archive int64  `json:"archive_id,omitempty"`
+	Archive int64  `json:"archive_id,string,omitempty"`
 }
 
 func (s *Server) startTaskArchiveWorker() {
@@ -590,16 +590,20 @@ func (s *Server) deleteTaskArchivesBatch(w http.ResponseWriter, r *http.Request)
 	s.queueTaskArchiveActionBatch(w, r, "delete")
 }
 
-func normalizeArchiveIDs(ids []int64) ([]int64, error) {
-	if len(ids) == 0 {
+func normalizeArchiveIDs(rawIDs []json.RawMessage) ([]int64, error) {
+	if len(rawIDs) == 0 {
 		return nil, errors.New("archive_ids 不能为空")
 	}
-	if len(ids) > 100 {
+	if len(rawIDs) > 100 {
 		return nil, errors.New("一次最多处理 100 个归档")
 	}
 	seen := map[int64]bool{}
-	out := make([]int64, 0, len(ids))
-	for _, id := range ids {
+	out := make([]int64, 0, len(rawIDs))
+	for _, raw := range rawIDs {
+		id, err := parseRequiredIDRaw(raw)
+		if err != nil {
+			return nil, fmt.Errorf("归档 id 无效: %w", err)
+		}
 		if id <= 0 {
 			return nil, fmt.Errorf("归档 id %d 无效", id)
 		}
