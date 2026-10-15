@@ -74,7 +74,7 @@ func (t *mockDriverTx) Rollback() error {
 
 type mockStmt struct{}
 
-func (s *mockStmt) Close() error { return nil }
+func (s *mockStmt) Close() error  { return nil }
 func (s *mockStmt) NumInput() int { return -1 }
 func (s *mockStmt) Exec(args []driver.Value) (driver.Result, error) {
 	return driver.RowsAffected(0), nil
