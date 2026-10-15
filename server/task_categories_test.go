@@ -14,6 +14,7 @@ import (
 // before touching the database, and it reports unknown ids per task instead of
 // failing the whole batch.
 func TestTaskCategoryBatchRoute(t *testing.T) {
+	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)

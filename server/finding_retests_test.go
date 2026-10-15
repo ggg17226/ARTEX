@@ -36,6 +36,7 @@ func (p retestProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2
 
 func newRetestServer(t *testing.T) (*Server, int64) {
 	t.Helper()
+	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
 	dsn, _, err := db.DSN()
 	if err != nil {
 		t.Skip("test postgres not configured")

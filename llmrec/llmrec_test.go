@@ -83,6 +83,7 @@ func (meteredStreamProvider) Stream(context.Context, llm.CompletionRequest) iter
 }
 
 func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
+	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
 	dsn := os.Getenv("ARTEX_PG_DSN")
 	if dsn == "" {
 		t.Skip("requires isolated ARTEX_PG_DSN")

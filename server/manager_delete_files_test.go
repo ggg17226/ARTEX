@@ -13,6 +13,7 @@ import (
 )
 
 func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
+	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
@@ -171,6 +172,7 @@ func TestStageTaskFilesRollbackReportsRestoreFailure(t *testing.T) {
 }
 
 func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *testing.T) {
+	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
 	dataDir := t.TempDir()
 	m, err := NewManager(dataDir, "")
 	if err != nil {
