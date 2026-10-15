@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync/atomic"
 	"testing"
 )
 
@@ -88,15 +89,21 @@ func (c *fakeConn) Rollback() error { return nil }
 
 func (c *fakeConn) Close() error { return nil }
 
+var driverSeq uint64
+
 func newFakeDB(t *testing.T) (*sql.DB, *fakeConn) {
 	t.Helper()
 	c := &fakeConn{}
 	d := &fakeDriver{conn: c}
-	sql.Register("idalloc_fake_"+t.Name(), d)
-	db, err := sql.Open("idalloc_fake_"+t.Name(), "")
+	driverName := fmt.Sprintf("idalloc_fake_%s_%d", t.Name(), atomic.AddUint64(&driverSeq, 1))
+	sql.Register(driverName, d)
+	db, err := sql.Open(driverName, "")
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
 	return db, c
 }
 
@@ -180,7 +187,7 @@ func TestAllocID_OutOfDomain(t *testing.T) {
 	}
 }
 
-func TestAllocIDByIdentity_HighValue(t *testing.T) {
+func TestAllocIDByIdentity_HappyPath(t *testing.T) {
 	db, _ := newFakeDB(t)
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
@@ -188,15 +195,46 @@ func TestAllocIDByIdentity_HighValue(t *testing.T) {
 	}
 	defer tx.Rollback()
 	id, err := AllocIDByIdentity(context.Background(), tx,
-		"SELECT id FROM t WHERE logical_key = ?", "k1")
+		"SELECT id FROM t WHERE logical_key = ?", uint64(12345))
 	if err != nil {
 		t.Fatalf("AllocIDByIdentity: %v", err)
 	}
-	if id != math.MaxUint64 {
-		// fake 返回 args[0]；此用例仅验证 0/越界以外的回读链路
-		t.Fatalf("AllocIDByIdentity = %d, want MaxUint64", id)
+	if id != 12345 {
+		t.Fatalf("AllocIDByIdentity = %d, want 12345", id)
 	}
 }
+
+func TestAllocPhysicalRowIDByIdentity_HighValue(t *testing.T) {
+	db, _ := newFakeDB(t)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+	id, err := AllocPhysicalRowIDByIdentity(context.Background(), tx,
+		"SELECT id FROM t WHERE logical_key = ?", "k1")
+	if err != nil {
+		t.Fatalf("AllocPhysicalRowIDByIdentity: %v", err)
+	}
+	if id != math.MaxUint64 {
+		t.Fatalf("AllocPhysicalRowIDByIdentity = %d, want MaxUint64", id)
+	}
+}
+
+func TestAllocPhysicalRowIDByIdentity_Zero(t *testing.T) {
+	db, _ := newFakeDB(t)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+	_, err = AllocPhysicalRowIDByIdentity(context.Background(), tx,
+		"SELECT id FROM t WHERE k = ?", uint64(0))
+	if !errors.Is(err, ErrReadbackZero) {
+		t.Fatalf("AllocPhysicalRowIDByIdentity = %v, want ErrReadbackZero", err)
+	}
+}
+
 
 func TestAllocIDByIdentity_Zero(t *testing.T) {
 	// 回读到 0 → 显式失败（不返回 0 给调用方）
@@ -211,3 +249,19 @@ func TestAllocIDByIdentity_Zero(t *testing.T) {
 		t.Fatalf("AllocIDByIdentity = %v, want ErrReadbackZero", err)
 	}
 }
+
+func TestAllocIDByIdentity_OutOfSafeRange(t *testing.T) {
+	// §2.4.1：公开业务 ID 回读必须落在 1..MaxInt64 兼容域；>MaxInt64 返回 ErrOutOfSafeRange
+	db, _ := newFakeDB(t)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+	_, err = AllocIDByIdentity(context.Background(), tx,
+		"SELECT id FROM t WHERE logical_key = ?", "k1")
+	if !errors.Is(err, ErrOutOfSafeRange) {
+		t.Fatalf("AllocIDByIdentity = %v, want ErrOutOfSafeRange", err)
+	}
+}
+

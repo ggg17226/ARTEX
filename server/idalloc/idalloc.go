@@ -51,15 +51,37 @@ func AllocID(ctx context.Context, tx *sql.Tx) (uint64, error) {
 	return id, nil
 }
 
-// AllocIDByIdentity 用于高值（>MaxInt64，实测 LAST_INSERT_ID()=0）与隐藏 row_id
-// 等无法依赖 session last_insert_id 的路径：在同一事务内按 exact logical
-// identity 回读。query 必须恰好返回 1 行、首列为逻辑身份 ID（BIGINT UNSIGNED），
+// AllocIDByIdentity 用于面向公开业务实体的 exact logical identity 回读（例如
+// 高值 >MaxInt64 实测 LAST_INSERT_ID()=0，需由业务根据唯一键查回）。
+// query 必须恰好返回 1 行、首列为逻辑身份 ID（BIGINT UNSIGNED），
 // 例如 "SELECT id FROM t WHERE logical_key = ?"。
 //
-// 约束：由于底层可能存在 roundtrip 显式插入 MaxUint64 的合法场景（spec §2.4.1/§11.1），
-// 仅检查 id != 0（回读为 0 报错 ErrReadbackZero）。若调用方要求落在 1..MaxInt64 兼容域，
-// 可额外调用 ValidateUint64。
+// 约束：回读到 0 返回 ErrReadbackZero；且回读后必须执行 ValidateUint64(id)，
+// 超出 1..MaxInt64 兼容域返回 ErrOutOfSafeRange，杜绝公开 ID 越界漏网（spec §2.4.1）。
 func AllocIDByIdentity(ctx context.Context, tx *sql.Tx, query string, args ...any) (uint64, error) {
+	var id uint64
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("%w: identity 查询未命中", ErrReadbackZero)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("idalloc: identity 回读失败: %w", err)
+	}
+	if id == 0 {
+		return 0, ErrReadbackZero
+	}
+	if err := ValidateUint64(id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// AllocPhysicalRowIDByIdentity 专供底层隐藏 row_id 的 exact identity 回读（spec §2.4.1）。
+// 仅供内部并发定位与事务锁续期，不暴露给前端或业务 DTO。
+//
+// 约束：回读到 0 返回 ErrReadbackZero；但允许全部有效的 uint64 高值（包含 math.MaxUint64），
+// 不执行 1..MaxInt64 兼容域截断守卫。
+func AllocPhysicalRowIDByIdentity(ctx context.Context, tx *sql.Tx, query string, args ...any) (uint64, error) {
 	var id uint64
 	err := tx.QueryRowContext(ctx, query, args...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -73,3 +95,4 @@ func AllocIDByIdentity(ctx context.Context, tx *sql.Tx, query string, args ...an
 	}
 	return id, nil
 }
+
