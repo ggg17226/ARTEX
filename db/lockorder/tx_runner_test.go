@@ -265,10 +265,10 @@ func TestTxRunner_DBGates_InsertIgnoreAndForUpdate(t *testing.T) {
 	if len(execStatements) != 2 {
 		t.Fatalf("expected 2 exec statements, got %d: %v", len(execStatements), execStatements)
 	}
-	if !strings.Contains(execStatements[0], "INSERT IGNORE INTO locks (name, created_at) VALUES ('business_relations', NOW(3))") {
+	if !strings.Contains(execStatements[0], "INSERT IGNORE INTO locks (name) VALUES ('business_relations')") {
 		t.Errorf("unexpected exec[0]: %s", execStatements[0])
 	}
-	if !strings.Contains(execStatements[1], "INSERT IGNORE INTO locks (name, created_at) VALUES (?, NOW(3))") {
+	if !strings.Contains(execStatements[1], "INSERT IGNORE INTO locks (name) VALUES (?)") {
 		t.Errorf("unexpected exec[1]: %s", execStatements[1])
 	}
 

@@ -342,7 +342,7 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 					return err
 				}
 				if tx != nil {
-					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name, created_at) VALUES ('business_relations', NOW(3))"); err != nil {
+					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name) VALUES ('business_relations')"); err != nil {
 						return fmt.Errorf("lock db business_relations: insert ignore: %w", err)
 					}
 					var name string
@@ -361,7 +361,7 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 					return err
 				}
 				if tx != nil {
-					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name, created_at) VALUES (?, NOW(3))", ns); err != nil {
+					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name) VALUES (?)", ns); err != nil {
 						return fmt.Errorf("lock db namespace %s: insert ignore: %w", ns, err)
 					}
 					var name string
