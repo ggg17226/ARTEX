@@ -95,4 +95,3 @@ func AllocPhysicalRowIDByIdentity(ctx context.Context, tx *sql.Tx, query string,
 	}
 	return id, nil
 }
-

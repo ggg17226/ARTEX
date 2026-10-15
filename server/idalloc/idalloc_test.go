@@ -235,7 +235,6 @@ func TestAllocPhysicalRowIDByIdentity_Zero(t *testing.T) {
 	}
 }
 
-
 func TestAllocIDByIdentity_Zero(t *testing.T) {
 	// 回读到 0 → 显式失败（不返回 0 给调用方）
 	db, _ := newFakeDB(t)
@@ -264,4 +263,3 @@ func TestAllocIDByIdentity_OutOfSafeRange(t *testing.T) {
 		t.Fatalf("AllocIDByIdentity = %v, want ErrOutOfSafeRange", err)
 	}
 }
-
