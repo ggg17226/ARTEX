@@ -127,7 +127,11 @@ func (s *Server) pgCreateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var catID *int64
-	if req.CategoryID != nil && *req.CategoryID != "" {
+	if req.CategoryID != nil {
+		if *req.CategoryID == "" {
+			writeErr(w, http.StatusBadRequest, "category_id 不能为空")
+			return
+		}
 		parsed, err := parseIDField(*req.CategoryID)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "category_id 无效: "+err.Error())
@@ -177,7 +181,11 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	patch := db.TaskTemplatePatch{Name: req.Name, Description: req.Description, Goal: req.Goal}
 	if catPresent {
 		patch.SetCategoryID = true
-		if req.CategoryID != nil && *req.CategoryID != "" {
+		if req.CategoryID != nil {
+			if *req.CategoryID == "" {
+				writeErr(w, http.StatusBadRequest, "category_id 不能为空")
+				return
+			}
 			parsed, err := parseIDField(*req.CategoryID)
 			if err != nil {
 				writeErr(w, http.StatusBadRequest, "category_id 无效: "+err.Error())

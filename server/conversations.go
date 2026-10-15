@@ -102,7 +102,11 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var profileID *int64
-	if req.LLMProfileID != nil && *req.LLMProfileID != "" {
+	if req.LLMProfileID != nil {
+		if *req.LLMProfileID == "" {
+			writeErr(w, 400, "llm_profile_id 不能为空")
+			return
+		}
 		id, err := parseIDField(*req.LLMProfileID)
 		if err != nil {
 			writeErr(w, 400, "llm_profile_id 无效: "+err.Error())
@@ -142,7 +146,11 @@ func (s *Server) pgUpdateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var profileID *int64
-	if req.LLMProfileID != nil && *req.LLMProfileID != "" {
+	if req.LLMProfileID != nil {
+		if *req.LLMProfileID == "" {
+			writeErr(w, 400, "llm_profile_id 不能为空")
+			return
+		}
 		id, err := parseIDField(*req.LLMProfileID)
 		if err != nil {
 			writeErr(w, 400, "llm_profile_id 无效: "+err.Error())
@@ -338,7 +346,7 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 			writeErr(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": cursor, "running": running, "hasMore": false})
+		writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": strconv.FormatInt(cursor, 10), "running": running, "hasMore": false})
 		return
 	}
 
@@ -355,7 +363,7 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 	if n := len(items); n > 0 {
 		cursor = items[n-1].ID
 	}
-	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": cursor, "running": running, "hasMore": hasMore})
+	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": strconv.FormatInt(cursor, 10), "running": running, "hasMore": hasMore})
 }
 
 // pgConversationMsgDetail lazily returns one step's full detail blob.

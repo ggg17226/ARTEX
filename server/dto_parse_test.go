@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"math"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -208,4 +209,150 @@ func TestTaskDTO_EmissionStringIDs(t *testing.T) {
 	if strings.Contains(rawNil, `"llm_profile_id"`) {
 		t.Errorf("expected llm_profile_id omitted, got %s", rawNil)
 	}
+}
+
+func TestParseCategoryIDField(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantNil    bool
+		wantID     int64
+		wantOK     bool
+		wantStatus int
+	}{
+		{
+			name:       "empty json raw",
+			raw:        "",
+			wantOK:     false,
+			wantStatus: 400,
+		},
+		{
+			name:       "null literal",
+			raw:        "null",
+			wantNil:    true,
+			wantOK:     true,
+			wantStatus: 200,
+		},
+		{
+			name:       "string valid number",
+			raw:        `"123"`,
+			wantNil:    false,
+			wantID:     123,
+			wantOK:     true,
+			wantStatus: 200,
+		},
+		{
+			name:       "string empty",
+			raw:        `""`,
+			wantOK:     false,
+			wantStatus: 400,
+		},
+		{
+			name:       "string invalid abc",
+			raw:        `"abc"`,
+			wantOK:     false,
+			wantStatus: 400,
+		},
+		{
+			name:       "string negative",
+			raw:        `"-5"`,
+			wantOK:     false,
+			wantStatus: 400,
+		},
+		{
+			name:       "number valid int",
+			raw:        `456`,
+			wantNil:    false,
+			wantID:     456,
+			wantOK:     true,
+			wantStatus: 200,
+		},
+		{
+			name:       "number zero",
+			raw:        `0`,
+			wantOK:     false,
+			wantStatus: 400,
+		},
+		{
+			name:       "number negative",
+			raw:        `-10`,
+			wantOK:     false,
+			wantStatus: 400,
+		},
+		{
+			name:       "number overflow MaxInt64",
+			raw:        `9223372036854775808`,
+			wantOK:     false,
+			wantStatus: 400,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			got, ok := parseCategoryIDField(rec, json.RawMessage(tt.raw))
+			if ok != tt.wantOK {
+				t.Fatalf("parseCategoryIDField(%s) ok = %v, wantOK = %v, body = %s", tt.raw, ok, tt.wantOK, rec.Body.String())
+			}
+			if !tt.wantOK {
+				if rec.Code != tt.wantStatus {
+					t.Fatalf("parseCategoryIDField(%s) status = %d, want %d", tt.raw, rec.Code, tt.wantStatus)
+				}
+				return
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("parseCategoryIDField(%s) = %v, want nil", tt.raw, *got)
+				}
+			} else {
+				if got == nil {
+					t.Fatalf("parseCategoryIDField(%s) = nil, want %d", tt.raw, tt.wantID)
+				} else if *got != tt.wantID {
+					t.Fatalf("parseCategoryIDField(%s) = %d, want %d", tt.raw, *got, tt.wantID)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateTaskProfileIDs(t *testing.T) {
+	t.Run("empty list", func(t *testing.T) {
+		s := &Server{}
+		ids, err := s.validateTaskProfileIDs(nil)
+		if err != nil || len(ids) != 0 {
+			t.Fatalf("expected empty, got err=%v ids=%v", err, ids)
+		}
+	})
+
+	t.Run("duplicate id", func(t *testing.T) {
+		s := &Server{}
+		_, err := s.validateTaskProfileIDs([]string{"1", "1"})
+		if err == nil {
+			t.Fatal("expected error for duplicate ids, got nil")
+		}
+	})
+
+	t.Run("empty string id", func(t *testing.T) {
+		s := &Server{}
+		_, err := s.validateTaskProfileIDs([]string{""})
+		if err == nil {
+			t.Fatal("expected error for empty id, got nil")
+		}
+	})
+
+	t.Run("non-numeric id", func(t *testing.T) {
+		s := &Server{}
+		_, err := s.validateTaskProfileIDs([]string{"xyz"})
+		if err == nil {
+			t.Fatal("expected error for non-numeric id, got nil")
+		}
+	})
+
+	t.Run("non-existent profile", func(t *testing.T) {
+		s := &Server{}
+		_, err := s.validateTaskProfileIDs([]string{"999"})
+		if err == nil {
+			t.Fatal("expected error for missing profile, got nil")
+		}
+	})
 }

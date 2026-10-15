@@ -895,7 +895,11 @@ func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	id, _ := pathInt(r, "id")
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 400, "bad id: "+err.Error())
+		return
+	}
 	if err := pg.DeleteMCP(id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -1872,7 +1876,11 @@ func (s *Server) pgDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	id, _ := pathInt(r, "id")
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 400, "bad id: "+err.Error())
+		return
+	}
 	if err := pg.DeleteProfileContext(r.Context(), id); err != nil {
 		switch {
 		case errors.Is(err, db.ErrActiveLLMProfileDelete):

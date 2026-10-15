@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/server/idalloc"
 )
 
 const maxTaskCategoryRequestBytes = 16 << 10
@@ -126,18 +127,43 @@ func (s *Server) pgDeleteTaskCategory(w http.ResponseWriter, r *http.Request) {
 // category — so it arrives as RawMessage instead of *int64, which cannot tell
 // an explicit null from an omitted key.
 func parseCategoryIDField(w http.ResponseWriter, raw json.RawMessage) (*int64, bool) {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
 		writeErr(w, http.StatusBadRequest, "category_id is required")
 		return nil, false
 	}
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	if bytes.Equal(trimmed, []byte("null")) {
 		return nil, true
 	}
-	var id int64
-	if err := json.Unmarshal(raw, &id); err != nil || id <= 0 {
+	// JSON string: `"123"` 或 `""`
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			writeErr(w, http.StatusBadRequest, "任务分类 id 无效")
+			return nil, false
+		}
+		if s == "" {
+			writeErr(w, http.StatusBadRequest, "category_id 不能为空")
+			return nil, false
+		}
+		id, err := parseIDField(s)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "任务分类 id 无效: "+err.Error())
+			return nil, false
+		}
+		return &id, true
+	}
+	// JSON number: 123
+	var num uint64
+	if err := json.Unmarshal(trimmed, &num); err != nil {
 		writeErr(w, http.StatusBadRequest, "任务分类 id 无效")
 		return nil, false
 	}
+	if err := idalloc.ValidateUint64(num); err != nil {
+		writeErr(w, http.StatusBadRequest, "任务分类 id 无效")
+		return nil, false
+	}
+	id := int64(num)
 	return &id, true
 }
 
