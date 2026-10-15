@@ -126,8 +126,8 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
     try {
       const result = await api.updateTaskLLMProfiles(
         task.id,
-        profileIDs.map(Number),
-        activeProfileID ? Number(activeProfileID) : undefined,
+        profileIDs,
+        activeProfileID || undefined,
       );
       if (result.switch_event) {
         toast.info(result.switch_event.summary, { id: `task-${task.id}-llm-${result.switch_event.seq}` });

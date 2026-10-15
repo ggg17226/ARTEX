@@ -47,7 +47,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [diffVer, setDiffVer] = React.useState<PromptVersion | null>(null);
 
   const [prompt, setPrompt] = React.useState("");
-  const [mcpVisible, setMcpVisible] = React.useState<number[]>([]);
+  const [mcpVisible, setMcpVisible] = React.useState<string[]>([]);
   const [skillVisible, setSkillVisible] = React.useState<string[]>([]);
   const [preview, setPreview] = React.useState("");
   const [maxTurns, setMaxTurns] = React.useState("0");
@@ -181,7 +181,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
     try {
       // 只提交本 agent 实际展示的字段，避免把未显示项(如 goals 的 max_turns)覆盖成默认。
       const patch: Parameters<typeof api.saveAgentConfig>[1] = {
-        llm_profile_id: llmProfileId === "" ? null : Number(llmProfileId),
+        llm_profile_id: llmProfileId === "" ? null : llmProfileId,
       };
       if (showConfig) {
         patch.max_turns = Math.max(0, Math.floor(Number(maxTurns) || 0));
@@ -198,7 +198,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   }
   // applyVis optimistically updates, persists, and toasts success/failure. On
   // failure it reverts to the prior selection so the UI never lies about state.
-  async function applyVis(nextMcp: number[], nextSkill: string[], okMsg: string) {
+  async function applyVis(nextMcp: string[], nextSkill: string[], okMsg: string) {
     const prevMcp = mcpVisible;
     const prevSkill = skillVisible;
     setMcpVisible(nextMcp);
@@ -213,7 +213,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
       toast.error("保存失败：" + (e as Error).message);
     }
   }
-  function toggleMcp(id: number) {
+  function toggleMcp(id: string) {
     const on = mcpVisible.includes(id);
     const name = mcp.find((m) => m.id === id)?.name ?? String(id);
     applyVis(
@@ -770,7 +770,7 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
   const [toolNames, setToolNames] = React.useState<string[]>([]);
   const [saving, setSaving] = React.useState(false);
   // null = 新增模式；非 null = 正在编辑该 id 的触发器。
-  const [editingId, setEditingId] = React.useState<number | null>(null);
+  const [editingId, setEditingId] = React.useState<string | null>(null);
 
   const reload = React.useCallback(() => {
     api.agentTriggers(agentKey).then(setTriggers).catch(() => setTriggers([]));
@@ -891,7 +891,7 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
       toast.error("保存失败：" + (e as Error).message);
     }
   }
-  async function del(id: number) {
+  async function del(id: string) {
     try {
       await api.deleteTrigger(id);
       if (editingId === id) resetForm();

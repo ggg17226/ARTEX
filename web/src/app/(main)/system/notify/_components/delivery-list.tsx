@@ -19,7 +19,7 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
   const [rows, setRows] = React.useState<NotificationDelivery[]>([]);
   const [total, setTotal] = React.useState(0);
   const [page, setPage] = React.useState(1);
-  const [channelID, setChannelID] = React.useState<number | undefined>(undefined);
+  const [channelID, setChannelID] = React.useState<string | undefined>(undefined);
   const [state, setState] = React.useState<string | undefined>(undefined);
   const [loading, setLoading] = React.useState(false);
   const pageSize = 50;
@@ -39,7 +39,7 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
     load();
   }, [load]);
 
-  async function retry(id: number) {
+  async function retry(id: string) {
     try {
       await api.notifyRetryDelivery(id);
       toast.success("已重新入队");
@@ -58,7 +58,7 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
           value={channelID ? String(channelID) : "all"}
           onValueChange={(v) => {
             setPage(1);
-            setChannelID(v === "all" ? undefined : Number(v));
+            setChannelID(v === "all" ? undefined : v);
           }}
         >
           <SelectTrigger size="sm" className="w-44">

@@ -19,7 +19,7 @@ function merge(old: SideExchange[], incoming: SideExchange[]) {
   for (const item of incoming) {
     if ((byID.get(item.id)?.sequence ?? -1) <= item.sequence) byID.set(item.id, item);
   }
-  return [...byID.values()].sort((a, b) => a.ordinal - b.ordinal);
+  return [...byID.values()].sort((a, b) => (BigInt(a.ordinal) > BigInt(b.ordinal) ? 1 : -1));
 }
 
 export function useSideQuestions(parent: string | null) {
@@ -31,12 +31,12 @@ export function useSideQuestions(parent: string | null) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [nextCursor, setNextCursor] = useState(0);
+  const [nextCursor, setNextCursor] = useState("0");
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
   const epoch = useRef(0);
   const [streamEpoch, setStreamEpoch] = useState(0);
-  const cursor = useRef(0);
+  const cursor = useRef("0");
   const submitting = useRef(false);
   const retry = useRef<{ question: string; id: string } | null>(null);
   const accepted = useRef<{ id: string; question: string } | null>(null);
@@ -55,7 +55,7 @@ export function useSideQuestions(parent: string | null) {
   }, []);
 
   const load = useCallback(
-    async (before = 0) => {
+    async (before: string | number = "0") => {
       if (!parent) return;
       const version = epoch.current;
       try {
@@ -65,7 +65,7 @@ export function useSideQuestions(parent: string | null) {
         restoreFailedDraft(data.items);
         setSnapshot(data.snapshot);
         setLoadError("");
-        if (before || !cursor.current) {
+        if (String(before) !== "0" || !cursor.current || cursor.current === "0") {
           cursor.current = data.next_cursor;
           setNextCursor(data.next_cursor);
         }
@@ -81,7 +81,7 @@ export function useSideQuestions(parent: string | null) {
     setStateParent(parent);
     setItems([]);
     setSnapshot(null);
-    setNextCursor(0);
+    setNextCursor("0");
     setDraft("");
     setError("");
     setLoadError("");
@@ -89,7 +89,7 @@ export function useSideQuestions(parent: string | null) {
     submitting.current = false;
     retry.current = null;
     accepted.current = null;
-    cursor.current = 0;
+    cursor.current = "0";
     if (!parent) {
       setOpen(false);
       setLoading(false);
@@ -200,8 +200,8 @@ export function useSideQuestions(parent: string | null) {
       await sideAPI.clear(parent);
       if (version !== epoch.current) return;
       setItems([]);
-      setNextCursor(0);
-      cursor.current = 0;
+      setNextCursor("0");
+      cursor.current = "0";
       setError("");
       retry.current = null;
       accepted.current = null;

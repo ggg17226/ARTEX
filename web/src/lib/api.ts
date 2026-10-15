@@ -249,12 +249,12 @@ export const api = {
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   createTask: (input: {
     name?: string;
-    categoryId?: number;
+    categoryId?: string;
     description: string;
     goal: string;
-    llmProfileIds?: number[];
+    llmProfileIds?: string[];
     sourceTaskIds?: string[];
-    companyIds?: number[];
+    companyIds?: string[];
     timeoutSeconds?: number;
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
@@ -280,12 +280,12 @@ export const api = {
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
-  renameTaskCategory: (id: number, name: string) => patch<TaskCategory>(`/task-categories/${id}`, { name }),
-  deleteTaskCategory: (id: number) => del<{ deleted: number }>(`/task-categories/${id}`),
-  updateTaskCategory: (taskId: string, categoryId?: number) =>
+  renameTaskCategory: (id: string, name: string) => patch<TaskCategory>(`/task-categories/${id}`, { name }),
+  deleteTaskCategory: (id: string) => del<{ deleted: string }>(`/task-categories/${id}`),
+  updateTaskCategory: (taskId: string, categoryId?: string | null) =>
     patch<Task>(`/tasks/${taskId}/category`, { category_id: categoryId ?? null }),
   // categoryId 省略/undefined = 移出分类（后端收到 null）
-  updateTasksCategory: (taskIds: string[], categoryId?: number) =>
+  updateTasksCategory: (taskIds: string[], categoryId?: string | null) =>
     post<{ items: BatchCategoryItem[]; category: TaskCategory | null }>("/tasks/category/batch", {
       task_ids: taskIds,
       category_id: categoryId ?? null,
@@ -295,15 +295,15 @@ export const api = {
     input: Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
-    id: number,
+    id: string,
     input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
-  deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
-  updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
+  deleteTaskTemplate: (id: string) => del<{ deleted: string }>(`/task-templates/${id}`),
+  updateTaskLLMProfiles: (id: string, llmProfileIds: string[], activeLLMProfileId?: string | null) =>
     put<{
       id: string;
-      llm_profile_ids: number[];
-      active_llm_profile_id?: number;
+      llm_profile_ids: string[];
+      active_llm_profile_id?: string;
       llm_failover_state: string;
       reopened_intents: number;
       switch_event?: Activity;
@@ -327,15 +327,15 @@ export const api = {
       items: arr(response.items),
     }));
   },
-  taskArchive: (id: number) => get<TaskArchive>(`/task-archives/${id}`),
+  taskArchive: (id: string) => get<TaskArchive>(`/task-archives/${id}`),
   archiveTask: (id: string) => post<TaskArchive>(`/tasks/${id}/archive`),
   archiveTasks: (taskIds: string[]) =>
     post<{ items: ArchiveBatchItem[] }>("/tasks/archive/batch", { task_ids: taskIds }),
-  restoreTaskArchive: (id: number) => post<TaskArchive>(`/task-archives/${id}/restore`),
-  restoreTaskArchives: (archiveIds: number[]) =>
+  restoreTaskArchive: (id: string) => post<TaskArchive>(`/task-archives/${id}/restore`),
+  restoreTaskArchives: (archiveIds: string[]) =>
     post<{ items: ArchiveBatchItem[] }>("/task-archives/restore/batch", { archive_ids: archiveIds }),
-  deleteTaskArchive: (id: number) => del<TaskArchive>(`/task-archives/${id}`),
-  deleteTaskArchives: (archiveIds: number[]) =>
+  deleteTaskArchive: (id: string) => del<TaskArchive>(`/task-archives/${id}`),
+  deleteTaskArchives: (archiveIds: string[]) =>
     post<{ items: ArchiveBatchItem[] }>("/task-archives/delete/batch", { archive_ids: archiveIds }),
   controlIntent: (
     taskId: string,
@@ -346,13 +346,13 @@ export const api = {
     mode?: "soft" | "hard",
   ) =>
     post<{
-      id: number;
+      id: string;
       state: "paused" | "open" | "deleted" | "";
       deleted?: { intents: number; facts: number; findings: number; activities: number };
     }>(`/tasks/${taskId}/intents/${intentId}/control`, { action, reason: reason ?? "", mode: mode ?? "soft" }),
   sendWorkerMessage: (taskId: string, intentId: string, message: string, requestId: string) =>
     post<{
-      id: number;
+      id: string;
       state: "running";
       accepted: true;
       request_id: string;
@@ -414,11 +414,11 @@ export const api = {
     get<{ rules: AssetInterceptRule[] | null }>(`/tasks/${id}/intercept-rules`).then((r) => arr(r.rules)),
   createTaskInterceptRule: (id: string, rule: AssetInterceptRuleInput) =>
     post<AssetInterceptRule>(`/tasks/${id}/intercept-rules`, rule),
-  updateTaskInterceptRule: (id: string, ruleId: number, rule: AssetInterceptRuleInput) =>
+  updateTaskInterceptRule: (id: string, ruleId: string, rule: AssetInterceptRuleInput) =>
     put<AssetInterceptRule>(`/tasks/${id}/intercept-rules/${ruleId}`, rule),
-  deleteTaskInterceptRule: (id: string, ruleId: number) =>
+  deleteTaskInterceptRule: (id: string, ruleId: string) =>
     del<{ deleted: boolean }>(`/tasks/${id}/intercept-rules/${ruleId}`),
-  toggleTaskInterceptRule: (id: string, ruleId: number, enabled: boolean) =>
+  toggleTaskInterceptRule: (id: string, ruleId: string, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/tasks/${id}/intercept-rules/${ruleId}/toggle`, { enabled }),
 
   // 本任务测试范围列表（含继承自来源任务的范围）。
@@ -427,9 +427,9 @@ export const api = {
   addTaskScope: (id: string, kind: string, value: string, reason?: string) =>
     post<TaskScopeRow>(`/tasks/${id}/scope`, { kind, value, reason }),
   // 删除本任务的一条测试范围。
-  deleteTaskScope: (id: string, scopeId: number) => del<{ ok: boolean }>(`/tasks/${id}/scope/${scopeId}`),
+  deleteTaskScope: (id: string, scopeId: string) => del<{ ok: boolean }>(`/tasks/${id}/scope/${scopeId}`),
   // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
-  taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
+  taskAssetRefs: (id: string, assetId: string) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
 
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),
@@ -485,7 +485,7 @@ export const api = {
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
-  deleteAssets: (ids: number[]) =>
+  deleteAssets: (ids: string[]) =>
     http<{ deleted: number }>("/assets", { method: "DELETE", body: JSON.stringify({ ids }) }),
   // task-scoped view of the same endpoint — server-side paginated like `assets`
   taskAssets: (taskId: string, type = "", limit = 50, offset = 0) =>
@@ -498,40 +498,40 @@ export const api = {
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?task_id=${encodeURIComponent(taskId)}&dsl=${encodeURIComponent(dsl)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
-  attachTaskAssets: (taskId: string, assetIds: number[], sourceSummary: string) =>
+  attachTaskAssets: (taskId: string, assetIds: string[], sourceSummary: string) =>
     post<TaskAssetMutation>(`/tasks/${taskId}/assets`, {
       asset_ids: assetIds,
       source_summary: sourceSummary,
     }),
   registerTaskAssetScopes: (taskId: string, scope: CompanyScopeRule[]) =>
     post<TaskAssetScopeMutation>(`/tasks/${taskId}/assets`, { scope }),
-  detachTaskAsset: (taskId: string, assetId: number) => del<{ detached: number }>(`/tasks/${taskId}/assets/${assetId}`),
+  detachTaskAsset: (taskId: string, assetId: string) => del<{ detached: number }>(`/tasks/${taskId}/assets/${assetId}`),
   taskIntentAssets: (taskId: string) =>
     get<{ assets: IntentAsset[] }>(`/tasks/${taskId}/intent-assets`).then((r) => arr(r.assets)),
 
   // ---- companies (企业 + 资产范围；归属唯一来源) ----
   companies: () => get<Company[]>("/companies").then(arr),
   createCompany: (name: string, scope: CompanyScopeRule[]) =>
-    post<{ id: number; created: boolean; scope_added?: number; scope_invalid?: number; scope_errors?: string[] }>(
+    post<{ id: string; created: boolean; scope_added?: number; scope_invalid?: number; scope_errors?: string[] }>(
       "/companies",
       {
         name,
         scope,
       },
     ),
-  addCompanyScope: (id: number, scope: CompanyScopeRule[], reason = "") =>
+  addCompanyScope: (id: string, scope: CompanyScopeRule[], reason = "") =>
     post<CompanyScopeMutation>(`/companies/${id}/scope`, {
       scope,
       reason,
     }),
-  updateCompanyScope: (id: number, scope: CompanyScopeRule[], reason = "") =>
+  updateCompanyScope: (id: string, scope: CompanyScopeRule[], reason = "") =>
     post<CompanyScopeMutation>(`/companies/${id}/scope`, {
       scope,
       reason,
       reset: true,
     }),
-  deleteCompany: (id: number, deleteAssets = false) =>
-    http<{ deleted: number; assets_deleted: number }>(`/companies/${id}`, {
+  deleteCompany: (id: string, deleteAssets = false) =>
+    http<{ deleted: string; assets_deleted: number }>(`/companies/${id}`, {
       method: "DELETE",
       body: JSON.stringify({ delete_assets: deleteAssets }),
     }),
@@ -670,7 +670,7 @@ export const api = {
     fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
-  deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  deleteFinding: (id: string) => del<{ deleted: boolean; id: string }>(`/exploration/findings/${id}`),
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),
@@ -718,42 +718,42 @@ export const api = {
       assets: r.assets ?? {},
     }));
   },
-  activity: (task?: string, opts?: { intent?: string; since?: number; limit?: number }) => {
+  activity: (task?: string, opts?: { intent?: string; since?: string | number; limit?: number }) => {
     const q = new URLSearchParams();
     if (task) q.set("task", task);
     if (opts?.intent) q.set("intent", opts.intent);
-    if (opts?.since) q.set("since", String(opts.since));
+    if (opts?.since !== undefined) q.set("since", String(opts.since));
     if (opts?.limit) q.set("limit", String(opts.limit));
-    return get<{ items: Activity[]; cursor: number }>(`/exploration/activity?${q.toString()}`).then((r) => ({
+    return get<{ items: Activity[]; cursor: string }>(`/exploration/activity?${q.toString()}`).then((r) => ({
       items: arr(r.items),
-      cursor: r.cursor ?? 0,
+      cursor: String(r.cursor ?? "0"),
     }));
   },
-  activityDetail: (id: number, task?: string) => get<{ detail: string }>(`/exploration/activity/${id}${tq(task)}`),
+  activityDetail: (id: string, task?: string) => get<{ detail: string }>(`/exploration/activity/${id}${tq(task)}`),
   // Reverse-paginated session history. session = "main" | "plan" | "intent:<id>".
   // before=0 → latest page; before=<id> → the older page ending before that id.
   // snapshotCursor is the TASK-level max id at query time — open the task SSE at
   // since=snapshotCursor so history (id≤cursor) and the live tail (id>cursor) meet
   // gap-free. hasMore = still-older steps exist (drives scroll-up loading).
-  activityHistory: (task: string, session: string, before = 0, limit = 200) => {
+  activityHistory: (task: string, session: string, before: string | number = "0", limit = 200) => {
     const q = new URLSearchParams({ session, limit: String(limit) });
     if (task) q.set("task", task);
-    if (before > 0) q.set("before", String(before));
-    return get<{ items: Activity[]; snapshot_cursor: number; earliest_cursor: number; has_more: boolean }>(
+    if (String(before) !== "0" && before !== 0) q.set("before", String(before));
+    return get<{ items: Activity[]; snapshot_cursor: string; earliest_cursor: string; has_more: boolean }>(
       `/exploration/activity/history?${q.toString()}`,
     ).then((r) => ({
       items: arr(r.items),
-      snapshotCursor: r.snapshot_cursor ?? 0,
-      earliestCursor: r.earliest_cursor ?? 0,
+      snapshotCursor: String(r.snapshot_cursor ?? "0"),
+      earliestCursor: String(r.earliest_cursor ?? "0"),
       hasMore: !!r.has_more,
     }));
   },
   // Paged worker (intent) session list — reaches past the legacy fixed 300 cap.
   // before=0 → newest page; before=<id> → older page. has_more = older intents exist.
-  intentsPage: (task: string, before = 0, limit = 300) => {
+  intentsPage: (task: string, before: string | number = "0", limit = 300) => {
     const q = new URLSearchParams({ limit: String(limit) });
     if (task) q.set("task", task);
-    q.set("before", String(before > 0 ? before : 0));
+    q.set("before", String(before));
     q.set("page", "1"); // marker so the backend returns the paged {items,has_more} shape
     return get<{ items: TaskNode[]; has_more: boolean }>(`/exploration/intents?${q.toString()}`).then((r) => ({
       items: arr(r.items),
@@ -835,10 +835,10 @@ export const api = {
     config: Record<string, unknown>;
     filter?: NotificationFilter;
     rate_per_min?: number;
-  }) => post<{ id: number }>(`/notify/channels`, payload),
+  }) => post<{ id: string }>(`/notify/channels`, payload),
   // PATCH 语义：只提交要改的字段。config 里的掩码值原样回传即表示「保持原值」。
   notifyUpdateChannel: (
-    id: number,
+    id: string,
     payload: {
       name?: string;
       kind?: string;
@@ -848,11 +848,11 @@ export const api = {
       filter?: NotificationFilter;
       rate_per_min?: number;
     },
-  ) => patch<{ id: number }>(`/notify/channels/${id}`, payload),
-  notifyDeleteChannel: (id: number) => del<{ ok: boolean }>(`/notify/channels/${id}`),
+  ) => patch<{ id: string }>(`/notify/channels/${id}`, payload),
+  notifyDeleteChannel: (id: string) => del<{ ok: boolean }>(`/notify/channels/${id}`),
   // 同步发一条测试消息；失败时后端会把渠道的原始错误回传，供排查配置。
-  notifyTestChannel: (id: number) => post<{ ok: boolean; latency_ms: number }>(`/notify/channels/${id}/test`),
-  notifyDeliveries: (q: { channelId?: number; state?: string; page?: number; pageSize?: number } = {}) => {
+  notifyTestChannel: (id: string) => post<{ ok: boolean; latency_ms: number }>(`/notify/channels/${id}/test`),
+  notifyDeliveries: (q: { channelId?: string; state?: string; page?: number; pageSize?: number } = {}) => {
     const p = new URLSearchParams();
     if (q.channelId) p.set("channel_id", String(q.channelId));
     if (q.state) p.set("state", q.state);
@@ -862,7 +862,7 @@ export const api = {
       `/notify/deliveries?${p.toString()}`,
     ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
   },
-  notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
+  notifyRetryDelivery: (id: string) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
@@ -938,7 +938,7 @@ export const api = {
     proxy = "",
     thinking_type = "",
     reasoning_effort = "",
-    profile_id?: number,
+    profile_id?: string,
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
     session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
   ) =>
@@ -957,7 +957,7 @@ export const api = {
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
-    id?: number; // omit/0 = create; set = update that profile
+    id?: string; // omit/0 = create; set = update that profile
     name: string;
     format: string;
     model: string;
@@ -976,17 +976,17 @@ export const api = {
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
-  }) => post<{ id: number }>("/llm/profiles", p),
-  deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
-  activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
+  }) => post<{ id: string }>("/llm/profiles", p),
+  deleteLLMProfile: (id: string) => del<{ deleted: string }>(`/llm/profiles/${id}`),
+  activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id }),
   // 轮询链的实际顺序 + 各配置的熔断状态。
   llmPool: () => get<LLMPoolStatus>("/llm/pool"),
   // 清除熔断，让下一次调用立刻重试该配置；不传 id = 全部清除。
-  resetLLMPool: (id?: string) => post<LLMPoolStatus>("/llm/pool/reset", { id: id ? Number(id) : 0 }),
+  resetLLMPool: (id?: string) => post<LLMPoolStatus>("/llm/pool/reset", { id: id ?? "0" }),
   // 全局重试策略（五层各自的次数+间隔）。全 0 = 全部走内置默认。
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
-  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
+  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: string) =>
     post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
       provider,
       base_url,
@@ -1005,36 +1005,36 @@ export const api = {
 
   // ---- conversations (chat page) ----
   conversations: () => get<{ conversations: Conversation[] }>("/conversations").then((r) => arr(r.conversations)),
-  createConversation: (agent_key: string, title = "", llm_profile_id?: number | null) =>
+  createConversation: (agent_key: string, title = "", llm_profile_id?: string | null) =>
     post<Conversation>("/conversations", { agent_key, title, llm_profile_id: llm_profile_id ?? null }),
-  updateConversation: (id: number, input: { title?: string; pinned?: boolean }) =>
+  updateConversation: (id: string, input: { title?: string; pinned?: boolean }) =>
     patch<Conversation>(`/conversations/${id}`, input),
-  renameConversation: (id: number, title: string) => patch<Conversation>(`/conversations/${id}`, { title }),
-  pinConversation: (id: number, pinned: boolean) => patch<Conversation>(`/conversations/${id}`, { pinned }),
-  updateConversationProfile: (id: number, llm_profile_id: number | null) =>
+  renameConversation: (id: string, title: string) => patch<Conversation>(`/conversations/${id}`, { title }),
+  pinConversation: (id: string, pinned: boolean) => patch<Conversation>(`/conversations/${id}`, { pinned }),
+  updateConversationProfile: (id: string, llm_profile_id: string | null) =>
     patch<{ ok: boolean }>(`/conversations/${id}/profile`, { llm_profile_id }),
-  deleteConversation: (id: number) => del<{ deleted: number }>(`/conversations/${id}`),
-  deleteConversations: (ids: number[]) =>
-    post<{ items: { id: number; ok: boolean; error?: string }[] }>("/conversations/delete/batch", { ids }),
+  deleteConversation: (id: string) => del<{ deleted: string }>(`/conversations/${id}`),
+  deleteConversations: (ids: string[]) =>
+    post<{ items: { id: string; ok: boolean; error?: string }[] }>("/conversations/delete/batch", { ids }),
   // Incremental tail: steps after `since` (id ASC) — live poll + post-send fetch.
-  conversationMessages: (id: number, since = 0) =>
-    get<{ items: Activity[]; cursor: number; running: boolean }>(`/conversations/${id}/messages?since=${since}`).then(
-      (r) => ({ items: arr(r.items), cursor: r.cursor ?? 0, running: !!r.running }),
+  conversationMessages: (id: string, since: string | number = "0") =>
+    get<{ items: Activity[]; cursor: string | number; running: boolean }>(`/conversations/${id}/messages?since=${since}`).then(
+      (r) => ({ items: arr(r.items), cursor: r.cursor ?? "0", running: !!r.running }),
     ),
   // Reverse pagination: the latest `limit` steps (before=0) or the page of older
   // steps ending before id `before`. hasMore = still-older steps exist.
-  conversationHistory: (id: number, before = 0, limit = 200) => {
+  conversationHistory: (id: string, before: string | number = "0", limit = 200) => {
     const q = new URLSearchParams({ limit: String(limit) });
-    if (before > 0) q.set("before", String(before));
-    return get<{ items: Activity[]; cursor: number; running: boolean; hasMore: boolean }>(
+    if (String(before) !== "0" && before !== 0) q.set("before", String(before));
+    return get<{ items: Activity[]; cursor: string | number; running: boolean; hasMore: boolean }>(
       `/conversations/${id}/messages?${q.toString()}`,
-    ).then((r) => ({ items: arr(r.items), cursor: r.cursor ?? 0, running: !!r.running, hasMore: !!r.hasMore }));
+    ).then((r) => ({ items: arr(r.items), cursor: r.cursor ?? "0", running: !!r.running, hasMore: !!r.hasMore }));
   },
-  conversationMsgDetail: (id: number, seq: number) =>
+  conversationMsgDetail: (id: string, seq: number) =>
     get<{ detail: string }>(`/conversations/${id}/messages/${seq}`).then((r) => r.detail ?? ""),
-  sendConversationMessage: (id: number, message: string, attachments?: ChatAttachment[]) =>
+  sendConversationMessage: (id: string, message: string, attachments?: ChatAttachment[]) =>
     post<{ status: string }>(`/conversations/${id}/messages`, { message, attachments }),
-  stopConversation: (id: number) => post<{ status: string }>(`/conversations/${id}/stop`, {}),
+  stopConversation: (id: string) => post<{ status: string }>(`/conversations/${id}/stop`, {}),
   saveAgentPrompt: (key: string, template: string, note = "") =>
     put<{ version: number }>(`/agents/${key}/prompt`, { template, note }),
   resetAgentPrompt: (key: string) => post<{ version: number }>(`/agents/${key}/prompt/reset`, {}),
@@ -1057,13 +1057,13 @@ export const api = {
     get<{ triggers: AgentTrigger[] }>(`/agents/${key}/triggers`).then((r) => arr(r.triggers)),
   createTrigger: (key: string, t: Omit<AgentTrigger, "id" | "agent_key" | "last_fire">) =>
     post<AgentTrigger>(`/agents/${key}/triggers`, t),
-  updateTrigger: (id: number, t: Omit<AgentTrigger, "id" | "agent_key" | "last_fire">) =>
+  updateTrigger: (id: string, t: Omit<AgentTrigger, "id" | "agent_key" | "last_fire">) =>
     patch<{ ok: boolean }>(`/triggers/${id}`, t),
-  deleteTrigger: (id: number) => del<{ deleted: number }>(`/triggers/${id}`),
+  deleteTrigger: (id: string) => del<{ deleted: string }>(`/triggers/${id}`),
   saveAgentConfig: (
     key: string,
     patch: {
-      llm_profile_id?: number | null; // number=绑定；null=解绑(跟随任务/全局)；缺省=不动
+      llm_profile_id?: string | null; // string=绑定；null=解绑(跟随任务/全局)；缺省=不动
       max_turns?: number;
       run_seconds?: number;
       web_search?: boolean;
@@ -1079,8 +1079,8 @@ export const api = {
     get<{ variables: PromptVar[] }>(`/agents/${key}/variables`).then((r) => arr(r.variables)),
   previewAgentPrompt: (key: string, template: string, sample?: Record<string, string>) =>
     post<{ rendered: string; error?: string }>(`/agents/${key}/prompt/preview`, { template, sample }),
-  getAgentVisibility: (key: string) => get<{ mcp: number[]; skill: string[] }>(`/agents/${key}/visibility`),
-  setAgentVisibility: (key: string, mcp: number[], skill: string[]) =>
+  getAgentVisibility: (key: string) => get<{ mcp: string[]; skill: string[] }>(`/agents/${key}/visibility`),
+  setAgentVisibility: (key: string, mcp: string[], skill: string[]) =>
     put<{ ok: boolean }>(`/agents/${key}/visibility`, { mcp, skill }),
 
   // ---- tools (内置工具目录) ----
@@ -1103,10 +1103,10 @@ export const api = {
 
   // ---- mcp ----
   mcpServers: () => get<{ servers: MCPServer[] }>("/mcp").then((r) => arr(r.servers)),
-  saveMcpServer: (m: Partial<MCPServer>) => post<{ id: number }>("/mcp", m),
-  deleteMcpServer: (id: number) => del<{ deleted: number }>(`/mcp/${id}`),
-  mcpTools: (id: number) => get<{ tools: MCPTool[] }>(`/mcp/${id}/tools`).then((r) => arr(r.tools)),
-  refreshMcpServer: (id: number) => post<{ tools: MCPTool[] }>(`/mcp/${id}/refresh`, {}).then((r) => arr(r.tools)),
+  saveMcpServer: (m: Partial<MCPServer>) => post<{ id: string }>("/mcp", m),
+  deleteMcpServer: (id: string) => del<{ deleted: string }>(`/mcp/${id}`),
+  mcpTools: (id: string) => get<{ tools: MCPTool[] }>(`/mcp/${id}/tools`).then((r) => arr(r.tools)),
+  refreshMcpServer: (id: string) => post<{ tools: MCPTool[] }>(`/mcp/${id}/refresh`, {}).then((r) => arr(r.tools)),
 
   // ---- 资产同步 (ScopeSentry 数据源) ----
   ssStatus: () =>
@@ -1181,9 +1181,9 @@ export const api = {
     get<{ missing: MissingSkill[] }>(`/skills/missing?limit=${limit}`).then((r) => arr(r.missing)),
 
   // ---- visibility (MCP resource side) ---- (agent ids are strings per spec)
-  resourceVisibility: (kind: string, id: number) =>
+  resourceVisibility: (kind: string, id: string) =>
     get<{ agents: string[] }>(`/visibility/${kind}/${id}`).then((r) => arr(r.agents)),
-  toggleVisibility: (agentId: string, kind: string, resourceId: number, visible: boolean) =>
+  toggleVisibility: (agentId: string, kind: string, resourceId: string, visible: boolean) =>
     post<{ ok: boolean }>("/visibility/toggle", { agent_id: agentId, kind, resource_id: resourceId, visible }),
 
   // ---- visibility (Skill，按名称) ----
@@ -1195,32 +1195,32 @@ export const api = {
   interceptRules: () => get<{ rules: InterceptRule[] }>("/intercept/rules").then((r) => arr(r.rules)),
   createInterceptRule: (rule: Omit<InterceptRule, "id" | "created_at" | "updated_at">) =>
     post<InterceptRule>("/intercept/rules", rule),
-  updateInterceptRule: (id: number, rule: Omit<InterceptRule, "id" | "created_at" | "updated_at">) =>
+  updateInterceptRule: (id: string, rule: Omit<InterceptRule, "id" | "created_at" | "updated_at">) =>
     put<InterceptRule>(`/intercept/rules/${id}`, rule),
-  deleteInterceptRule: (id: number) => del<{ deleted: number }>(`/intercept/rules/${id}`),
-  toggleInterceptRule: (id: number, enabled: boolean) =>
+  deleteInterceptRule: (id: string) => del<{ deleted: string }>(`/intercept/rules/${id}`),
+  toggleInterceptRule: (id: string, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/intercept/rules/${id}/toggle`, { enabled }),
 
   // ---- asset intercept rules（资产拦截：全局黑名单） ----
   assetInterceptRules: () => get<{ rules: AssetInterceptRule[] }>("/asset-intercept/rules").then((r) => arr(r.rules)),
   createAssetInterceptRule: (rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
     post<AssetInterceptRule>("/asset-intercept/rules", rule),
-  updateAssetInterceptRule: (id: number, rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
+  updateAssetInterceptRule: (id: string, rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
     put<AssetInterceptRule>(`/asset-intercept/rules/${id}`, rule),
-  deleteAssetInterceptRule: (id: number) => del<{ deleted: number }>(`/asset-intercept/rules/${id}`),
-  toggleAssetInterceptRule: (id: number, enabled: boolean) =>
+  deleteAssetInterceptRule: (id: string) => del<{ deleted: string }>(`/asset-intercept/rules/${id}`),
+  toggleAssetInterceptRule: (id: string, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/asset-intercept/rules/${id}/toggle`, { enabled }),
 
   // ---- intercept pending (ask) ----
   interceptPending: () => get<{ pending: InterceptPending[] }>("/intercept/pending").then((r) => arr(r.pending)),
-  interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
-  interceptDecide: (id: number, decision: "allowed" | "denied") =>
+  interceptGetOne: (id: string) => get<InterceptPending>(`/intercept/pending/${id}`),
+  interceptDecide: (id: string, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
-  interceptExecution: (id: number, conversationId?: number) =>
+  interceptExecution: (id: string, conversationId?: string) =>
     get<import("@/lib/types").InterceptExecution>(
       `/intercept/history/${id}/execution${conversationId ? `?conversation=${conversationId}` : ""}`,
     ),
-  interceptDetail: (id: number) => get<InterceptDetail>(`/intercept/history/${id}`),
+  interceptDetail: (id: string) => get<InterceptDetail>(`/intercept/history/${id}`),
   interceptHistory: () => get<{ items: InterceptApprovalRow[] }>("/intercept/history").then((r) => arr(r.items)),
   interceptHistoryPage: (page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
     get<{ items: InterceptApprovalRow[]; total?: number }>(
@@ -1295,9 +1295,9 @@ export const api = {
     sp.set("size", String(params?.size ?? 50));
     return get<{ records: LLMRecordItem[]; total: number }>(`/llm/records?${sp}`);
   },
-  llmRecordDetail: (id: number) => get<LLMRecordDetail>(`/llm/records/${id}`),
+  llmRecordDetail: (id: string) => get<LLMRecordDetail>(`/llm/records/${id}`),
   llmTasks: () => get<{ tasks: LLMTask[] }>(`/llm/records/tasks`),
-  llmRecordsDeleteTask: (task: string) => del<{ deleted: number }>(`/llm/records?task=${encodeURIComponent(task)}`),
+  llmRecordsDeleteTask: (task: string) => del<{ deleted: string }>(`/llm/records?task=${encodeURIComponent(task)}`),
   // 按模型聚合本任务的 token 用量（来自常开的 llm_usage 计量账本，逐次调用精确，
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>

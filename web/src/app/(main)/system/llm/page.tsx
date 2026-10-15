@@ -362,7 +362,7 @@ function ProfileSheet({
     setModelsOpen(false);
   }, [open, profile]);
 
-  const profileId = profile ? Number(profile.id) : undefined;
+  const profileId = profile?.id;
 
   async function loadModels() {
     if (loadingModels) return;
@@ -424,7 +424,7 @@ function ProfileSheet({
     setSaving(true);
     try {
       const { id } = await api.saveLLMProfile({
-        ...(profile ? { id: Number(profile.id) } : {}),
+        ...(profile ? { id: profile.id } : {}),
         name: name.trim(),
         format,
         model: model.trim(),

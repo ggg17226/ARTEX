@@ -7,7 +7,7 @@ export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 export interface Task {
   id: string;
   name?: string; // 可选任务名称;空/缺省=未命名,展示时回退到描述
-  category_id?: number;
+  category_id?: string;
   category_name?: string;
   pinned?: boolean;
   pinned_at?: string | null;
@@ -30,19 +30,19 @@ export interface Task {
   goals_met?: number;
   engine_mode?: EngineMode;
   tokens?: TokenTotal; // whole-task token consumption
-  llm_profile_id?: number; // LLM profile used; absent = default profile
-  llm_profile_ids?: number[]; // ordered task-level failover chain
-  active_llm_profile_id?: number; // profile used by the next LLM call
+  llm_profile_id?: string; // LLM profile used; absent = default profile
+  llm_profile_ids?: string[]; // ordered task-level failover chain
+  active_llm_profile_id?: string; // profile used by the next LLM call
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
-  company_ids?: number[]; // associated company scopes; current company assets join the task at creation
+  company_ids?: string[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
 }
 
 export interface TaskCategory {
-  id: number;
+  id: string;
   name: string;
   task_count: number;
   created_at: string;
@@ -50,11 +50,11 @@ export interface TaskCategory {
 }
 
 export interface TaskTemplate {
-  id: number;
+  id: string;
   name: string;
   description: string;
   goal: string;
-  category_id?: number | null; // 预设分类；null/缺省=无
+  category_id?: string | null; // 预设分类；null/缺省=无
   intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
   created_at: string;
   updated_at: string;
@@ -100,8 +100,8 @@ export interface TaskArchiveTokenStats {
 }
 
 export interface TaskArchive {
-  id: number;
-  task_id: number;
+  id: string;
+  task_id: string;
   state: TaskArchiveState;
   phase: string;
   progress: number;
@@ -115,9 +115,9 @@ export interface TaskArchive {
   task_description: string;
   task_goal: string;
   original_status: TaskStatus;
-  category_id?: number;
+  category_id?: string;
   category_name?: string;
-  source_task_ids: number[];
+  source_task_ids: string[];
   remaining_timeout_seconds: number;
   data_counts: Record<string, number>;
   aggregate_stats: {
@@ -141,7 +141,7 @@ export interface TaskArchivePage {
 
 export interface ArchiveBatchItem {
   id: string;
-  archive_id?: number;
+  archive_id?: string;
   ok: boolean;
   queued: boolean;
   error?: string;
@@ -220,10 +220,10 @@ export interface TaskAssetView {
 export type NewAssetType = "root_domain" | "ip" | "subdomain" | "app" | "service" | "endpoint";
 
 export interface Asset {
-  id: number;
+  id: string;
   type: NewAssetType;
-  company_id?: number;
-  task_ids: number[];
+  company_id?: string;
+  task_ids: string[];
   domain?: string;
   root_domain?: string;
   ip?: string;
@@ -254,18 +254,18 @@ export interface Asset {
   last_seen: string;
   task_source?: string;
   task_source_summary?: string;
-  task_source_node_id?: number;
+  task_source_node_id?: string;
 }
 
 export interface IntentAsset {
-  intent_id: number | string;
-  asset_id: number;
+  intent_id: string;
+  asset_id: string;
   type: NewAssetType;
   label: string;
   source: string;
   source_summary: string;
-  source_node_id?: number;
-  source_task_id: number;
+  source_node_id?: string;
+  source_task_id: string;
   inherited: boolean;
 }
 
@@ -292,8 +292,8 @@ export interface CoverageGraphNode {
   label: string;
   tested: boolean;
   in_scope: boolean;
-  asset_id?: number;
-  company_id?: number;
+  asset_id?: string;
+  company_id?: string;
   domain?: string;
   root_domain?: string;
   ip?: string;
@@ -317,7 +317,7 @@ export interface CoverageGraphData {
 
 // 某资产在本任务探索图里关联到的意图/事实/发现（覆盖图节点抽屉用）。
 export interface CoverageAssetRef {
-  id: number;
+  id: string;
   kind: string;
   state: string;
   summary: string;
@@ -352,10 +352,10 @@ export interface WorkspaceFile {
 
 // 任务测试范围的一条（覆盖度分母 + 授权边界）。
 export interface TaskScopeRow {
-  id: number;
-  task_id: number;
+  id: string;
+  task_id: string;
   kind: "company" | "root_domain" | "subdomain" | "ip" | "cidr" | "icp" | "keyword";
-  company_id?: number;
+  company_id?: string;
   company_name?: string; // 后端 JOIN companies 解析，仅 kind=company 有值
   domain?: string;
   net?: string;
@@ -384,8 +384,8 @@ export interface CompanyScopeMutation {
 
 // 公司资产范围规则的一条（归属唯一真值来源）。
 export interface ScopeRow {
-  id: number;
-  company_id: number;
+  id: string;
+  company_id: string;
   kind: CompanyScopeKind;
   domain?: string; // kind=domain 时有值
   net?: string; // kind=ip|cidr 时有值
@@ -396,7 +396,7 @@ export interface ScopeRow {
 
 // 企业：type=company 的资产节点 + 图标 + 资产计数 + 资产范围规则。
 export interface Company {
-  id: number;
+  id: string;
   name: string;
   logo?: string; // 远程图标 URL；空则前端用名称首字母
   asset_count: number;
@@ -593,8 +593,8 @@ export interface FindingAssetNode {
   parent?: string;
   kind: FindingAssetKind;
   label: string;
-  asset_id?: number;
-  company_id?: number;
+  asset_id?: string;
+  company_id?: string;
   self: number; // 直接挂在该资产上的发现数
   total: number; // 含子孙、按发现去重
   critical: number;
@@ -662,7 +662,7 @@ export interface Activity {
 }
 
 export interface LLMAuditProfile {
-  id: number;
+  id: string;
   name: string;
   format: string;
   model: string;
@@ -676,7 +676,7 @@ export interface LLMTransition {
 }
 
 export interface TaskLLMResolution {
-  profile_id?: number;
+  profile_id?: string;
   name: string;
   format: string;
   model: string;
@@ -693,7 +693,7 @@ export interface TaskLLMResolutions {
 
 // ---- Agent triggers (P3 调度，仅自定义 agent) ----
 export interface AgentTrigger {
-  id: number;
+  id: string;
   agent_key: string;
   enabled: boolean;
   interval_sec: number; // 定时:每 N 秒(0=不定时)
@@ -714,16 +714,16 @@ export interface AgentTrigger {
 
 // ---- Conversations (chat page) ----
 export interface ActiveFindingRetest {
-  id: number;
+  id: string;
   finding_id: string;
-  conversation_id: number;
+  conversation_id: string;
   status: "pending" | "running";
 }
 
 export interface FindingRetest {
-  id: number;
-  finding_id: number;
-  conversation_id: number | null;
+  id: string;
+  finding_id: string;
+  conversation_id: string | null;
   status: "pending" | "running" | "completed" | "failed" | "stopped";
   verdict: "" | "reproduced" | "fixed" | "inconclusive";
   notes: string;
@@ -736,11 +736,11 @@ export interface FindingRetest {
 }
 
 export interface Conversation {
-  id: number;
+  id: string;
   running?: boolean; // live server state, returned with the conversation list
   agent_key: string;
   title: string;
-  llm_profile_id?: number;
+  llm_profile_id?: string;
   pinned?: boolean;
   pinned_at?: string | null;
   created_at: string;
@@ -955,8 +955,8 @@ export interface Settings {
 // 后端对所有字段都不加校验：配置畸形时按「命中」处理（宁可多推不可漏推）。
 export interface NotificationFilter {
   min_severity?: string; // "" | low | medium | high | critical
-  task_ids?: number[]; // 空=不限；非空则要求与漏洞所属任务有交集
-  asset_ids?: number[]; // 空=不限；非空则要求与漏洞锚定资产有交集
+  task_ids?: string[]; // 空=不限；非空则要求与漏洞所属任务有交集
+  asset_ids?: string[]; // 空=不限；非空则要求与漏洞锚定资产有交集
   vulnclass_include?: string[]; // 空=全收；非空则要求漏洞类型命中任一关键词（大小写不敏感子串）
   vulnclass_exclude?: string[]; // 命中任一关键词即排除（排除优先于包含）
   on_status_change?: boolean; // 是否也接收漏洞处置状态变更事件
@@ -965,7 +965,7 @@ export interface NotificationFilter {
 // NotificationChannel 是一个渠道实例。config 的字段随 kind 而异，
 // 且凭据字段在读取时被替换成 "__masked__" 开头的掩码值——原样回传即表示「不改」。
 export interface NotificationChannel {
-  id: number;
+  id: string;
   name: string;
   kind: string;
   enabled: boolean;
@@ -1005,16 +1005,16 @@ export interface NotificationMeta {
 
 // NotificationDelivery 是一条投递记录，用于投递历史与失败重发。
 export interface NotificationDelivery {
-  id: number;
+  id: string;
   finding_id: string;
   event_kind: string; // finding_created | finding_status_changed
-  channel_id: number;
+  channel_id: string;
   channel_name: string;
   channel_kind: string;
   state: "pending" | "sending" | "sent" | "failed" | "skipped";
   attempts: number;
   last_error: string;
-  batch_id?: number;
+  batch_id?: string;
   created_at: string;
   sent_at?: string;
   next_attempt_at: string;
@@ -1118,7 +1118,7 @@ export interface Agent {
   role: string;
   builtin: boolean;
   enabled: boolean;
-  llm_profile_id?: number | null; // 绑定的 LLM 配置；null/absent = 跟随任务/会话/全局
+  llm_profile_id?: string | null; // 绑定的 LLM 配置；null/absent = 跟随任务/会话/全局
   max_turns?: number; // 0 = 无限制
   run_seconds?: number; // worker 单次运行墙钟上限(秒)；0 = 无限制
   web_search?: boolean; // 是否启用网络搜索(受系统全局开关门控)
@@ -1152,9 +1152,9 @@ export interface AgentDetail {
   prompt: string;
   variables: PromptVar[];
   versions: PromptVersion[];
-  visibility: { mcp: number[]; skill: string[] };
+  visibility: { mcp: string[]; skill: string[] };
   // 可绑定的 LLM 配置候选(供「默认模型」下拉)；当前绑定见 agent.llm_profile_id
-  llm_profiles?: { id: number; name: string; model: string; is_default: boolean }[];
+  llm_profiles?: { id: string; name: string; model: string; is_default: boolean }[];
   wrapup_prompt?: string; // 已保存的收尾提示词(空=用内置默认)
   wrapup_default?: string; // 内置默认收尾提示词(占位/恢复默认)
   wrapup_max_turns?: number; // 已保存的收尾轮数(0=用内置默认)
@@ -1169,7 +1169,7 @@ export interface AgentDetail {
 
 // ---- MCP ----
 export interface MCPServer {
-  id: number;
+  id: string;
   name: string;
   transport: "stdio" | "http" | "sse";
   command?: string;
@@ -1207,7 +1207,7 @@ export interface SkillItem {
 export interface SkillCall {
   ts: string;
   agent_key: string;
-  task_id: number; // 0 = 非任务场景（对话会话）
+  task_id: string; // "0" = 非任务场景（对话会话）
   session_id: string;
   args_len: number;
 }
@@ -1255,7 +1255,7 @@ export type InterceptMatchTarget = "tool_name" | "tool_input";
 export type InterceptMatchType = "string" | "regex";
 
 export interface InterceptRule {
-  id: number;
+  id: string;
   name: string;
   enabled: boolean;
   priority: number;
@@ -1294,7 +1294,7 @@ export interface AssetInterceptRuleInput {
 }
 
 export interface AssetInterceptRule {
-  id: number;
+  id: string;
   enabled: boolean;
   action?: AssetInterceptAction; // 全局规则不带此字段（恒为拦截）；任务级规则区分 block/allow
   kind: AssetInterceptKind;
@@ -1307,9 +1307,9 @@ export interface AssetInterceptRule {
 
 export interface InterceptPending {
   decision_source?: "rule" | "model" | "unknown" | "";
-  id: number;
-  rule_id?: number;
-  conversation_id?: number;
+  id: string;
+  rule_id?: string;
+  conversation_id?: string;
   task_id?: string;
   agent_name: string;
   tool_name: string;
@@ -1324,7 +1324,7 @@ export interface InterceptPending {
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
 export interface JudgeConfig {
   enabled: boolean;
-  profile_id: number; // 0 = 跟随激活/默认配置
+  profile_id: string; // "0" = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
   timeout_seconds: number; // 模型调用超时
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
@@ -1381,7 +1381,7 @@ export interface SSTask {
 // ConvTokenSummary — one conversation's token total (+ profile/date) for merging
 // chat usage into the dashboard token stats. GET /api/tokens/conversations.
 export interface ConvTokenSummary {
-  llm_profile_id: number | null;
+  llm_profile_id: string | null;
   created_at: string;
   input_tokens: number;
   output_tokens: number;
@@ -1391,8 +1391,8 @@ export interface ConvTokenSummary {
 
 // ---- Command recording (Bash execution history) ----
 export interface CommandRecord {
-  id: number;
-  exploration_id: number;
+  id: string;
+  exploration_id: string;
   worker: string;
   tool: string;
   command: string; // raw tool input (JSON)
@@ -1410,7 +1410,7 @@ export interface ToolStat {
 
 // ---- LLM recording ----
 export interface LLMRecordItem {
-  id: number;
+  id: string;
   ts: string;
   model: string;
   profile_name: string;
@@ -1453,10 +1453,10 @@ export interface InterceptReviewInput {
   };
   // Version 1 snapshots are immutable and remain readable in historical audits.
   task?: {
-    task_id: number;
+    task_id: string;
     description: string;
     goal: string;
-    constraints: { id: number; kind: string; text: string; origin: string; created_at: number }[];
+    constraints: { id: string; kind: string; text: string; origin: string; created_at: number }[];
     truncated?: boolean;
   };
   working_directory?: string;
@@ -1500,7 +1500,7 @@ export interface InterceptAudit {
   decision_reason?: string;
   rule_name?: string;
   config_digest?: string;
-  profile_id?: number;
+  profile_id?: string;
   execution_status: "not_started" | "not_executed" | "awaiting_result" | "succeeded" | "failed" | "unknown";
   output?: string;
   output_truncated?: boolean;
@@ -1604,7 +1604,7 @@ export interface UpdateProgress {
 
 // Original execution selected from an approval, never submitted to the reviewer.
 export interface InterceptExecution {
-  conversation_id: number | null;
+  conversation_id: string | null;
   task_id: string | null;
   session: string;
   seq: number;

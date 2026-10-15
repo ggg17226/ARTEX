@@ -197,7 +197,7 @@ const FOLLOW_ACTIVE = "0"; // profile_id 0 = 跟随激活/默认配置
 
 const defaultJudge = (): JudgeConfig => ({
   enabled: false,
-  profile_id: 0,
+  profile_id: "0",
   prompt: "",
   timeout_seconds: 15,
   fail_action: "allow",
@@ -363,7 +363,7 @@ function JudgeCard() {
               <div className="space-y-4">
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">判定模型与策略</p>
                 <Field label="审批模型">
-                  <Select value={String(cfg.profile_id || 0)} onValueChange={(v) => patch({ profile_id: Number(v) })}>
+                  <Select value={cfg.profile_id ?? "0"} onValueChange={(v) => patch({ profile_id: v })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={FOLLOW_ACTIVE}>跟随激活配置</SelectItem>
@@ -541,7 +541,7 @@ export default function InterceptPage() {
     }
   }
 
-  async function handleDelete(id: number) {
+  async function handleDelete(id: string) {
     try {
       await api.deleteInterceptRule(id);
       toast.success("规则已删除");

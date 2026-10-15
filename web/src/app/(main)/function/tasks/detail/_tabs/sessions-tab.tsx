@@ -642,7 +642,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
 
   // Refs backing SSE/loading without re-render churn.
-  const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
+  const snapshotRef = React.useRef("0"); // task-level snapshot cursor → SSE since=
   const esRef = React.useRef<EventSource | null>(null);
   const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
@@ -676,7 +676,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
       if (key === "system") {
         void (async () => {
-          let since = 0;
+          let since = "0";
           let systemItems: Activity[] = [];
           for (;;) {
             const page = await api.activity(taskId, { since, limit: SYSTEM_SCAN_PAGE });
@@ -687,7 +687,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                 (item) => item.worker === "system" || item.kind === "llm_switch" || item.kind === "llm_failover",
               ),
             );
-            if (page.items.length < SYSTEM_SCAN_PAGE || page.cursor <= since) break;
+            if (page.items.length < SYSTEM_SCAN_PAGE || BigInt(page.cursor || "0") <= BigInt(since || "0")) break;
             since = page.cursor;
           }
           patchStore(key, (s) => {
@@ -721,7 +721,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         .activityHistory(taskId, key, 0, PAGE)
         .then((r) => {
           if (reqTokenRef.current[key] !== token) return; // superseded
-          if (r.snapshotCursor > snapshotRef.current) snapshotRef.current = r.snapshotCursor;
+          if (BigInt(r.snapshotCursor || "0") > BigInt(snapshotRef.current || "0")) snapshotRef.current = r.snapshotCursor;
           patchStore(key, (s) => {
             const items = mergeBySeq(r.items, s.items); // keep any live frames arrived meanwhile
             return {
@@ -890,7 +890,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     setActiveId(MAIN_ID); // a stale worker id from the previous task must not leak in
     setMainSegs([{ seq: 0, created_at: "" }]);
     setCurrentSeg(0);
-    snapshotRef.current = 0;
+    snapshotRef.current = "0";
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
     // Reserve the initial main key so the active-session effect (which fires for main on
@@ -1080,9 +1080,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         .then((r) => {
           if (!active) return;
           const freshIds = new Set(r.items.map((item) => item.id));
-          const oldestFreshId = r.items.reduce((minimum, item) => Math.min(minimum, Number(item.id)), Infinity);
+          const oldestFreshId = r.items.reduce(
+            (minimum, item) => (BigInt(item.id) < minimum ? BigInt(item.id) : minimum),
+            BigInt(Number.MAX_SAFE_INTEGER),
+          );
           const displaced = r.hasMore
-            ? firstIntentsRef.current.filter((item) => !freshIds.has(item.id) && Number(item.id) < oldestFreshId)
+            ? firstIntentsRef.current.filter((item) => !freshIds.has(item.id) && BigInt(item.id) < oldestFreshId)
             : [];
           if (displaced.length > 0) {
             setOlderIntents((previous) => {
@@ -1109,8 +1112,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const loadOlderIntents = React.useCallback(() => {
     if (loadingOlderIntents) return;
     const all = [...intents, ...olderIntents];
-    const minId = all.reduce((m, n) => Math.min(m, Number(n.id)), Infinity);
-    if (!Number.isFinite(minId)) return;
+    if (all.length === 0) return;
+    const minId = all.reduce(
+      (m, n) => (BigInt(n.id) < m ? BigInt(n.id) : m),
+      BigInt(Number.MAX_SAFE_INTEGER),
+    ).toString();
     setLoadingOlderIntents(true);
     api
       .intentsPage(taskId, minId, 300)
@@ -1133,7 +1139,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     const byId = new Map<string, TaskNode>();
     for (const n of olderIntents) byId.set(n.id, n);
     for (const n of intents) byId.set(n.id, n); // fresh poll wins over older snapshot
-    return [...byId.values()].sort((a, b) => Number(b.id) - Number(a.id));
+    return [...byId.values()].sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1));
   }, [intents, olderIntents]);
   const intentAssetsByID = React.useMemo(() => {
     const grouped = new Map<string, IntentAsset[]>();
@@ -2096,7 +2102,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               <div className="flex items-center border-t px-4 py-2">
                 <TodoPopover
                   seq={latestTodoSeq}
-                  fetchDetail={(seq) => api.activityDetail(seq, taskId).then((r) => r.detail ?? "")}
+                  fetchDetail={(seq) => api.activityDetail(String(seq), taskId).then((r) => r.detail ?? "")}
                 />
               </div>
             )}

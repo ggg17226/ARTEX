@@ -262,7 +262,7 @@ function ModelReviewContext({ input }: { input: InterceptReviewInput }) {
   );
 }
 
-type Decide = (id: number, decision: "allowed" | "denied") => Promise<void>;
+type Decide = (id: string, decision: "allowed" | "denied") => Promise<void>;
 
 function DecisionActions({ row, busy, decide }: { row: InterceptApprovalRow; busy: boolean; decide: Decide }) {
   if (row.status !== "pending") return null;
@@ -546,10 +546,10 @@ function ApprovalTable({
   revision: number;
   label: string;
 }) {
-  const [expanded, setExpanded] = React.useState<Set<number>>(() => new Set());
+  const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
   const columns = React.useSyncExternalStore(subscribeColumns, visibleColumnCount, serverColumnCount);
   const prefix = React.useId();
-  function toggle(id: number) {
+  function toggle(id: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);

@@ -1074,7 +1074,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
   const [newKind, setNewKind] = React.useState<AssetInterceptKind>("fuzzy_domain");
   const [newPattern, setNewPattern] = React.useState("");
   const [newNote, setNewNote] = React.useState("");
-  const [editId, setEditId] = React.useState<number | null>(null);
+  const [editId, setEditId] = React.useState<string | null>(null);
   const [editAction, setEditAction] = React.useState<"block" | "allow">("block");
   const [editKind, setEditKind] = React.useState<AssetInterceptKind>("fuzzy_domain");
   const [editPattern, setEditPattern] = React.useState("");

@@ -124,8 +124,8 @@ export default function AssetsPage() {
   const [rowsTab, setRowsTab] = React.useState("");
 
   // asset selection & delete
-  const [selected, setSelected] = React.useState<Set<number>>(new Set());
-  const [deleteIds, setDeleteIds] = React.useState<number[]>([]);
+  const [selected, setSelected] = React.useState<Set<string>>(new Set());
+  const [deleteIds, setDeleteIds] = React.useState<string[]>([]);
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
 
@@ -157,7 +157,7 @@ export default function AssetsPage() {
     setSelected(new Set());
   }, [loadMeta]);
 
-  const toggleSelect = (id: number) => {
+  const toggleSelect = (id: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -166,7 +166,7 @@ export default function AssetsPage() {
     });
   };
 
-  const toggleSelectAll = (ids: number[]) => {
+  const toggleSelectAll = (ids: string[]) => {
     setSelected((prev) => {
       const allSelected = ids.every((id) => prev.has(id));
       const next = new Set(prev);
@@ -183,7 +183,7 @@ export default function AssetsPage() {
     });
   };
 
-  const openDelete = (ids: number[]) => {
+  const openDelete = (ids: string[]) => {
     setDeleteIds(ids);
     setDeleteOpen(true);
   };
@@ -287,12 +287,12 @@ export default function AssetsPage() {
   }, [page, size, tab, total]);
 
   const companyById = React.useMemo(() => {
-    const m = new Map<number, string>();
+    const m = new Map<string, string>();
     for (const c of companies) m.set(c.id, c.name);
     return m;
   }, [companies]);
 
-  const companyName = (id?: number) => (id ? (companyById.get(id) ?? "") : "");
+  const companyName = (id?: string) => (id ? (companyById.get(id) ?? "") : "");
 
   const tabCounts: Record<string, number> = { ...counts, company: companies.length };
   const totalAssets = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -323,7 +323,7 @@ export default function AssetsPage() {
             共 <span className="tabular-nums">{totalAssets}</span> 项资产
           </span>
           {selected.size > 0 && (
-            <Button variant="destructive" size="sm" onClick={() => openDelete(Array.from(selected) as number[])}>
+            <Button variant="destructive" size="sm" onClick={() => openDelete(Array.from(selected))}>
               <Trash2Icon className="size-3.5" /> 删除已选 ({selected.size})
             </Button>
           )}
@@ -831,8 +831,8 @@ function AssetCard({
   onSize: React.Dispatch<React.SetStateAction<number>>;
   onPage: React.Dispatch<React.SetStateAction<number>>;
   rows?: Asset[];
-  selected?: Set<number>;
-  onToggleAll?: (ids: number[]) => void;
+  selected?: Set<string>;
+  onToggleAll?: (ids: string[]) => void;
   children: React.ReactNode;
 }) {
   const childRows = React.Children.toArray(children);

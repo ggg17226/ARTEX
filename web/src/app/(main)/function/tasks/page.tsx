@@ -743,7 +743,7 @@ export default function TasksPage() {
 
   // 后端把整批分类写入放在一个事务里，所以失败项只可能是勾选后又被删掉的任务。
   const moveSelectedTasksCategory = React.useCallback(
-    async (categoryID?: number) => {
+    async (categoryID?: string) => {
       const ids = [...selectedIds];
       if (ids.length === 0 || movingCategory) return;
       if (ids.length > 100) {
@@ -1653,9 +1653,9 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(20);
   const [total, setTotal] = React.useState(0);
-  const [selected, setSelected] = React.useState<Set<number>>(() => new Set());
+  const [selected, setSelected] = React.useState<Set<string>>(() => new Set());
   const [loading, setLoading] = React.useState(true);
-  const pendingRestoreIDs = React.useRef(new Set<number>());
+  const pendingRestoreIDs = React.useRef(new Set<string>());
 
   const load = React.useCallback(async () => {
     try {
@@ -1737,8 +1737,8 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
       const succeeded = result.items.filter((item) => item.ok).length;
       const failed = result.items.length - succeeded;
       for (const item of result.items) {
-        const archiveID = Number(item.archive_id ?? item.id);
-        if (item.ok && Number.isSafeInteger(archiveID) && archiveID > 0) pendingRestoreIDs.current.add(archiveID);
+        const archiveID = String(item.archive_id ?? item.id);
+        if (item.ok && archiveID) pendingRestoreIDs.current.add(archiveID);
       }
       if (succeeded > 0) toast.success(`已将 ${succeeded} 个任务加入还原队列`);
       if (failed > 0) toast.error(`${failed} 个任务无法还原`);
@@ -2225,7 +2225,7 @@ function MoveTasksCategoryDialog({
   categories: TaskCategory[];
   count: number;
   moving: boolean;
-  onMove: (categoryID?: number) => Promise<void>;
+  onMove: (categoryID?: string) => Promise<void>;
 }) {
   const [open, setOpen] = React.useState(false);
   const [target, setTarget] = React.useState(UNCATEGORIZED_VALUE);
@@ -2276,7 +2276,7 @@ function MoveTasksCategoryDialog({
           <Button
             disabled={moving}
             onClick={() => {
-              void onMove(target === UNCATEGORIZED_VALUE ? undefined : Number(target)).then(() => setOpen(false));
+              void onMove(target === UNCATEGORIZED_VALUE ? undefined : target).then(() => setOpen(false));
             }}
           >
             {moving && <Spinner data-icon="inline-start" />}
@@ -2444,8 +2444,8 @@ function CategoryPicker({
   portalContainer,
 }: {
   categories: TaskCategory[];
-  value?: number;
-  onValueChange: (categoryID?: number) => void;
+  value?: string;
+  onValueChange: (categoryID?: string) => void;
   onCategoryCreated: () => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
 }) {
@@ -2456,7 +2456,7 @@ function CategoryPicker({
   const [localExtra, setLocalExtra] = React.useState<TaskCategory[]>([]);
 
   const allCategories = React.useMemo(() => {
-    const byID = new Map<number, TaskCategory>();
+    const byID = new Map<string, TaskCategory>();
     for (const category of categories) byID.set(category.id, category);
     for (const category of localExtra) if (!byID.has(category.id)) byID.set(category.id, category);
     return [...byID.values()];
@@ -2506,7 +2506,7 @@ function CategoryPicker({
       onValueChange={(next: string[]) => {
         // 单选：取最新选中的一个；移除 chip（清空）则回到未分类。
         const last = next[next.length - 1];
-        onValueChange(last ? Number(last) : undefined);
+        onValueChange(last ? last : undefined);
         setInputValue("");
       }}
       inputValue={inputValue}
@@ -2582,16 +2582,16 @@ function CompanyPicker({
   portalContainer,
 }: {
   companies: Company[];
-  value: number[];
-  onValueChange: (value: number[]) => void;
+  value: string[];
+  onValueChange: (value: string[]) => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
 }) {
   const companiesByID = React.useMemo(
-    () => new Map(companies.map((company) => [String(company.id), company])),
+    () => new Map(companies.map((company) => [company.id, company])),
     [companies],
   );
-  const companyIDs = React.useMemo(() => companies.map((company) => String(company.id)), [companies]);
-  const selectedIDs = React.useMemo(() => value.map(String), [value]);
+  const companyIDs = React.useMemo(() => companies.map((company) => company.id), [companies]);
+  const selectedIDs = React.useMemo(() => value, [value]);
 
   return (
     <Combobox
@@ -2602,7 +2602,7 @@ function CompanyPicker({
       }}
       multiple
       value={selectedIDs}
-      onValueChange={(next) => onValueChange(next.map(Number).filter(Number.isFinite))}
+      onValueChange={onValueChange}
     >
       <ComboboxChips>
         <ComboboxValue>
@@ -2641,7 +2641,7 @@ function CompanyPicker({
   );
 }
 
-type CategoryManagementView = number | "uncategorized" | "new";
+type CategoryManagementView = string | "uncategorized" | "new";
 
 function CategoryDropTarget({
   value,
@@ -2781,7 +2781,9 @@ function CategoryManagementSheet({
 
   const selectedCategory = React.useMemo(
     () =>
-      typeof selectedView === "number" ? (categories.find((category) => category.id === selectedView) ?? null) : null,
+      selectedView !== "uncategorized" && selectedView !== "new"
+        ? (categories.find((category) => category.id === selectedView) ?? null)
+        : null,
     [categories, selectedView],
   );
 
@@ -2789,7 +2791,7 @@ function CategoryManagementSheet({
 
   const visibleTasks = React.useMemo(() => {
     if (selectedView === "uncategorized") return tasks.filter((task) => task.category_id == null);
-    if (typeof selectedView === "number") return tasks.filter((task) => task.category_id === selectedView);
+    if (selectedView !== "new") return tasks.filter((task) => task.category_id === selectedView);
     return [];
   }, [selectedView, tasks]);
 
@@ -2855,7 +2857,7 @@ function CategoryManagementSheet({
   async function moveTask(task: Task, destination: string) {
     if (movingTaskID) return;
     const category =
-      destination === "uncategorized" ? null : (categories.find((item) => item.id === Number(destination)) ?? null);
+      destination === "uncategorized" ? null : (categories.find((item) => item.id === destination) ?? null);
     if (destination !== "uncategorized" && !category) {
       toast.error("目标分类不存在，请刷新后重试");
       return;
@@ -3073,14 +3075,14 @@ function CreateTaskSheet({
 }) {
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState("");
-  const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
+  const [categoryID, setCategoryID] = React.useState<string | undefined>(undefined);
   const [description, setDescription] = React.useState("");
   const [goal, setGoal] = React.useState("");
-  const [selectedTemplateID, setSelectedTemplateID] = React.useState<number | null>(null);
+  const [selectedTemplateID, setSelectedTemplateID] = React.useState<string | null>(null);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [companies, setCompanies] = React.useState<Company[]>([]);
   const [sourceTaskIDs, setSourceTaskIDs] = React.useState<string[]>([]);
-  const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
+  const [companyIDs, setCompanyIDs] = React.useState<string[]>([]);
   const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
   const [creating, setCreating] = React.useState(false);
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
@@ -3147,7 +3149,7 @@ function CreateTaskSheet({
         categoryId: categoryID,
         description: description.trim(),
         goal: goal.trim(),
-        llmProfileIds: llmProfileIDs.map(Number),
+        llmProfileIds: llmProfileIDs,
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
         timeoutSeconds: timeoutSec,

@@ -194,7 +194,7 @@ function InterceptCard({
   // extract pending_id from summary: "工具 Bash 请求审批 (#42)"
   const pendingId = React.useMemo(() => {
     const m = /\(#(\d+)\)/.exec(step.summary);
-    return m ? parseInt(m[1], 10) : null;
+    return m ? m[1] : null;
   }, [step.summary]);
 
   const toolName = React.useMemo(() => {
@@ -693,7 +693,7 @@ function ExecView({
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
   // its own (conversation-scoped) fetcher instead.
   const getDetail = React.useCallback(
-    (seq: number) => (fetchDetail ? fetchDetail(seq) : api.activityDetail(seq, taskId).then((r) => r.detail ?? "")),
+    (seq: number) => (fetchDetail ? fetchDetail(seq) : api.activityDetail(String(seq), taskId).then((r) => r.detail ?? "")),
     [fetchDetail, taskId],
   );
   return (

@@ -106,7 +106,7 @@ function SidePanel({
         }}
         className="min-h-0 flex-1 overflow-y-auto p-3"
       >
-        {side.nextCursor > 0 && (
+        {side.nextCursor && side.nextCursor !== "0" && (
           <Button variant="ghost" size="sm" onClick={() => void side.load(side.nextCursor)}>
             加载更早的旁路问答
           </Button>

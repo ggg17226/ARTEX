@@ -286,14 +286,14 @@ function LLMProfileRow({
   rightSlot,
 }: {
   profiles: LLMProfile[];
-  selected: number | null;
-  onChange: (id: number | null) => void;
+  selected: string | null;
+  onChange: (id: string | null) => void;
   disabled?: boolean;
   rightSlot?: React.ReactNode;
 }) {
   const [open, setOpen] = React.useState(false);
   const activeDefault = profiles.find((p) => p.is_default);
-  const current = selected != null ? profiles.find((p) => Number(p.id) === selected) : null;
+  const current = selected != null ? profiles.find((p) => p.id === selected) : null;
   const label = current ? current.name : `默认${activeDefault ? `（${activeDefault.name}）` : ""}`;
 
   return (
@@ -339,12 +339,12 @@ function LLMProfileRow({
               key={p.id}
               type="button"
               onClick={() => {
-                onChange(Number(p.id));
+                onChange(p.id);
                 setOpen(false);
               }}
               className={cn(
                 "flex w-full flex-col rounded px-2 py-1.5 text-left hover:bg-accent",
-                selected === Number(p.id) && "bg-accent",
+                selected === p.id && "bg-accent",
               )}
             >
               <span className="text-sm">{p.name}</span>
@@ -374,7 +374,7 @@ function DraftChat({
   onStarted: (c: Conversation, pending?: { input?: string; attachments?: ChatAttachment[] }) => void;
 }) {
   const [agentKey, setAgentKey] = React.useState("");
-  const [llmProfileId, setLlmProfileId] = React.useState<number | null>(null);
+  const [llmProfileId, setLlmProfileId] = React.useState<string | null>(null);
   const [input, setInput] = React.useState("");
   const [sending, setSending] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
@@ -503,7 +503,7 @@ function ChatView({
   // 方式1 文件上传:已上传的附件(落到 sessions/conv-<id>/uploads/),随下条消息一起发。
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>(initial?.attachments ?? []);
   const [uploading, setUploading] = React.useState(false);
-  const cursorRef = React.useRef(0); // newest loaded id — incremental-tail anchor
+  const cursorRef = React.useRef<string | number>(0); // newest loaded id — incremental-tail anchor
   const earliestRef = React.useRef(0); // earliest loaded id — reverse-pagination anchor
   const hasMoreRef = React.useRef(false); // older history remains above the loaded window
   const loadingMoreRef = React.useRef(false); // guard: one scroll-up load at a time
@@ -513,7 +513,7 @@ function ChatView({
   const currentProfileId = conv.llm_profile_id ?? null;
   const side = useSideQuestions(`/api/conversations/${conv.id}`);
 
-  async function changeProfile(id: number | null) {
+  async function changeProfile(id: string | null) {
     try {
       await api.updateConversationProfile(conv.id, id);
       onConvUpdated();
@@ -553,7 +553,7 @@ function ChatView({
       .then((r) => {
         if (!live) return;
         setMessages((current) => mergeActivities(r.items, current));
-        cursorRef.current = Math.max(cursorRef.current, r.cursor);
+        if (BigInt(r.cursor || "0") > BigInt(cursorRef.current || "0")) cursorRef.current = r.cursor;
         earliestRef.current = r.items.length ? r.items[0].seq : 0;
         hasMoreRef.current = r.hasMore;
         setHasMore(r.hasMore);
@@ -589,7 +589,7 @@ function ChatView({
         if (r.items.length) {
           setMessages((prev) => mergeActivities(prev, r.items));
         }
-        cursorRef.current = Math.max(cursorRef.current, r.cursor);
+        if (BigInt(r.cursor || "0") > BigInt(cursorRef.current || "0")) cursorRef.current = r.cursor;
         keepPolling = r.running;
         setRunning(r.running);
         if (!r.running) onTitleMaybeChanged(); // first-turn auto-title landed
@@ -863,16 +863,16 @@ const ConversationItem = React.memo(function ConversationItem({
   active: boolean;
   renaming: boolean;
   renameText: string;
-  onSelect: (id: number) => void;
+  onSelect: (id: string) => void;
   onStartRename: (conversation: Conversation) => void;
   onRenameText: (v: string) => void;
-  onCommitRename: (id: number, title: string) => void;
+  onCommitRename: (id: string, title: string) => void;
   onCancelRename: () => void;
   onTogglePinned: (conversation: Conversation) => void;
-  onDelete: (id: number) => void;
+  onDelete: (id: string) => void;
   selectionMode: boolean;
   selectedForDelete: boolean;
-  onSelectedForDeleteChange: (id: number, checked: boolean) => void;
+  onSelectedForDeleteChange: (id: string, checked: boolean) => void;
 }) {
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const renameInputRef = React.useRef<HTMLInputElement>(null);
@@ -1047,10 +1047,10 @@ export default function ChatPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [convs, setConvs] = React.useState<Conversation[]>([]);
   const [agentFilter, setAgentFilter] = React.useState<string | null>(null);
-  const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
-  const selectConversation = React.useCallback((id: number | null) => {
+  const selectConversation = React.useCallback((id: string | null) => {
     if (id !== selectedId) {
       const url = new URL(window.location.href);
       url.searchParams.delete("approval");
@@ -1060,9 +1060,9 @@ export default function ChatPage() {
     setSelectedId(id);
   }, [selectedId]);
 
-  const [renamingId, setRenamingId] = React.useState<number | null>(null);
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameText, setRenameText] = React.useState("");
-  const [selectedConversationIds, setSelectedConversationIds] = React.useState<Set<number>>(() => new Set());
+  const [selectedConversationIds, setSelectedConversationIds] = React.useState<Set<string>>(() => new Set());
   // selectionMode gates the multi-select UI: off by default (clean list, no
   // checkboxes); the header "多选" button turns it on, "完成" turns it off and
   // clears the selection.
@@ -1077,7 +1077,7 @@ export default function ChatPage() {
   // conversation via the paperclip, keyed by the new conversation id (consumed once
   // by ChatView on mount; ids never repeat, so leftover entries are harmless).
   const [pendingByConv, setPendingByConv] = React.useState<
-    Record<number, { input?: string; attachments?: ChatAttachment[] }>
+    Record<string, { input?: string; attachments?: ChatAttachment[] }>
   >({});
 
   const conversationListSeq = React.useRef(0);
@@ -1159,8 +1159,7 @@ export default function ChatPage() {
     const params = new URLSearchParams(window.location.search);
     setSourceRequested(params.has("approval"));
     const c = params.get("c");
-    const id = c ? Number(c) : NaN;
-    if (Number.isFinite(id)) setSelectedId(id);
+    if (c) setSelectedId(c);
   }, []);
   // Mirror the current selection into the URL (replaceState → no history spam). A
   // selectedId with no matching conversation (e.g. a stale ?c=, or a just-created
@@ -1232,7 +1231,7 @@ export default function ChatPage() {
   if (allConversationsSelected) conversationHeaderChecked = true;
   else if (someConversationsSelected) conversationHeaderChecked = "indeterminate";
 
-  const toggleConversationSelected = React.useCallback((id: number, checked: boolean) => {
+  const toggleConversationSelected = React.useCallback((id: string, checked: boolean) => {
     setSelectedConversationIds((current) => {
       const next = new Set(current);
       if (checked) next.add(id);
@@ -1253,7 +1252,7 @@ export default function ChatPage() {
   }
 
   const del = React.useCallback(
-    async (id: number) => {
+    async (id: string) => {
       try {
         await api.deleteConversation(id);
         setSelectedId((current) => (current === id ? null : current));
@@ -1275,8 +1274,8 @@ export default function ChatPage() {
     const ids = [...selectedConversationIds];
     if (ids.length === 0 || bulkDeleting) return;
     setBulkDeleting(true);
-    const deleted = new Set<number>();
-    const failed: { id: number; error: string }[] = [];
+    const deleted = new Set<string>();
+    const failed: { id: string; error: string }[] = [];
     try {
       for (let offset = 0; offset < ids.length; offset += 100) {
         const result = await api.deleteConversations(ids.slice(offset, offset + 100));
@@ -1285,7 +1284,7 @@ export default function ChatPage() {
           else failed.push({ id: item.id, error: item.error ?? "对话不存在" });
         }
       }
-      if (deleted.has(selectedId ?? -1)) selectConversation(null);
+      if (selectedId && deleted.has(selectedId)) selectConversation(null);
       setSelectedConversationIds((current) => {
         const next = new Set(current);
         for (const id of deleted) next.delete(id);
@@ -1330,7 +1329,7 @@ export default function ChatPage() {
     setRenameText(c.title || "");
   }, []);
   const commitRename = React.useCallback(
-    async (id: number, value: string) => {
+    async (id: string, value: string) => {
       const title = value.trim();
       setRenamingId(null);
       if (!title) return;

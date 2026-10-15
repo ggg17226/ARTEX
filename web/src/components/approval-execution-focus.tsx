@@ -1,14 +1,15 @@
 "use client";
 
 import * as React from "react";
+
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import type { Activity, InterceptExecution } from "@/lib/types";
 
 // Resolve one exact persisted call, independently of transcript pagination.
-export function useApprovalFocus({ taskId, conversationId }: { taskId?: string; conversationId?: number }) {
+export function useApprovalFocus({ taskId, conversationId }: { taskId?: string; conversationId?: string }) {
   const [state, setState] = React.useState<{
-    id: number;
+    id: string;
     source?: InterceptExecution;
     error?: string;
     loading: boolean;
@@ -17,9 +18,9 @@ export function useApprovalFocus({ taskId, conversationId }: { taskId?: string; 
   // biome-ignore lint/correctness/useExhaustiveDependencies: revision is the explicit retry trigger.
   React.useEffect(() => {
     const q = new URLSearchParams(window.location.search);
-    const id = Number(q.get("approval"));
-    const matches = conversationId ? q.get("c") === String(conversationId) : q.get("id") === taskId;
-    if (!matches || !Number.isSafeInteger(id) || id <= 0) {
+    const id = q.get("approval")?.trim() ?? "";
+    const matches = conversationId ? q.get("c") === conversationId : q.get("id") === taskId;
+    if (!matches || !id || id === "0") {
       setState(null);
       return;
     }

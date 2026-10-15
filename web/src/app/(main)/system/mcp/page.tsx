@@ -46,7 +46,7 @@ const emptyForm: FormState = {
 export default function MCPPage() {
   const [servers, setServers] = React.useState<MCPServer[]>([]);
   const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [visibility, setVisibility] = React.useState<Record<number, string[]>>({});
+  const [visibility, setVisibility] = React.useState<Record<string, string[]>>({});
 
   const [open, setOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<MCPServer | null>(null); // null = add mode
@@ -123,7 +123,7 @@ export default function MCPPage() {
     loadTools(s.id);
   }
 
-  async function loadTools(id: number) {
+  async function loadTools(id: string) {
     setToolsLoading(true);
     try {
       setTools(await api.mcpTools(id));
@@ -217,7 +217,7 @@ export default function MCPPage() {
     }
   }
 
-  async function toggleVisibility(serverId: number, agentId: string, agentName: string) {
+  async function toggleVisibility(serverId: string, agentId: string, agentName: string) {
     const on = (visibility[serverId] ?? []).includes(agentId);
     try {
       await api.toggleVisibility(agentId, "mcp", serverId, !on);
@@ -416,8 +416,8 @@ export default function MCPPage() {
                   {agents.map((a) => (
                     <label key={a.key} className="flex items-center gap-2 text-sm">
                       <Checkbox
-                        checked={(visibility[s.id] ?? []).includes(a.id)}
-                        onCheckedChange={() => toggleVisibility(s.id, a.id, a.name)}
+                        checked={(visibility[s.id] ?? []).includes(a.key)}
+                        onCheckedChange={() => toggleVisibility(s.id, a.key, a.name)}
                       />
                       {a.name}
                     </label>

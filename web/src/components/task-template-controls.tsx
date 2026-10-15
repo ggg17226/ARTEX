@@ -40,7 +40,7 @@ interface TemplateDraft {
   name: string;
   description: string;
   goal: string;
-  categoryID: number | null;
+  categoryID: string | null;
   interceptRules: AssetInterceptRuleInput[];
 }
 
@@ -54,7 +54,7 @@ interface TaskTemplateManagerProps {
   seed: TemplateSeed | null;
   onCreated: (template: TaskTemplate) => void;
   onUpdated: (template: TaskTemplate) => void;
-  onDeleted: (id: number) => void;
+  onDeleted: (id: string) => void;
 }
 
 const emptyDraft = (): TemplateDraft => ({
@@ -84,7 +84,7 @@ function TaskTemplateManager({
   onUpdated,
   onDeleted,
 }: TaskTemplateManagerProps) {
-  const [selectedID, setSelectedID] = React.useState<number | null>(null);
+  const [selectedID, setSelectedID] = React.useState<string | null>(null);
   const [draft, setDraft] = React.useState<TemplateDraft>(emptyDraft);
   const [saving, setSaving] = React.useState(false);
   const [deleteOpen, setDeleteOpen] = React.useState(false);
@@ -274,9 +274,9 @@ function TaskTemplateManager({
                   <NativeSelect
                     id="task-template-category"
                     className="w-full"
-                    value={draft.categoryID == null ? "" : String(draft.categoryID)}
+                    value={draft.categoryID == null ? "" : draft.categoryID}
                     onChange={(event) =>
-                      patchDraft({ categoryID: event.target.value === "" ? null : Number(event.target.value) })
+                      patchDraft({ categoryID: event.target.value === "" ? null : event.target.value })
                     }
                   >
                     <NativeSelectOption value="">未分类</NativeSelectOption>
@@ -347,10 +347,10 @@ function TaskTemplateManager({
 interface TaskTemplateControlsProps {
   description: string;
   goal: string;
-  categoryID?: number;
+  categoryID?: string;
   interceptRules?: AssetInterceptRuleInput[];
-  selectedTemplateID: number | null;
-  onSelectedTemplateIDChange: (id: number | null) => void;
+  selectedTemplateID: string | null;
+  onSelectedTemplateIDChange: (id: string | null) => void;
   onApply: (template: TaskTemplate) => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
 }
@@ -428,7 +428,7 @@ export function TaskTemplateControls({
     setTemplates((current) => [template, ...current.filter((item) => item.id !== template.id)]);
   };
 
-  const deleteTemplate = (id: number) => {
+  const deleteTemplate = (id: string) => {
     setTemplates((current) => current.filter((template) => template.id !== id));
     if (selectedTemplateID === id) onSelectedTemplateIDChange(null);
   };

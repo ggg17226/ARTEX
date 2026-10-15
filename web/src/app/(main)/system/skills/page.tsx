@@ -902,7 +902,7 @@ export default function SkillsPage() {
                             <span className="tabular-nums text-muted-foreground">{fmtTime(c.ts)}</span>
                             <Badge variant="outline" className="font-normal">{c.agent_key || "—"}</Badge>
                             <span className="ml-auto text-muted-foreground">
-                              {c.task_id > 0 ? `任务 #${c.task_id}` : c.session_id ? "对话会话" : "—"}
+                              {c.task_id && c.task_id !== "0" ? `任务 #${c.task_id}` : c.session_id ? "对话会话" : "—"}
                             </span>
                           </div>
                         ))}

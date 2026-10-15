@@ -53,7 +53,7 @@ export const ACTIVE_TASK = "t-acme-web";
 export const tasks: Task[] = [
   {
     id: "t-acme-web",
-    category_id: 1,
+    category_id: "1",
     category_name: "外部评估",
     description: "Acme 官网与后台外部渗透（acme.com）",
     goal: "拿到 acme.com 后台管理权限，确认可读取用户敏感数据。",
@@ -70,16 +70,16 @@ export const tasks: Task[] = [
     goals_total: 5,
     goals_met: 2,
     engine_mode: "exploring",
-    llm_profile_id: 1,
-    llm_profile_ids: [1, 2],
-    active_llm_profile_id: 1,
+    llm_profile_id: "1",
+    llm_profile_ids: ["1", "2"],
+    active_llm_profile_id: "1",
     llm_failover_state: "ready",
     source_task_ids: [],
     tokens: { input_tokens: 1284500, output_tokens: 96320, cache_read_tokens: 890400, cache_write_tokens: 132000 },
   },
   {
     id: "t-acme-api",
-    category_id: 2,
+    category_id: "2",
     category_name: "API 专项",
     description: "api.acme.com 越权与注入测试",
     goal: "评估 api.acme.com 订单/用户接口的越权(IDOR)与注入风险。",
@@ -96,16 +96,16 @@ export const tasks: Task[] = [
     goals_total: 4,
     goals_met: 1,
     engine_mode: "exploring",
-    llm_profile_id: 1,
-    llm_profile_ids: [1, 2],
-    active_llm_profile_id: 1,
+    llm_profile_id: "1",
+    llm_profile_ids: ["1", "2"],
+    active_llm_profile_id: "1",
     llm_failover_state: "ready",
     source_task_ids: ["t-acme-web"],
     tokens: { input_tokens: 642300, output_tokens: 51200, cache_read_tokens: 401000, cache_write_tokens: 60000 },
   },
   {
     id: "t-shop-pay",
-    category_id: 2,
+    category_id: "2",
     category_name: "API 专项",
     description: "shop.acme.com 支付与订单链路",
     goal: "评估支付与订单接口的越权、金额篡改与竞态风险。",
@@ -121,16 +121,16 @@ export const tasks: Task[] = [
     goals_total: 4,
     goals_met: 1,
     engine_mode: "paused",
-    llm_profile_id: 2,
-    llm_profile_ids: [2, 1],
-    active_llm_profile_id: 2,
+    llm_profile_id: "2",
+    llm_profile_ids: ["2", "1"],
+    active_llm_profile_id: "2",
     llm_failover_state: "ready",
     source_task_ids: ["t-acme-web", "t-acme-api"],
     tokens: { input_tokens: 233000, output_tokens: 18700, cache_read_tokens: 120000, cache_write_tokens: 22000 },
   },
   {
     id: "t-vpn-edge",
-    category_id: 1,
+    category_id: "1",
     category_name: "外部评估",
     description: "对外暴露面侦察（VPN / 边界服务）",
     goal: "识别 acme.com 对外暴露的可利用边界服务。",
@@ -148,9 +148,9 @@ export const tasks: Task[] = [
     goals_total: 3,
     goals_met: 3,
     engine_mode: "idle",
-    llm_profile_id: 1,
-    llm_profile_ids: [1],
-    active_llm_profile_id: 1,
+    llm_profile_id: "1",
+    llm_profile_ids: ["1"],
+    active_llm_profile_id: "1",
     llm_failover_state: "ready",
     source_task_ids: [],
     tokens: { input_tokens: 512000, output_tokens: 40100, cache_read_tokens: 300000, cache_write_tokens: 41000 },
@@ -159,14 +159,14 @@ export const tasks: Task[] = [
 
 export const taskCategories: TaskCategory[] = [
   {
-    id: 1,
+    id: "1",
     name: "外部评估",
     task_count: 2,
     created_at: T("2026-07-18T08:00:00Z"),
     updated_at: T("2026-07-25T08:00:00Z"),
   },
   {
-    id: 2,
+    id: "2",
     name: "API 专项",
     task_count: 2,
     created_at: T("2026-07-19T08:00:00Z"),
@@ -176,7 +176,7 @@ export const taskCategories: TaskCategory[] = [
 
 export const taskTemplates: TaskTemplate[] = [
   {
-    id: 1,
+    id: "1",
     name: "外部 Web 渗透",
     description: "对目标互联网暴露面开展黑盒渗透测试，覆盖站点、接口和常见管理入口。",
     goal: "识别并验证可造成未授权访问、敏感数据泄露或服务器失陷的安全问题。",
@@ -184,7 +184,7 @@ export const taskTemplates: TaskTemplate[] = [
     updated_at: T("2026-07-25T08:00:00Z"),
   },
   {
-    id: 2,
+    id: "2",
     name: "API 越权专项",
     description: "围绕目标 API 的身份认证、对象级授权和角色边界开展专项测试。",
     goal: "确认是否存在 IDOR、水平越权、垂直越权及批量数据访问风险。",
@@ -240,24 +240,24 @@ export function stats(
 // ── Company + Assets (new unified model) ─────────────────────────────────────
 export const companies: Company[] = [
   {
-    id: 1,
+    id: "1",
     name: "Acme Corp",
     logo: "",
     asset_count: 18,
     scope: [
-      { id: 1, company_id: 1, kind: "domain", domain: "acme.com", raw: "acme.com", reason: "主域" },
-      { id: 2, company_id: 1, kind: "cidr", net: "203.0.113.0/24", raw: "203.0.113.0/24" },
-      { id: 3, company_id: 1, kind: "ip", net: "198.51.100.20", raw: "198.51.100.20" },
+      { id: "1", company_id: "1", kind: "domain", domain: "acme.com", raw: "acme.com", reason: "主域" },
+      { id: "2", company_id: "1", kind: "cidr", net: "203.0.113.0/24", raw: "203.0.113.0/24" },
+      { id: "3", company_id: "1", kind: "ip", net: "198.51.100.20", raw: "198.51.100.20" },
     ],
   },
 ];
 
 export const assets: Asset[] = [
   {
-    id: 1,
+    id: "1",
     type: "root_domain",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     domain: "acme.com",
     root_domain: "acme.com",
     icp: "京ICP备2021xxxx号",
@@ -266,10 +266,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:00:00Z"),
   },
   {
-    id: 2,
+    id: "2",
     type: "subdomain",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     domain: "www.acme.com",
     root_domain: "acme.com",
     record_type: "CNAME",
@@ -277,10 +277,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:01:00Z"),
   },
   {
-    id: 3,
+    id: "3",
     type: "subdomain",
-    company_id: 1,
-    task_ids: [2],
+    company_id: "1",
+    task_ids: ["2"],
     domain: "api.acme.com",
     root_domain: "acme.com",
     record_type: "A",
@@ -288,10 +288,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:02:00Z"),
   },
   {
-    id: 4,
+    id: "4",
     type: "subdomain",
-    company_id: 1,
-    task_ids: [3],
+    company_id: "1",
+    task_ids: ["3"],
     domain: "shop.acme.com",
     root_domain: "acme.com",
     record_type: "A",
@@ -299,10 +299,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:03:00Z"),
   },
   {
-    id: 5,
+    id: "5",
     type: "subdomain",
-    company_id: 1,
-    task_ids: [4],
+    company_id: "1",
+    task_ids: ["4"],
     domain: "vpn.acme.com",
     root_domain: "acme.com",
     record_type: "A",
@@ -310,10 +310,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-20T02:00:00Z"),
   },
   {
-    id: 6,
+    id: "6",
     type: "subdomain",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     domain: "admin.acme.com",
     root_domain: "acme.com",
     record_type: "A",
@@ -321,10 +321,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:04:00Z"),
   },
   {
-    id: 7,
+    id: "7",
     type: "ip",
-    company_id: 1,
-    task_ids: [1, 2],
+    company_id: "1",
+    task_ids: ["1", "2"],
     ip: "203.0.113.10",
     c_segment: "203.0.113.0",
     open_ports: [
@@ -335,20 +335,20 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:05:00Z"),
   },
   {
-    id: 8,
+    id: "8",
     type: "ip",
-    company_id: 1,
-    task_ids: [2],
+    company_id: "1",
+    task_ids: ["2"],
     ip: "203.0.113.11",
     c_segment: "203.0.113.0",
     open_ports: [{ port: 443, service: "https" }],
     last_seen: T("2026-07-26T02:06:00Z"),
   },
   {
-    id: 9,
+    id: "9",
     type: "ip",
-    company_id: 1,
-    task_ids: [4],
+    company_id: "1",
+    task_ids: ["4"],
     ip: "198.51.100.20",
     c_segment: "198.51.100.0",
     open_ports: [
@@ -358,10 +358,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-20T02:00:00Z"),
   },
   {
-    id: 10,
+    id: "10",
     type: "service",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "203.0.113.10",
     port: 443,
     service_type: "https",
@@ -369,10 +369,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:07:00Z"),
   },
   {
-    id: 11,
+    id: "11",
     type: "service",
-    company_id: 1,
-    task_ids: [4],
+    company_id: "1",
+    task_ids: ["4"],
     ip: "198.51.100.20",
     port: 22,
     service_type: "ssh",
@@ -380,10 +380,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-20T02:00:00Z"),
   },
   {
-    id: 12,
+    id: "12",
     type: "app",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     url: "https://www.acme.com",
     app_name: "Acme 官网",
     category: "corp",
@@ -395,10 +395,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:08:00Z"),
   },
   {
-    id: 13,
+    id: "13",
     type: "app",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     url: "https://admin.acme.com",
     app_name: "后台管理",
     category: "admin",
@@ -409,10 +409,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:09:00Z"),
   },
   {
-    id: 14,
+    id: "14",
     type: "app",
-    company_id: 1,
-    task_ids: [2],
+    company_id: "1",
+    task_ids: ["2"],
     url: "https://api.acme.com",
     app_name: "REST API",
     category: "api",
@@ -423,10 +423,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:10:00Z"),
   },
   {
-    id: 15,
+    id: "15",
     type: "endpoint",
-    company_id: 1,
-    task_ids: [2],
+    company_id: "1",
+    task_ids: ["2"],
     url: "https://api.acme.com/v1/orders",
     method: "GET",
     status_code: 200,
@@ -437,20 +437,20 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:11:00Z"),
   },
   {
-    id: 16,
+    id: "16",
     type: "endpoint",
-    company_id: 1,
-    task_ids: [2],
+    company_id: "1",
+    task_ids: ["2"],
     url: "https://api.acme.com/v1/users/me",
     method: "GET",
     status_code: 200,
     last_seen: T("2026-07-26T02:12:00Z"),
   },
   {
-    id: 17,
+    id: "17",
     type: "endpoint",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     url: "https://admin.acme.com/login",
     method: "POST",
     status_code: 200,
@@ -458,10 +458,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-26T02:13:00Z"),
   },
   {
-    id: 18,
+    id: "18",
     type: "endpoint",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     url: "https://www.acme.com/search",
     method: "GET",
     status_code: 200,
@@ -470,10 +470,10 @@ export const assets: Asset[] = [
   },
   // 内网资产（DMZ→内网横向发现）
   {
-    id: 19,
+    id: "19",
     type: "ip",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "10.0.20.15",
     c_segment: "10.0.20.0",
     open_ports: [
@@ -483,10 +483,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-25T15:40:00Z"),
   },
   {
-    id: 20,
+    id: "20",
     type: "ip",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "10.10.10.10",
     c_segment: "10.10.10.0",
     open_ports: [
@@ -497,30 +497,30 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-25T21:00:00Z"),
   },
   {
-    id: 21,
+    id: "21",
     type: "ip",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "10.10.10.5",
     c_segment: "10.10.10.0",
     open_ports: [{ port: 445, service: "smb" }],
     last_seen: T("2026-07-25T21:00:00Z"),
   },
   {
-    id: 22,
+    id: "22",
     type: "ip",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "10.10.10.20",
     c_segment: "10.10.10.0",
     open_ports: [{ port: 8080, service: "http-proxy" }],
     last_seen: T("2026-07-25T21:00:00Z"),
   },
   {
-    id: 23,
+    id: "23",
     type: "service",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "10.10.10.20",
     port: 8080,
     service_type: "http",
@@ -528,10 +528,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-25T21:35:00Z"),
   },
   {
-    id: 24,
+    id: "24",
     type: "service",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     ip: "10.10.10.10",
     port: 445,
     service_type: "smb",
@@ -539,10 +539,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-25T23:55:00Z"),
   },
   {
-    id: 25,
+    id: "25",
     type: "app",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     url: "http://10.10.10.20:8080",
     app_name: "Jenkins (内部)",
     category: "ci",
@@ -553,10 +553,10 @@ export const assets: Asset[] = [
     last_seen: T("2026-07-25T21:35:00Z"),
   },
   {
-    id: 26,
+    id: "26",
     type: "endpoint",
-    company_id: 1,
-    task_ids: [1],
+    company_id: "1",
+    task_ids: ["1"],
     url: "http://10.10.10.20:8080/script",
     method: "GET",
     status_code: 200,
@@ -572,8 +572,8 @@ export const assetCounts: Record<string, number> = assets.reduce<Record<string, 
 // assetRef 把资产 id 变成 finding 上挂的资产引用(label 与后端 coverageNodeLabel
 // 的取值顺序一致:URL > 域名 > IP > 应用名)。「按资产」视图的树就是靠这些引用
 // 把发现挂到资产上的。
-function assetRef(id: number): FindingAsset {
-  const asset = assets.find((candidate) => candidate.id === id);
+function assetRef(id: number | string): FindingAsset {
+  const asset = assets.find((candidate) => candidate.id === String(id));
   if (!asset) throw new Error(`mock assetRef: unknown asset ${id}`);
   return {
     id: String(id),
@@ -2841,7 +2841,7 @@ export const dailyTokens: DailyTokenBucket[] = Array.from({ length: 30 }, (_, i)
 
 export const convTokens: ConvTokenSummary[] = [
   {
-    llm_profile_id: 1,
+    llm_profile_id: "1",
     created_at: T("2026-07-25T10:00:00Z"),
     input_tokens: 42000,
     output_tokens: 3800,
@@ -2849,7 +2849,7 @@ export const convTokens: ConvTokenSummary[] = [
     cache_write_tokens: 5200,
   },
   {
-    llm_profile_id: 2,
+    llm_profile_id: "2",
     created_at: T("2026-07-24T16:00:00Z"),
     input_tokens: 18000,
     output_tokens: 1600,
@@ -3163,7 +3163,7 @@ export function agentDetail(key: string): AgentDetail {
     prompt: `你是 ARTEX 的「${a.name}」。\n目标：{{.Goal}}\n资产概览：{{.AssetSummary}}\n路线提示：{{.RouteHint}}\n请基于以上信息推进探索，并通过工具把结果写回图。`,
     variables: promptVars,
     versions: promptVersions,
-    visibility: { mcp: [1, 2], skill: ["api-recon", "playwright-cli"] },
+    visibility: { mcp: ["1", "2"], skill: ["api-recon", "playwright-cli"] },
     wrapup_prompt: "",
     wrapup_default: "时间/步数将尽，请总结已确认发现并标记意图终态。",
     wrapup_max_turns: 0,
@@ -3177,7 +3177,7 @@ export function agentDetail(key: string): AgentDetail {
 // ── MCP ──────────────────────────────────────────────────────────────────────
 export const mcpServers: MCPServer[] = [
   {
-    id: 1,
+    id: "1",
     name: "shodan",
     transport: "http",
     url: "https://mcp.shodan.io/sse",
@@ -3187,7 +3187,7 @@ export const mcpServers: MCPServer[] = [
     tools: ["host_info", "search", "dns_resolve"],
   },
   {
-    id: 2,
+    id: "2",
     name: "playwright",
     transport: "stdio",
     command: "npx",
@@ -3198,13 +3198,13 @@ export const mcpServers: MCPServer[] = [
   },
 ];
 
-export const mcpToolsById: Record<number, MCPTool[]> = {
-  1: [
+export const mcpToolsById: Record<string, MCPTool[]> = {
+  "1": [
     { name: "host_info", description: "查询某 IP 的 Shodan 主机信息" },
     { name: "search", description: "Shodan 搜索" },
     { name: "dns_resolve", description: "DNS 解析" },
   ],
-  2: [
+  "2": [
     { name: "browser_navigate", description: "浏览器打开 URL" },
     { name: "browser_click", description: "点击元素" },
     { name: "browser_snapshot", description: "抓取可访问性快照" },
@@ -3245,9 +3245,9 @@ export const skills: SkillItem[] = [
 ];
 
 export const skillCalls: SkillCall[] = [
-  { ts: "2026-08-20T09:12:00Z", agent_key: "worker", task_id: 42, session_id: "", args_len: 128 },
-  { ts: "2026-08-20T08:03:00Z", agent_key: "planner", task_id: 42, session_id: "", args_len: 0 },
-  { ts: "2026-08-19T17:55:00Z", agent_key: "worker", task_id: 37, session_id: "", args_len: 64 },
+  { ts: "2026-08-20T09:12:00Z", agent_key: "worker", task_id: "42", session_id: "", args_len: 128 },
+  { ts: "2026-08-20T08:03:00Z", agent_key: "planner", task_id: "42", session_id: "", args_len: 0 },
+  { ts: "2026-08-19T17:55:00Z", agent_key: "worker", task_id: "37", session_id: "", args_len: 64 },
 ];
 
 export const missingSkills: MissingSkill[] = [
@@ -3380,7 +3380,7 @@ export const llmPool: LLMPoolStatus = {
 // ── Intercept ────────────────────────────────────────────────────────────────
 export const interceptRules: InterceptRule[] = [
   {
-    id: 1,
+    id: "1",
     name: "破坏性命令需审批",
     enabled: true,
     priority: 10,
@@ -3396,7 +3396,7 @@ export const interceptRules: InterceptRule[] = [
     updated_at: T("2026-07-20T10:00:00Z"),
   },
   {
-    id: 2,
+    id: "2",
     name: "外发流量直接拒绝",
     enabled: true,
     priority: 20,
@@ -3415,8 +3415,8 @@ export const interceptRules: InterceptRule[] = [
 
 export const interceptPending: InterceptPending[] = [
   {
-    id: 101,
-    rule_id: 1,
+    id: "101",
+    rule_id: "1",
     task_id: "t-acme-web",
     agent_name: "work#3",
     tool_name: "bash",
@@ -3429,8 +3429,8 @@ export const interceptPending: InterceptPending[] = [
 
 export const interceptHistory: InterceptApprovalRow[] = [
   {
-    id: 90,
-    rule_id: 1,
+    id: "90",
+    rule_id: "1",
     task_id: "t-acme-web",
     agent_name: "work#1",
     tool_name: "bash",
@@ -3444,7 +3444,7 @@ export const interceptHistory: InterceptApprovalRow[] = [
     rule_name: "破坏性命令需审批",
   },
   {
-    id: 91,
+    id: "91",
     task_id: "t-acme-api",
     agent_name: "work#2",
     tool_name: "bash",
@@ -3458,8 +3458,8 @@ export const interceptHistory: InterceptApprovalRow[] = [
     rule_name: "",
   },
   {
-    id: 92,
-    rule_id: 2,
+    id: "92",
+    rule_id: "2",
     task_id: "t-acme-web",
     agent_name: "work#13",
     tool_name: "bash",
@@ -3473,7 +3473,7 @@ export const interceptHistory: InterceptApprovalRow[] = [
     rule_name: "外发流量直接拒绝",
   },
   {
-    id: 93,
+    id: "93",
     task_id: "t-acme-web",
     agent_name: "work#7",
     tool_name: "bash",
@@ -3489,7 +3489,7 @@ export const interceptHistory: InterceptApprovalRow[] = [
 
 // Approval detail fixtures use harmless report-writing examples.
 interceptHistory.unshift({
-  id: 94,
+  id: "94",
   task_id: "t-acme-web",
   agent_name: "work#1",
   tool_name: "Write",
@@ -3531,7 +3531,7 @@ export const interceptDetails: Record<number, InterceptAudit> = {
     initial_reason: "[模型] 将已有检查结论写入本地报告，不修改业务数据。",
     effective_action: "allow",
     config_digest: "b4c569fdb4c569fdb4c569fdb4c569fdb4c569fdb4c569fdb4c569fdb4c569fd1234",
-    profile_id: 1,
+    profile_id: "1",
     execution_status: "succeeded",
     output: "Successfully wrote reports/summary.md\n共写入 68 个字符。",
     execution_ended_at: T("2026-07-26T08:00:03Z"),
@@ -3546,7 +3546,7 @@ export const interceptDetails: Record<number, InterceptAudit> = {
     captured_at: T("2026-07-25T15:14:00Z"),
     initial_action: "ask",
     initial_reason: "[模型] 疑似备份表，无法确定是否生产数据。",
-    profile_id: 1,
+    profile_id: "1",
     execution_status: "not_started",
   },
 };
@@ -3554,35 +3554,35 @@ export const interceptDetails: Record<number, InterceptAudit> = {
 // ── Conversations (chat) ─────────────────────────────────────────────────────
 export const conversations: Conversation[] = [
   {
-    id: 1,
+    id: "1",
     agent_key: "mainagent",
     title: "acme 后台切入点讨论",
-    llm_profile_id: 1,
+    llm_profile_id: "1",
     pinned: true,
     pinned_at: T("2026-07-26T04:00:00Z"),
     created_at: T("2026-07-25T10:00:00Z"),
     updated_at: T("2026-07-26T03:40:00Z"),
   },
   {
-    id: 2,
+    id: "2",
     agent_key: "mainagent",
     title: "API 越权面梳理",
-    llm_profile_id: 2,
+    llm_profile_id: "2",
     created_at: T("2026-07-24T16:00:00Z"),
     updated_at: T("2026-07-24T17:20:00Z"),
   },
   {
-    id: 3,
+    id: "3",
     agent_key: "mainagent",
     title: "内网横向 · DMZ→域控攻击路径规划",
-    llm_profile_id: 1,
+    llm_profile_id: "1",
     created_at: T("2026-07-25T15:45:00Z"),
     updated_at: T("2026-07-26T00:25:00Z"),
   },
 ];
 
-export const conversationMessages: Record<number, Activity[]> = {
-  1: [
+export const conversationMessages: Record<string, Activity[]> = {
+  "1": [
     { seq: 1, worker: "user", ts: T("2026-07-25T10:00:00Z"), kind: "user", summary: "后台在哪，先从哪切入？" },
     {
       seq: 2,
@@ -3648,7 +3648,7 @@ export const conversationMessages: Record<number, Activity[]> = {
         "成了 —— admin/admin123 直接登进控制台，已记为高危发现并证明「获取后台管理权限」目标达成。下一步转向读用户数据（目标②）。",
     },
   ],
-  2: [
+  "2": [
     {
       seq: 1,
       worker: "user",
@@ -3710,7 +3710,7 @@ export const conversationMessages: Record<number, Activity[]> = {
         "越权面有两条：① /v1/orders?id= 是自增数字 id → 典型 IDOR，改 id 试读他人订单；② JWT 用 HS256，试 john/hashcat 爆密钥→可伪造任意 sub 越权。我把这两条各派生成一个意图。建议先做 IDOR（成本低、影响直接）。",
     },
   ],
-  3: [
+  "3": [
     {
       seq: 1,
       worker: "user",
@@ -3812,16 +3812,16 @@ export const coverage = {
 // ── 资产覆盖图（/tasks/{id}/coverage-graph）──
 export const coverageGraph = {
   nodes: [
-    { key: "c:1", kind: "company", label: "Acme Corp", tested: false, in_scope: false, company_id: 1 },
+    { key: "c:1", kind: "company", label: "Acme Corp", tested: false, in_scope: false, company_id: "1" },
     {
       key: "a:1",
       kind: "root_domain",
       label: "acme.com",
       tested: false,
       in_scope: false,
-      asset_id: 1,
+      asset_id: "1",
       domain: "acme.com",
-      company_id: 1,
+      company_id: "1",
     },
     {
       key: "a:2",
@@ -3829,7 +3829,7 @@ export const coverageGraph = {
       label: "www.acme.com",
       tested: true,
       in_scope: true,
-      asset_id: 2,
+      asset_id: "2",
       domain: "www.acme.com",
       root_domain: "acme.com",
     },
@@ -3839,7 +3839,7 @@ export const coverageGraph = {
       label: "api.acme.com",
       tested: true,
       in_scope: true,
-      asset_id: 3,
+      asset_id: "3",
       domain: "api.acme.com",
       root_domain: "acme.com",
     },
@@ -3849,7 +3849,7 @@ export const coverageGraph = {
       label: "admin.acme.com",
       tested: false,
       in_scope: true,
-      asset_id: 4,
+      asset_id: "4",
       domain: "admin.acme.com",
       root_domain: "acme.com",
     },
@@ -3859,7 +3859,7 @@ export const coverageGraph = {
       label: "www.acme.com",
       tested: true,
       in_scope: true,
-      asset_id: 5,
+      asset_id: "5",
       domain: "www.acme.com",
       url: "https://www.acme.com",
       port: 443,
@@ -3872,7 +3872,7 @@ export const coverageGraph = {
       label: "https://www.acme.com/search",
       tested: true,
       in_scope: true,
-      asset_id: 6,
+      asset_id: "6",
       url: "https://www.acme.com/search?q=",
       domain: "www.acme.com",
     },
@@ -3882,7 +3882,7 @@ export const coverageGraph = {
       label: "api.acme.com",
       tested: true,
       in_scope: true,
-      asset_id: 7,
+      asset_id: "7",
       domain: "api.acme.com",
       url: "https://api.acme.com",
       port: 443,
@@ -3895,7 +3895,7 @@ export const coverageGraph = {
       label: "https://api.acme.com/v1/orders",
       tested: false,
       in_scope: true,
-      asset_id: 8,
+      asset_id: "8",
       url: "https://api.acme.com/v1/orders?id=",
       domain: "api.acme.com",
     },
@@ -3905,7 +3905,7 @@ export const coverageGraph = {
       label: "admin.acme.com",
       tested: false,
       in_scope: true,
-      asset_id: 9,
+      asset_id: "9",
       domain: "admin.acme.com",
       url: "https://admin.acme.com",
       port: 443,
@@ -3918,9 +3918,9 @@ export const coverageGraph = {
       label: "203.0.113.10",
       tested: true,
       in_scope: true,
-      asset_id: 10,
+      asset_id: "10",
       ip: "203.0.113.10",
-      company_id: 1,
+      company_id: "1",
     },
   ],
   edges: [
@@ -3952,19 +3952,19 @@ const NODE_ASSETS: Record<string, number[]> = {
 
 export function nodeAssetsFor(nodeId: string): FindingAsset[] {
   return (NODE_ASSETS[nodeId] ?? []).flatMap((id) => {
-    const asset = assets.find((candidate) => candidate.id === id);
+    const asset = assets.find((candidate) => candidate.id === String(id));
     return asset ? [assetRef(id)] : [];
   });
 }
 
-export function assetRefsFor(_assetId: number) {
+export function assetRefsFor(_assetId: string | number) {
   return {
     intents: [
-      { id: 12, kind: "intent", state: "done", summary: "对 www.acme.com 搜索接口做 SQL 注入探测" },
-      { id: 18, kind: "intent", state: "running", summary: "枚举 api.acme.com 的对象越权 (IDOR)" },
+      { id: "12", kind: "intent", state: "done", summary: "对 www.acme.com 搜索接口做 SQL 注入探测" },
+      { id: "18", kind: "intent", state: "running", summary: "枚举 api.acme.com 的对象越权 (IDOR)" },
     ],
-    facts: [{ id: 34, kind: "fact", state: "confirmed", summary: "search?q= 参数可注入，报错回显 MySQL 语法错误" }],
-    findings: [{ id: 41, kind: "finding", state: "confirmed", summary: "[高] SQL 注入 www.acme.com/search?q=" }],
+    facts: [{ id: "34", kind: "fact", state: "confirmed", summary: "search?q= 参数可注入，报错回显 MySQL 语法错误" }],
+    findings: [{ id: "41", kind: "finding", state: "confirmed", summary: "[高] SQL 注入 www.acme.com/search?q=" }],
   };
 }
 
@@ -4034,8 +4034,8 @@ export function workspaceRead(path: string) {
 // ── 工具执行历史（/commands）──
 export const commandRecords = [
   {
-    id: 1,
-    exploration_id: 1,
+    id: "1",
+    exploration_id: "1",
     worker: "worker-1",
     tool: "bash",
     command: JSON.stringify({ command: "curl -s 'https://www.acme.com/search?q=test'" }),
@@ -4044,8 +4044,8 @@ export const commandRecords = [
     created_at: T("2026-08-09T02:10:00Z"),
   },
   {
-    id: 2,
-    exploration_id: 1,
+    id: "2",
+    exploration_id: "1",
     worker: "worker-1",
     tool: "bash",
     command: JSON.stringify({ command: "sqlmap -u 'https://www.acme.com/search?q=1' --batch --dbs" }),
@@ -4054,8 +4054,8 @@ export const commandRecords = [
     created_at: T("2026-08-09T02:12:30Z"),
   },
   {
-    id: 3,
-    exploration_id: 1,
+    id: "3",
+    exploration_id: "1",
     worker: "worker-2",
     tool: "bash",
     command: JSON.stringify({ command: "ffuf -u https://api.acme.com/FUZZ -w common.txt -mc 200,401,403" }),
@@ -4064,8 +4064,8 @@ export const commandRecords = [
     created_at: T("2026-08-09T02:15:00Z"),
   },
   {
-    id: 4,
-    exploration_id: 1,
+    id: "4",
+    exploration_id: "1",
     worker: "worker-2",
     tool: "bash",
     command: JSON.stringify({ command: "nmap -sV -p- 203.0.113.10" }),
@@ -4074,8 +4074,8 @@ export const commandRecords = [
     created_at: T("2026-08-09T02:18:00Z"),
   },
   {
-    id: 5,
-    exploration_id: 1,
+    id: "5",
+    exploration_id: "1",
     worker: "worker-1",
     tool: "bash",
     command: JSON.stringify({ command: "curl -s https://admin.acme.com/login --data 'user=admin&pass=admin123'" }),
@@ -4088,7 +4088,7 @@ export const commandRecords = [
 // ── LLM 录制（/llm/records、/llm/records/{id}）──
 export const llmRecords = [
   {
-    id: 1,
+    id: "1",
     ts: T("2026-08-09T02:10:02Z"),
     model: "claude-opus-4-8",
     profile_name: "默认",
@@ -4103,7 +4103,7 @@ export const llmRecords = [
     status: "ok",
   },
   {
-    id: 2,
+    id: "2",
     ts: T("2026-08-09T02:11:40Z"),
     model: "claude-opus-4-8",
     profile_name: "默认",
@@ -4118,7 +4118,7 @@ export const llmRecords = [
     status: "ok",
   },
   {
-    id: 3,
+    id: "3",
     ts: T("2026-08-09T02:15:20Z"),
     model: "claude-opus-4-8",
     profile_name: "默认",
@@ -4133,7 +4133,7 @@ export const llmRecords = [
     status: "ok",
   },
   {
-    id: 4,
+    id: "4",
     ts: T("2026-08-09T02:16:05Z"),
     model: "claude-opus-4-8",
     profile_name: "默认",
@@ -4155,8 +4155,8 @@ const llmTaskCounts: Record<string, number> = {};
 for (const r of llmRecords) if (r.task_id) llmTaskCounts[r.task_id] = (llmTaskCounts[r.task_id] ?? 0) + 1;
 export const llmTasks: LLMTask[] = Object.entries(llmTaskCounts).map(([task_id, count]) => ({ task_id, count }));
 
-export function llmRecordDetail(id: number, records = llmRecords) {
-  const item = records.find((r) => r.id === id) ?? records[0];
+export function llmRecordDetail(id: string | number, records = llmRecords) {
+  const item = records.find((r) => String(r.id) === String(id)) ?? records[0];
   return {
     ...item,
     request_body: JSON.stringify(

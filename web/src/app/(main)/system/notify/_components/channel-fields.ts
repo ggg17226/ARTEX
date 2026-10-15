@@ -164,13 +164,11 @@ export function parseKV(text: string): Record<string, string> {
   return out;
 }
 // parseIDs 解析逗号/空白分隔的 id 列表。
-export function parseIDs(text: string): number[] {
+export function parseIDs(text: string): string[] {
   return text
     .split(/[\s,，]+/)
     .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => Number(s))
-    .filter((n) => Number.isFinite(n) && n > 0);
+    .filter(Boolean);
 }
 // parseKeywords 解析行/逗号分隔的关键词列表（漏洞类型名可能含空格，所以按行或逗号切）。
 export function parseKeywords(text: string): string[] {

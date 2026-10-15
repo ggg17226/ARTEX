@@ -326,28 +326,28 @@ export default function DashboardPage() {
 
   // ── token stats per LLM profile ──────────────────────────────────────────
   // tasks whose llm_profile_id is null/undefined used the active default profile
-  const defaultProfileId = activeProfile ? Number(activeProfile.id) : null;
+  const defaultProfileId = activeProfile ? activeProfile.id : null;
 
   // 数据源开关：旧版 = activity（task.tokens + 会话），新版 = llm_usage 计量账本。
   const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("old");
-  // selected profile tab: "all" = 全部; number = specific profile id
-  const [tokenTab, setTokenTab] = React.useState<number | null | "all">("all");
+  // selected profile tab: "all" = 全部; string = specific profile id
+  const [tokenTab, setTokenTab] = React.useState<string | null | "all">("all");
   // day range for the daily bar chart
   const [tokenDays, setTokenDays] = React.useState<7 | 30 | 90 | 180 | 365>(30);
 
   // profile 名 → id，用于把 llm_usage 的 profile_name 映射到现有 profile 分栏。
   const profileIdByName = React.useMemo(() => {
-    const m = new Map<string, number>();
-    for (const p of llmProfiles) m.set(p.name, Number(p.id));
+    const m = new Map<string, string>();
+    for (const p of llmProfiles) m.set(p.name, p.id);
     return m;
   }, [llmProfiles]);
 
   type Bucket = { input: number; output: number; cacheRead: number; cacheWrite: number; taskCount: number };
 
   // 旧版：按 profile 归桶（来自 activity 的 task.tokens + 会话用量）。
-  const tokenByProfileOld = React.useMemo<Map<number | null, Bucket>>(() => {
-    const m = new Map<number | null, Bucket>();
-    const fold = (key: number | null, inp: number, out: number, cr: number, cw: number, addTask: boolean) => {
+  const tokenByProfileOld = React.useMemo<Map<string | null, Bucket>>(() => {
+    const m = new Map<string | null, Bucket>();
+    const fold = (key: string | null, inp: number, out: number, cr: number, cw: number, addTask: boolean) => {
       const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
       m.set(key, {
         input: prev.input + inp,
@@ -381,8 +381,8 @@ export default function DashboardPage() {
   }, [tasks, convTokens, defaultProfileId]);
 
   // 新版：按 profile 归桶（来自 llm_usage 全局聚合，逐次调用精确）。
-  const tokenByProfileNew = React.useMemo<Map<number | null, Bucket>>(() => {
-    const m = new Map<number | null, Bucket>();
+  const tokenByProfileNew = React.useMemo<Map<string | null, Bucket>>(() => {
+    const m = new Map<string | null, Bucket>();
     for (const p of usageStats?.by_profile ?? []) {
       // 未匹配到现有 profile（改名/删除/空名）→ 落到默认桶，仍计入「全部」。
       const key = profileIdByName.get(p.profile_name) ?? defaultProfileId;
@@ -416,7 +416,7 @@ export default function DashboardPage() {
       }
       return { input, output, cacheRead, cacheWrite, taskCount };
     }
-    const v = tokenByProfile.get(tokenTab as number | null);
+    const v = tokenByProfile.get(tokenTab as string | null);
     return v
       ? { input: v.input, output: v.output, cacheRead: v.cacheRead, cacheWrite: v.cacheWrite, taskCount: v.taskCount }
       : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
@@ -640,7 +640,7 @@ export default function DashboardPage() {
               全部
             </button>
             {llmProfiles.map((p) => {
-              const key = Number(p.id);
+              const key = p.id;
               const hasData = tokenByProfile.has(key) || (p.is_default && tokenByProfile.has(defaultProfileId));
               const resolvedKey = tokenByProfile.has(key) ? key : p.is_default ? defaultProfileId : key;
               return (
