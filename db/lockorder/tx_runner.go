@@ -3,11 +3,17 @@ package lockorder
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 var (
@@ -20,6 +26,7 @@ var (
 	}
 
 	ErrRetryExhausted = errors.New("lockorder: transaction retry attempts exhausted")
+	ErrOutcomeUnknown = errors.New("lockorder: transaction commit outcome unknown, local gates held")
 )
 
 // mysqlErrorNumberExtractor 兼容从不同 mysql driver 错误中提取状态码
@@ -103,8 +110,49 @@ func stringSearch(s, substr string) bool {
 	return false
 }
 
-func isErrNoRows(err error) bool {
-	return errors.Is(err, sql.ErrNoRows) || (err != nil && err.Error() == "EOF")
+// isOutcomeUnknown 识别连接重置、broken pipe、connection lost 等网络/驱动断连类错误，或特定标记
+func isOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrOutcomeUnknown) {
+		return true
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) {
+		return true
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		switch myErr.Number {
+		case 2006, 2013: // CR_SERVER_GONE_ERROR, CR_SERVER_LOST
+			return true
+		}
+	}
+	type hasNumMethod interface {
+		Number() uint16
+	}
+	var hnm hasNumMethod
+	if errors.As(err, &hnm) {
+		switch hnm.Number() {
+		case 2006, 2013:
+			return true
+		}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection lost") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "server has gone away") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "bad connection") {
+		return true
+	}
+	return false
 }
 
 // GateManager 本地门禁管理器接口
@@ -294,9 +342,15 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 					return err
 				}
 				if tx != nil {
+					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name, created_at) VALUES ('business_relations', NOW(3))"); err != nil {
+						return fmt.Errorf("lock db business_relations: insert ignore: %w", err)
+					}
 					var name string
 					row := tx.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = 'business_relations' FOR UPDATE")
-					if err := row.Scan(&name); err != nil && !isErrNoRows(err) {
+					if err := row.Scan(&name); err != nil {
+						if errors.Is(err, sql.ErrNoRows) {
+							return fmt.Errorf("lock db business_relations: row not found under lock")
+						}
 						return fmt.Errorf("lock db business_relations: %w", err)
 					}
 				}
@@ -307,9 +361,15 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 					return err
 				}
 				if tx != nil {
+					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name, created_at) VALUES (?, NOW(3))", ns); err != nil {
+						return fmt.Errorf("lock db namespace %s: insert ignore: %w", ns, err)
+					}
 					var name string
 					row := tx.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = ? FOR UPDATE", ns)
-					if err := row.Scan(&name); err != nil && !isErrNoRows(err) {
+					if err := row.Scan(&name); err != nil {
+						if errors.Is(err, sql.ErrNoRows) {
+							return fmt.Errorf("lock db namespace %s: row not found under lock", ns)
+						}
 						return fmt.Errorf("lock db namespace %s: %w", ns, err)
 					}
 				}
@@ -343,6 +403,10 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 				// 成功提交：逆序释放本地门禁，返回成功
 				releaseLocalGates()
 				return nil
+			}
+			if isOutcomeUnknown(commitErr) {
+				log.Printf("[lockorder] tx commit outcome unknown: %v; holding local gates", commitErr)
+				return fmt.Errorf("%w: %v", ErrOutcomeUnknown, commitErr)
 			}
 			payloadErr = commitErr
 		}

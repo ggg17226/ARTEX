@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,9 @@ type mockDriver struct {
 	txStarted    int
 	txCommitted  int
 	txRolledBack int
+	execFn       func(query string, args []driver.Value) (driver.Result, error)
+	queryFn      func(query string, args []driver.Value) (driver.Rows, error)
+	commitFn     func() error
 }
 
 var (
@@ -36,7 +40,7 @@ type mockConn struct {
 }
 
 func (c *mockConn) Prepare(query string) (driver.Stmt, error) {
-	return &mockStmt{}, nil
+	return &mockStmt{conn: c, query: query}, nil
 }
 
 func (c *mockConn) Close() error {
@@ -61,7 +65,11 @@ type mockDriverTx struct {
 func (t *mockDriverTx) Commit() error {
 	t.conn.driver.mu.Lock()
 	t.conn.driver.txCommitted++
+	fn := t.conn.driver.commitFn
 	t.conn.driver.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
 	return nil
 }
 
@@ -72,23 +80,48 @@ func (t *mockDriverTx) Rollback() error {
 	return nil
 }
 
-type mockStmt struct{}
+type mockStmt struct {
+	conn  *mockConn
+	query string
+}
 
 func (s *mockStmt) Close() error  { return nil }
 func (s *mockStmt) NumInput() int { return -1 }
 func (s *mockStmt) Exec(args []driver.Value) (driver.Result, error) {
+	s.conn.driver.mu.Lock()
+	fn := s.conn.driver.execFn
+	s.conn.driver.mu.Unlock()
+	if fn != nil {
+		return fn(s.query, args)
+	}
 	return driver.RowsAffected(0), nil
 }
 func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
-	return &mockRows{}, nil
+	s.conn.driver.mu.Lock()
+	fn := s.conn.driver.queryFn
+	s.conn.driver.mu.Unlock()
+	if fn != nil {
+		return fn(s.query, args)
+	}
+	return &mockRows{nameVal: "mock_row"}, nil
 }
 
-type mockRows struct{}
+type mockRows struct {
+	nameVal string
+	read    bool
+}
 
-func (r *mockRows) Columns() []string { return []string{"id"} }
+func (r *mockRows) Columns() []string { return []string{"name"} }
 func (r *mockRows) Close() error      { return nil }
 func (r *mockRows) Next(dest []driver.Value) error {
-	return errors.New("EOF")
+	if r.read {
+		return io.EOF
+	}
+	r.read = true
+	if len(dest) > 0 {
+		dest[0] = r.nameVal
+	}
+	return nil
 }
 
 func getMockDB(t *testing.T) *sql.DB {
