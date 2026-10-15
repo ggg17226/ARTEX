@@ -76,9 +76,9 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		AgentKey     string `json:"agent_key"`
-		Title        string `json:"title"`
-		LLMProfileID *int64 `json:"llm_profile_id"`
+		AgentKey     string  `json:"agent_key"`
+		Title        string  `json:"title"`
+		LLMProfileID *string `json:"llm_profile_id"`
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -101,11 +101,18 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "agent 不存在")
 		return
 	}
-	if req.LLMProfileID != nil {
-		if _, ok := s.loadProfileConfig(*req.LLMProfileID); !ok {
+	var profileID *int64
+	if req.LLMProfileID != nil && *req.LLMProfileID != "" {
+		id, err := parseIDField(*req.LLMProfileID)
+		if err != nil {
+			writeErr(w, 400, "llm_profile_id 无效: "+err.Error())
+			return
+		}
+		if _, ok := s.loadProfileConfig(id); !ok {
 			writeErr(w, 400, "指定的 LLM 配置不存在或未设置 API Key")
 			return
 		}
+		profileID = &id
 	}
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
@@ -115,7 +122,7 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("标题最多 %d 个字符", maxConversationTitleRunes))
 		return
 	}
-	c, err := pg.CreateConversation(req.AgentKey, title, req.LLMProfileID)
+	c, err := pg.CreateConversation(req.AgentKey, title, profileID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -129,18 +136,25 @@ func (s *Server) pgUpdateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		LLMProfileID *int64 `json:"llm_profile_id"` // null clears the override
+		LLMProfileID *string `json:"llm_profile_id"` // null clears the override
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
 	}
-	if req.LLMProfileID != nil {
-		if _, ok := s.loadProfileConfig(*req.LLMProfileID); !ok {
+	var profileID *int64
+	if req.LLMProfileID != nil && *req.LLMProfileID != "" {
+		id, err := parseIDField(*req.LLMProfileID)
+		if err != nil {
+			writeErr(w, 400, "llm_profile_id 无效: "+err.Error())
+			return
+		}
+		if _, ok := s.loadProfileConfig(id); !ok {
 			writeErr(w, 400, "指定的 LLM 配置不存在或未设置 API Key")
 			return
 		}
+		profileID = &id
 	}
-	if err := pg.UpdateConversationProfile(c.ID, req.LLMProfileID); err != nil {
+	if err := pg.UpdateConversationProfile(c.ID, profileID); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -221,13 +235,13 @@ func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": c.ID})
+	writeJSON(w, 200, map[string]any{"deleted": strconv.FormatInt(c.ID, 10)})
 }
 
 const maxConversationDeleteBatch = 100
 
 type conversationDeleteItem struct {
-	ID    int64  `json:"id"`
+	ID    string `json:"id"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
@@ -251,15 +265,16 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var request struct {
-		IDs []int64 `json:"ids"`
+		IDs []string `json:"ids"`
 	}
 	if !decodeConversationRequest(w, r, &request) {
 		return
 	}
 	ids := make([]int64, 0, len(request.IDs))
 	seen := make(map[int64]struct{}, len(request.IDs))
-	for _, id := range request.IDs {
-		if id <= 0 {
+	for _, raw := range request.IDs {
+		id, err := parseIDField(strings.TrimSpace(raw))
+		if err != nil {
 			writeErr(w, http.StatusBadRequest, "对话 id 无效")
 			return
 		}
@@ -289,7 +304,7 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 	items := make([]conversationDeleteItem, 0, len(ids))
 	for _, id := range ids {
 		_, ok := deletedSet[id]
-		item := conversationDeleteItem{ID: id, OK: ok}
+		item := conversationDeleteItem{ID: strconv.FormatInt(id, 10), OK: ok}
 		if !ok {
 			item.Error = "conversation not found"
 		}

@@ -26,7 +26,7 @@ var (
 
 // TaskCategory is a globally reusable task grouping label.
 type TaskCategory struct {
-	ID        int64     `json:"id"`
+	ID        int64     `json:"id,string"`
 	Name      string    `json:"name"`
 	NKey      string    `json:"-"`
 	TaskCount int       `json:"task_count"`

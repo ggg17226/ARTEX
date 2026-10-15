@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -117,7 +118,7 @@ func (s *Server) pgDeleteTaskCategory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "task category not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }
 
 // parseCategoryIDField reads the category_id field shared by the single-task and

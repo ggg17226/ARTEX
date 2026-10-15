@@ -177,7 +177,7 @@ func (s *Server) interceptDeleteRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.m.interceptor.Invalidate()
-	writeJSON(w, 200, map[string]any{"deleted": id})
+	writeJSON(w, 200, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }
 
 func (s *Server) interceptToggleRule(w http.ResponseWriter, r *http.Request) {

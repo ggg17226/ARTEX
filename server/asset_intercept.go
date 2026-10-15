@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -93,7 +94,7 @@ func (s *Server) assetInterceptDeleteRule(w http.ResponseWriter, r *http.Request
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": id})
+	writeJSON(w, 200, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }
 
 func (s *Server) assetInterceptToggleRule(w http.ResponseWriter, r *http.Request) {

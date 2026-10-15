@@ -900,7 +900,7 @@ func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": id})
+	writeJSON(w, 200, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }
 
 // pgRefreshMCP re-discovers one MCP's tools on demand and re-caches them, so a
@@ -1894,7 +1894,7 @@ func (s *Server) pgDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	// Cache invalidation also removed the active profile's shared provider entry.
 	// Reapply after task-state sync so the wake-up observes the post-delete chain.
 	s.reapplyActiveProfile()
-	writeJSON(w, 200, map[string]any{"deleted": id})
+	writeJSON(w, 200, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }
 
 func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
@@ -1956,14 +1956,24 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ID int64 `json:"id"` // 0 / omitted = all
+		ID string `json:"id"` // "0" / omitted = all
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if body.ID > 0 {
-		s.llmHealth.Reset(body.ID)
+	var targetID int64
+	bodyID := strings.TrimSpace(body.ID)
+	if bodyID != "" && bodyID != "0" {
+		parsed, err := parseIDField(bodyID)
+		if err != nil {
+			writeErr(w, 400, "id 无效: "+err.Error())
+			return
+		}
+		targetID = parsed
+	}
+	if targetID > 0 {
+		s.llmHealth.Reset(targetID)
 	} else {
 		for id := range s.llmHealth.Snapshot() {
 			s.llmHealth.Reset(id)

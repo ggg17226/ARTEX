@@ -2,7 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -31,9 +33,9 @@ func rawString(raw json.RawMessage) string {
 // ---- Task (frontend "Task") ---- created_at as RFC3339, plus a derived status.
 type TaskDTO struct {
 	ID                 string             `json:"id"`
-	ExplorationID      int64              `json:"exploration_id"`
+	ExplorationID      string             `json:"exploration_id"`
 	Name               string             `json:"name"` // 可选任务名称;空=未命名
-	CategoryID         *int64             `json:"category_id,omitempty"`
+	CategoryID         *string            `json:"category_id,omitempty"`
 	CategoryName       string             `json:"category_name,omitempty"`
 	Pinned             bool               `json:"pinned"`
 	PinnedAt           string             `json:"pinned_at,omitempty"`
@@ -52,14 +54,14 @@ type TaskDTO struct {
 	GoalsMet           int                `json:"goals_met"`
 	InFlight           int                `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
 	Findings           FindingSeverityDTO `json:"findings"`                 // 该任务已登记的漏洞数（findings 表，按严重度分档）
-	LLMProfileID       *int64             `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
-	LLMProfileIDs      []int64            `json:"llm_profile_ids"`
-	ActiveLLMProfileID *int64             `json:"active_llm_profile_id,omitempty"`
+	LLMProfileID       *string            `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
+	LLMProfileIDs      []string           `json:"llm_profile_ids"`
+	ActiveLLMProfileID *string            `json:"active_llm_profile_id,omitempty"`
 	LLMFailoverState   string             `json:"llm_failover_state"`
 	LLMFailoverReason  string             `json:"llm_failover_reason,omitempty"`
 	SourceTaskIDs      []string           `json:"source_task_ids"`
 	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
-	CompanyIDs         []int64            `json:"company_ids"`
+	CompanyIDs         []string           `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 }
 
@@ -108,12 +110,11 @@ func taskDTO(t *Task, status string) TaskDTO {
 	for _, id := range lifecycle.SourceTaskIDs {
 		sourceIDs = append(sourceIDs, i64s(id))
 	}
-	profileIDs := append(make([]int64, 0, len(llmState.ProfileIDs)), llmState.ProfileIDs...)
 	return TaskDTO{
 		ID:                 t.ID,
-		ExplorationID:      t.ExpID,
+		ExplorationID:      i64s(t.ExpID),
 		Name:               lifecycle.Name,
-		CategoryID:         lifecycle.CategoryID,
+		CategoryID:         i64Ptr(lifecycle.CategoryID),
 		CategoryName:       lifecycle.CategoryName,
 		Pinned:             lifecycle.PinnedAt > 0,
 		PinnedAt:           completedRFC(lifecycle.PinnedAt),
@@ -126,13 +127,13 @@ func taskDTO(t *Task, status string) TaskDTO {
 		CompletedUnix:      lifecycle.CompletedAt,
 		Paused:             lifecycle.Paused,
 		Queued:             lifecycle.Queued,
-		LLMProfileID:       llmState.ProfileID,
-		LLMProfileIDs:      profileIDs,
-		ActiveLLMProfileID: llmState.ActiveID,
+		LLMProfileID:       i64Ptr(llmState.ProfileID),
+		LLMProfileIDs:      idStrings(llmState.ProfileIDs),
+		ActiveLLMProfileID: i64Ptr(llmState.ActiveID),
 		LLMFailoverState:   llmState.FailoverState,
 		LLMFailoverReason:  llmState.FailoverReason,
 		SourceTaskIDs:      sourceIDs,
-		CompanyIDs:         lifecycle.CompanyIDs,
+		CompanyIDs:         idStrings(lifecycle.CompanyIDs),
 		CoverageEnabled:    t.CoverageEnabled,
 	}
 }
@@ -282,7 +283,7 @@ func edgeDTOs(in []db.Edge) []EdgeDTO {
 // ---- Coverage asset references ----
 
 type CoverageAssetRefDTO struct {
-	ID           int64  `json:"id"`
+	ID           string `json:"id"`
 	Kind         string `json:"kind"`
 	State        string `json:"state"`
 	Summary      string `json:"summary"`
@@ -292,7 +293,7 @@ type CoverageAssetRefDTO struct {
 
 func coverageAssetRefDTO(ref db.AssetRef) CoverageAssetRefDTO {
 	out := CoverageAssetRefDTO{
-		ID: ref.ID, Kind: ref.Kind, State: ref.State, Summary: ref.Summary, Inherited: ref.Inherited,
+		ID: i64s(ref.ID), Kind: ref.Kind, State: ref.State, Summary: ref.Summary, Inherited: ref.Inherited,
 	}
 	if ref.SourceTaskID > 0 {
 		out.SourceTaskID = i64s(ref.SourceTaskID)
@@ -533,18 +534,18 @@ func activityDTOs(in []db.Activity) []ActivityDTO {
 // ---- Agent (frontend "Agent") — string id ----
 
 type AgentDTO struct {
-	ID               string `json:"id"`
-	Key              string `json:"key"`
-	Name             string `json:"name"`
-	Description      string `json:"description"`
-	Role             string `json:"role"`
-	Builtin          bool   `json:"builtin"`
-	Enabled          bool   `json:"enabled"`
-	MaxTurns         int    `json:"max_turns"`
-	RunSecs          int    `json:"run_seconds"`
-	WebSearch        bool   `json:"web_search"`
-	InteractiveShell bool   `json:"interactive_shell"`
-	LLMProfileID     *int64 `json:"llm_profile_id"` // 绑定的 LLM 配置;null=跟随任务/全局
+	ID               string  `json:"id"`
+	Key              string  `json:"key"`
+	Name             string  `json:"name"`
+	Description      string  `json:"description"`
+	Role             string  `json:"role"`
+	Builtin          bool    `json:"builtin"`
+	Enabled          bool    `json:"enabled"`
+	MaxTurns         int     `json:"max_turns"`
+	RunSecs          int     `json:"run_seconds"`
+	WebSearch        bool    `json:"web_search"`
+	InteractiveShell bool    `json:"interactive_shell"`
+	LLMProfileID     *string `json:"llm_profile_id"` // 绑定的 LLM 配置;null=跟随任务/全局
 	// P3 触发后处理策略(仅自定义 agent 有意义)。
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
@@ -568,7 +569,7 @@ func agentDTO(a *db.Agent) AgentDTO {
 		RunSecs:            a.RunSecs,
 		WebSearch:          a.WebSearch,
 		InteractiveShell:   a.InteractiveShell,
-		LLMProfileID:       a.LLMProfileID,
+		LLMProfileID:       i64Ptr(a.LLMProfileID),
 		TriggerRunMode:     a.TriggerRunMode,
 		TriggerMergeMode:   a.TriggerMergeMode,
 		TriggerMaxParallel: a.TriggerMaxParallel,
@@ -659,4 +660,40 @@ func idStrings(in []int64) []string {
 		out = append(out, i64s(v))
 	}
 	return out
+}
+
+// i64Ptr 把内部 *int64 指针转为 wire *string（nil → nil，保持 omitempty 语义）。
+func i64Ptr(v *int64) *string {
+	if v == nil {
+		return nil
+	}
+	s := strconv.FormatInt(*v, 10)
+	return &s
+}
+
+// parseIDField 严格解析入口 string ID（path value / body 必填 ID）：
+// 必须为十进制整数且落在 1..math.MaxInt64（spec §2.4.1；逐端点，不是全局 >0）。
+// 空串/非数字/负数/0/小数/>MaxInt64 → 错误，调用方回 400。
+func parseIDField(s string) (int64, error) {
+	if s == "" {
+		return 0, errors.New("id 不能为空")
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("id 非法: %q", s)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("id 非法（必须为 1..MaxInt64 正整数）: %s", s)
+	}
+	return v, nil
+}
+
+// parseIDFieldLenient 用于 query-param 过滤器（如 commandTaskFilter）：
+// 空串/不可解析/越界 → nil（视为无过滤，不 400）；合法 1..MaxInt64 → &v。
+func parseIDFieldLenient(s string) *int64 {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 || v > math.MaxInt64 {
+		return nil
+	}
+	return &v
 }

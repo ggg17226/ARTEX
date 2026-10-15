@@ -1485,8 +1485,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	sourceIDs := make([]int64, 0, len(req.SourceTaskIDs))
 	seenSources := map[int64]bool{}
 	for _, raw := range req.SourceTaskIDs {
-		id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-		if err != nil || id <= 0 || seenSources[id] {
+		id, err := parseIDField(strings.TrimSpace(raw))
+		if err != nil || seenSources[id] {
 			writeErr(w, 400, "关联任务 id 无效或重复")
 			return
 		}
@@ -2362,7 +2362,7 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "finding not found")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": true, "id": id})
+	writeJSON(w, 200, map[string]any{"deleted": true, "id": strconv.FormatInt(id, 10)})
 }
 
 func (s *Server) intents(w http.ResponseWriter, r *http.Request) {

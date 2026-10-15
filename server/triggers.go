@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -134,5 +135,5 @@ func (s *Server) pgDeleteTrigger(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": id})
+	writeJSON(w, 200, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }

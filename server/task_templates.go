@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -22,7 +23,7 @@ type taskTemplateRequest struct {
 	Name           *string                `json:"name"`
 	Description    *string                `json:"description"`
 	Goal           *string                `json:"goal"`
-	CategoryID     *int64                 `json:"category_id"`
+	CategoryID     *string                `json:"category_id"`
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules"`
 }
 
@@ -125,11 +126,20 @@ func (s *Server) pgCreateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "拦截/允许规则无效："+err.Error())
 		return
 	}
+	var catID *int64
+	if req.CategoryID != nil && *req.CategoryID != "" {
+		parsed, err := parseIDField(*req.CategoryID)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "category_id 无效: "+err.Error())
+			return
+		}
+		catID = &parsed
+	}
 	template, err := pg.CreateTaskTemplate(db.TaskTemplateInput{
 		Name:           stringValue(req.Name),
 		Description:    stringValue(req.Description),
 		Goal:           stringValue(req.Goal),
-		CategoryID:     req.CategoryID,
+		CategoryID:     catID,
 		InterceptRules: rules,
 	})
 	if err != nil {
@@ -167,7 +177,16 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	patch := db.TaskTemplatePatch{Name: req.Name, Description: req.Description, Goal: req.Goal}
 	if catPresent {
 		patch.SetCategoryID = true
-		patch.CategoryID = req.CategoryID
+		if req.CategoryID != nil && *req.CategoryID != "" {
+			parsed, err := parseIDField(*req.CategoryID)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, "category_id 无效: "+err.Error())
+				return
+			}
+			patch.CategoryID = &parsed
+		} else {
+			patch.CategoryID = nil
+		}
 	}
 	if rulesPresent {
 		rules, err := buildTaskInterceptRules(req.InterceptRules)
@@ -205,7 +224,7 @@ func (s *Server) pgDeleteTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "task template not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": strconv.FormatInt(id, 10)})
 }
 
 func stringValue(value *string) string {

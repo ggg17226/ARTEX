@@ -26,12 +26,12 @@ var (
 // TaskTemplate is a reusable task preset (description/goal + optional category
 // and task-level intercept/allow rules).
 type TaskTemplate struct {
-	ID             int64                    `json:"id"`
+	ID             int64                    `json:"id,string"`
 	Name           string                   `json:"name"`
 	NKey           string                   `json:"-"`
 	Description    string                   `json:"description"`
 	Goal           string                   `json:"goal"`
-	CategoryID     *int64                   `json:"category_id"`
+	CategoryID     *int64                   `json:"category_id,string"`
 	InterceptRules []TaskInterceptRuleInput `json:"intercept_rules"`
 	CreatedAt      time.Time                `json:"created_at"`
 	UpdatedAt      time.Time                `json:"updated_at"`
