@@ -6,9 +6,10 @@ import (
 	"errors"
 	"math"
 	"os"
+	"strings"
 	"testing"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 // openTiDB 读 env ARTEX_TIDB_DSN（与 P08 同名 env；P03 不依赖 config/）。
@@ -23,6 +24,9 @@ func openTiDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
 	if err := db.PingContext(context.Background()); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
@@ -62,18 +66,31 @@ func TestTiDB_HighValueLastInsertIDZero(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "CREATE TABLE idalloc_t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, logical_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE)"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS idalloc_t") }()
+	defer func() {
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS idalloc_t"); err != nil {
+			t.Errorf("cleanup drop table: %v", err)
+		}
+	}()
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, "INSERT INTO idalloc_t (id) VALUES (?)", uint64(9223372036854775813)); err != nil {
+	// 显式插入高值（需带必填 logical_key 满足 STRICT_TRANS_TABLES）
+	if _, err := tx.ExecContext(ctx, "INSERT INTO idalloc_t (id, logical_key) VALUES (?, ?)", uint64(9223372036854775813), "high_1"); err != nil {
 		t.Fatalf("insert high value: %v", err)
 	}
 	if _, err := AllocID(ctx, tx); !errors.Is(err, ErrReadbackZero) {
 		t.Fatalf("AllocID after high-value insert = %v, want ErrReadbackZero（LAST_INSERT_ID()=0 实测）", err)
+	}
+
+	// 补齐后续自增插入（logical_key = "high_2"），断言自增获得的 LAST_INSERT_ID() 依然为 0 并被 AllocID 拒绝
+	if _, err := tx.ExecContext(ctx, "INSERT INTO idalloc_t (logical_key) VALUES (?)", "high_2"); err != nil {
+		t.Fatalf("insert auto-increment after high value: %v", err)
+	}
+	if _, err := AllocID(ctx, tx); !errors.Is(err, ErrReadbackZero) {
+		t.Fatalf("AllocID after subsequent auto-increment = %v, want ErrReadbackZero（LAST_INSERT_ID()=0 实测）", err)
 	}
 }
 
@@ -91,7 +108,11 @@ func TestTiDB_MaxUint64RoundtripThenWrap(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "CREATE TABLE idalloc_t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, logical_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE)"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS idalloc_t") }()
+	defer func() {
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS idalloc_t"); err != nil {
+			t.Errorf("cleanup drop table: %v", err)
+		}
+	}()
 
 	// 1) MaxUint64 显式 insert + exact identity 回读 roundtrip 合法：
 	tx, err := db.BeginTx(ctx, nil)
@@ -128,7 +149,14 @@ func TestTiDB_MaxUint64RoundtripThenWrap(t *testing.T) {
 	defer tx2.Rollback()
 	if _, err := tx2.ExecContext(ctx, "INSERT INTO idalloc_t (logical_key) VALUES ('after')"); err != nil {
 		// 形态 B：ERROR 1105 auto increment action failed —— 分配器本身拒绝，fail closed 达成
-		t.Logf("allocator 拒绝自增（fail closed，ERROR 1105 形态）: %v", err)
+		// 精准断言错误确实源自 allocator 耗尽，杜绝非预期错误假绿
+		var mysqlErr *mysql.MySQLError
+		isMySQL1105 := errors.As(err, &mysqlErr) && mysqlErr.Number == 1105
+		isAutoIncActionFailed := strings.Contains(strings.ToLower(err.Error()), "auto increment action failed")
+		if !isMySQL1105 && !isAutoIncActionFailed {
+			t.Fatalf("unexpected insert error: %v", err)
+		}
+		t.Logf("allocator 拒绝自增（fail closed，精准命中 allocator exhaustion）: %v", err)
 		return
 	}
 	// 形态 A：自增回绕 id=0 → LAST_INSERT_ID()=0 或 identity 回读到 0 → 显式错误
@@ -156,7 +184,11 @@ func TestTiDB_InsertIgnoreMissExplicitError(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "CREATE TABLE idalloc_t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, logical_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE)"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS idalloc_t") }()
+	defer func() {
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS idalloc_t"); err != nil {
+			t.Errorf("cleanup drop table: %v", err)
+		}
+	}()
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
