@@ -33,6 +33,64 @@ type archiveBatchItem struct {
 	Archive int64  `json:"archive_id,string,omitempty"`
 }
 
+// taskArchiveWire 是归档 HTTP 响应的输出形状（P03 R22）。
+//
+// db.TaskArchive.SourceTaskIDs 必须保持 []int64：它由 task_archives.source_task_ids
+// 列的 JSON 文本 json.Unmarshal 回读（db/task_archives.go scanTaskArchive），
+// 且 encoding/json 的 ,string 对切片无效（Marshal 直接报错）。因此只在输出侧用
+// 外层同名字段覆盖成 []string（浅层优先屏蔽嵌入字段，模式同 W4b-2b 的 assetWire）；
+// id / task_id / category_id 仍由 db.TaskArchive 上已有的 ,string tag 保护。
+//
+// SourceTaskIDs 为 nil 时 wire 仍是 null（taskIDStrings 保留 nil 语义），
+// 空切片仍是 []，与原行为一致。
+type taskArchiveWire struct {
+	pgdb.TaskArchive
+	SourceTaskIDs []string `json:"source_task_ids"`
+}
+
+// taskArchivePageWire 覆盖 TaskArchivePage.Items（逐项转换）；total / page / size
+// 是分页计数，保持 number。
+type taskArchivePageWire struct {
+	Items []taskArchiveWire `json:"items"`
+	Total int               `json:"total"`
+	Page  int               `json:"page"`
+	Size  int               `json:"size"`
+}
+
+// taskArchiveDTO 转换单条归档；nil 原样返回 nil（调用方已保证非 nil 时才有输出）。
+func taskArchiveDTO(item *pgdb.TaskArchive) *taskArchiveWire {
+	if item == nil {
+		return nil
+	}
+	return &taskArchiveWire{TaskArchive: *item, SourceTaskIDs: taskIDStrings(item.SourceTaskIDs)}
+}
+
+// taskArchiveWires 逐项转换；nil 切片仍是 nil（ListTaskArchives 空结果就是 nil，
+// 对外保持 null，不会变成 []）。
+func taskArchiveWires(items []pgdb.TaskArchive) []taskArchiveWire {
+	if items == nil {
+		return nil
+	}
+	out := make([]taskArchiveWire, 0, len(items))
+	for i := range items {
+		out = append(out, taskArchiveWire{
+			TaskArchive:   items[i],
+			SourceTaskIDs: taskIDStrings(items[i].SourceTaskIDs),
+		})
+	}
+	return out
+}
+
+// taskArchivePageDTO 把分页结果转成 wire 形状（分页计数字段原样保留）。
+func taskArchivePageDTO(page pgdb.TaskArchivePage) taskArchivePageWire {
+	return taskArchivePageWire{
+		Items: taskArchiveWires(page.Items),
+		Total: page.Total,
+		Page:  page.Page,
+		Size:  page.Size,
+	}
+}
+
 func (s *Server) startTaskArchiveWorker() {
 	if s.m == nil || s.m.pg == nil {
 		return
@@ -443,7 +501,8 @@ func (s *Server) listTaskArchives(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, result)
+	// P03 R22：source_task_ids 覆盖成字符串数组（逐项转换）。
+	writeJSON(w, 200, taskArchivePageDTO(result))
 }
 
 func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
@@ -461,7 +520,8 @@ func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "归档不存在")
 		return
 	}
-	writeJSON(w, 200, item)
+	// P03 R22：source_task_ids 覆盖成字符串数组。
+	writeJSON(w, 200, taskArchiveDTO(item))
 }
 
 func (s *Server) queueTaskArchive(w http.ResponseWriter, r *http.Request) {
@@ -477,7 +537,8 @@ func (s *Server) queueTaskArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.notifyTaskArchiveWorker()
-	writeJSON(w, http.StatusAccepted, item)
+	// P03 R22：source_task_ids 覆盖成字符串数组。
+	writeJSON(w, http.StatusAccepted, taskArchiveDTO(item))
 }
 
 func (s *Server) queueTaskArchiveRestore(w http.ResponseWriter, r *http.Request) {
@@ -492,7 +553,8 @@ func (s *Server) queueTaskArchiveRestore(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.notifyTaskArchiveWorker()
-	writeJSON(w, http.StatusAccepted, item)
+	// P03 R22：source_task_ids 覆盖成字符串数组。
+	writeJSON(w, http.StatusAccepted, taskArchiveDTO(item))
 }
 
 func (s *Server) queueTaskArchiveDelete(w http.ResponseWriter, r *http.Request) {
@@ -507,7 +569,8 @@ func (s *Server) queueTaskArchiveDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.notifyTaskArchiveWorker()
-	writeJSON(w, http.StatusAccepted, item)
+	// P03 R22：source_task_ids 覆盖成字符串数组。
+	writeJSON(w, http.StatusAccepted, taskArchiveDTO(item))
 }
 
 func (s *Server) queueTaskArchivesBatch(w http.ResponseWriter, r *http.Request) {

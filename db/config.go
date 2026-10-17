@@ -806,8 +806,14 @@ func (d *DB) ListPromptVersions(agentID int64) ([]PromptVersion, error) {
 
 // ---------- MCP servers ----------
 
+// MCPServer 是 mcp_servers 行。
+//
+// P03 R26：id 是 64 位实体 ID，对外 string。本类型不是请求体解码目标，也不是持久化
+// JSON 回读目标（SaveMCP / ListMCP 全走 SQL 列）；POST /api/mcp 的请求体由
+// server.saveMCPRequest 承载，它以外层 ID json.RawMessage 屏蔽本字段（浅层优先），
+// 因此加 ,string 后请求解码仍不受影响（有离线回归测试锁定）。
 type MCPServer struct {
-	ID        int64           `json:"id"`
+	ID        int64           `json:"id,string"`
 	Name      string          `json:"name"`
 	Transport string          `json:"transport"`
 	Command   string          `json:"command,omitempty"`
@@ -815,7 +821,7 @@ type MCPServer struct {
 	Env       json.RawMessage `json:"env"`
 	URL       string          `json:"url,omitempty"`
 	Enabled   bool            `json:"enabled"`
-	Insecure  bool            `json:"insecure"` // http: skip TLS cert verification (self-signed servers, issue #108)
+	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 

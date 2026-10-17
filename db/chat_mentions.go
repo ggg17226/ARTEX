@@ -10,9 +10,13 @@ import (
 )
 
 // ChatMention is a lightweight search result. Details are read again on send.
+//
+// P03 R25：id 是 64 位实体 ID（finding / company / asset / …），对外 string。
+// 内部 chatMentionCursor 是另一类型：它被 Marshal 后 base64 成不透明的
+// next_cursor 字符串，不是前端数字字段，故保持原样。
 type ChatMention struct {
 	Kind        string `json:"kind"`
-	ID          int64  `json:"id"`
+	ID          int64  `json:"id,string"`
 	Label       string `json:"label"`
 	Description string `json:"description"`
 }

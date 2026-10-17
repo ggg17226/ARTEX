@@ -170,12 +170,19 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 			ID    string `json:"id"` // P03：企业 ID 对外 string
 			Added int    `json:"scope_added"`
 		}
-		_ = json.Unmarshal(rec.Body.Bytes(), &created)
-		companyID, _ := parseIDField(created.ID)
-		defer func() { _ = m.pg.Companies().DeleteCompany(companyID) }()
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("解析创建响应失败: %v body=%s", err, rec.Body.String())
+		}
+		// ID 解析失败必须显式失败：忽略 error 会让下面的 cleanup 静默失效，
+		// 每轮跑完都留下一条企业数据（W4b-2a 审查 M-2）。
+		companyID, err := parseIDField(created.ID)
+		if err != nil {
+			t.Fatalf("创建响应 id 应是合法 ID string，得到 %q: %v", created.ID, err)
+		}
+		defer func() { _ = m.pg.Companies().DeleteCompany(companyID) }()
 		if created.Added != len(scope) {
 			t.Fatalf("scope_added=%d want=%d", created.Added, len(scope))
 		}

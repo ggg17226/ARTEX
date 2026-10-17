@@ -591,7 +591,9 @@ func TestNotifyDeliveriesHistoryAndRetry(t *testing.T) {
 	}
 	var hist struct {
 		Deliveries []struct {
-			ID        int64  `json:"id"`
+			// P03 R24（W4b-2a）：deliveries[].id 对外是带引号的 string，
+			// 这里必须按 string 解码，否则接库时 encoding/json 直接报错。
+			ID        string `json:"id"`
 			State     string `json:"state"`
 			LastError string `json:"last_error"`
 			Attempts  int    `json:"attempts"`
@@ -605,6 +607,11 @@ func TestNotifyDeliveriesHistoryAndRetry(t *testing.T) {
 	if hist.Total != 1 || len(hist.Deliveries) != 1 {
 		t.Fatalf("应查到 1 条失败投递，得到 total=%d len=%d", hist.Total, len(hist.Deliveries))
 	}
+	// ID 必须是可解析的十进制 ID string（1..MaxInt64）。
+	deliveryID, idErr := parseIDField(hist.Deliveries[0].ID)
+	if idErr != nil {
+		t.Fatalf("deliveries[].id 应是合法 ID string，得到 %q: %v", hist.Deliveries[0].ID, idErr)
+	}
 	if hist.Deliveries[0].LastError == "" {
 		t.Fatal("历史里应带上失败原因，否则用户无法排查")
 	}
@@ -616,11 +623,11 @@ func TestNotifyDeliveriesHistoryAndRetry(t *testing.T) {
 	}
 
 	// 手动重发：应回到 pending 且清零计数。
-	if r := f.request("POST", fmt.Sprintf("/api/notify/deliveries/%d/retry", hist.Deliveries[0].ID), ""); r.Code != 200 {
+	if r := f.request("POST", "/api/notify/deliveries/"+hist.Deliveries[0].ID+"/retry", ""); r.Code != 200 {
 		t.Fatalf("重发失败 %d: %s", r.Code, r.Body)
 	}
 	var attempts int
-	if err := f.pg.QueryRow(`SELECT state, attempts FROM notification_deliveries WHERE id=$1`, hist.Deliveries[0].ID).Scan(&state, &attempts); err != nil {
+	if err := f.pg.QueryRow(`SELECT state, attempts FROM notification_deliveries WHERE id=$1`, deliveryID).Scan(&state, &attempts); err != nil {
 		t.Fatal(err)
 	}
 	if state != db.NotifyStatePending || attempts != 0 {

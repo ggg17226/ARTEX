@@ -16,10 +16,13 @@ var ErrRetestNotRunning = errors.New("本次复测已结束或尚未开始，请
 
 // FindingRetest is an immutable historical test once its conversation turn ends.
 // Snapshot is only loaded for the agent, never sent with the history list.
+//
+// P03 R17：id / finding_id / conversation_id 是 64 位实体 ID，对外 string。
+// ConversationID 无 omitempty，nil 仍是 null。Snapshot 是 RawMessage（DB 列原样），未动。
 type FindingRetest struct {
-	ID             int64           `json:"id"`
-	FindingID      int64           `json:"finding_id"`
-	ConversationID *int64          `json:"conversation_id"`
+	ID             int64           `json:"id,string"`
+	FindingID      int64           `json:"finding_id,string"`
+	ConversationID *int64          `json:"conversation_id,string"`
 	Status         string          `json:"status"`
 	Verdict        string          `json:"verdict"`
 	Notes          string          `json:"notes"`
@@ -36,10 +39,12 @@ const retestCols = `id, finding_id, conversation_id, status, verdict, notes, sum
 
 // ActiveFindingRetest is the small status payload polled by the findings list.
 // Finding IDs use the same string representation as the findings API.
+//
+// P03 R18：id / conversation_id 同样对外 string（FindingID 早已合规）。
 type ActiveFindingRetest struct {
-	ID             int64  `json:"id"`
+	ID             int64  `json:"id,string"`
 	FindingID      int64  `json:"finding_id,string"`
-	ConversationID int64  `json:"conversation_id"`
+	ConversationID int64  `json:"conversation_id,string"`
 	Status         string `json:"status"`
 }
 

@@ -8,8 +8,11 @@ import (
 // ConvTokenSummary is one conversation's token total (sum of its kind='result'
 // rows) with its profile + created_at, used to merge conversation usage into the
 // dashboard's per-profile / daily token stats (which otherwise cover only tasks).
+//
+// P03 R20：llm_profile_id 是 64 位配置 ID，对外 string；无 omitempty，nil 仍是 null。
+// token 计数保持 number。
 type ConvTokenSummary struct {
-	LLMProfileID     *int64 `json:"llm_profile_id"`
+	LLMProfileID     *int64 `json:"llm_profile_id,string"`
 	CreatedAt        string `json:"created_at"`
 	InputTokens      int    `json:"input_tokens"`
 	OutputTokens     int    `json:"output_tokens"`

@@ -152,10 +152,13 @@ ORDER BY COUNT(*) DESC, skill`)
 }
 
 // SkillCall is one row of a skill's recent-call list (detail panel).
+//
+// P03 R19：task_id 是 64 位任务 ID，对外 string（无任务时 SQL COALESCE 出的 0
+// 变成 "0"，与其它 ID 字段的零值口径一致）。
 type SkillCall struct {
 	TS        time.Time `json:"ts"`
 	AgentKey  string    `json:"agent_key"`
-	TaskID    int64     `json:"task_id"`
+	TaskID    int64     `json:"task_id,string"`
 	SessionID string    `json:"session_id"`
 	ArgsLen   int       `json:"args_len"`
 }

@@ -80,14 +80,22 @@ func TestMgmtAPI(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("create mcp: %d", code)
 	}
-	mid := int64(out["id"].(float64))
+	// P03：POST /api/mcp 的 id 与 visibility 的 mcp 数组对外都是 string
+	// （S07 / E05），这里必须按 string 断言，否则接库时 float64 断言直接 panic。
+	midStr, ok := out["id"].(string)
+	if !ok {
+		t.Fatalf("mcp id 应是 string，得到 %T", out["id"])
+	}
+	if _, err := parseIDField(midStr); err != nil {
+		t.Fatalf("mcp id 应是合法 ID string，得到 %q: %v", midStr, err)
+	}
 
 	ag, _ := m.pg.GetAgentByKey("planner")
-	code, _ = do("PUT", "/api/agents/planner/visibility", map[string]any{"mcp": []int64{mid}, "skill": []int64{}})
+	code, _ = do("PUT", "/api/agents/planner/visibility", map[string]any{"mcp": []string{midStr}, "skill": []string{}})
 	if code != 200 {
 		t.Fatalf("set visibility: %d", code)
 	}
-	code, out = do("GET", "/api/visibility/mcp/"+itoaTest(mid), nil)
+	code, out = do("GET", "/api/visibility/mcp/"+midStr, nil)
 	if code != 200 {
 		t.Fatalf("resource visibility: %d", code)
 	}
@@ -96,7 +104,7 @@ func TestMgmtAPI(t *testing.T) {
 	}
 
 	// cleanup
-	do("DELETE", "/api/mcp/"+itoaTest(mid), nil)
+	do("DELETE", "/api/mcp/"+midStr, nil)
 	m.pg.Exec(`DELETE FROM agent_prompts WHERE agent_id=$1`, ag.ID)
 	m.pg.Exec(`UPDATE agents SET current_prompt_id=NULL WHERE id=$1`, ag.ID)
 }

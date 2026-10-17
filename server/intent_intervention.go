@@ -137,8 +137,10 @@ func (s *Server) sendWorkerMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// P03 R21/O-1：iid 是 intent 节点主键（BIGINT），对外必须是 string；
+	// request_id 是客户端生成的幂等键（string），accepted / state 是状态字段，保持原样。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":         iid,
+		"id":         i64s(iid),
 		"state":      "running",
 		"accepted":   true,
 		"request_id": requestID,

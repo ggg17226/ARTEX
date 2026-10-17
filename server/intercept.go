@@ -518,6 +518,45 @@ func validateInterceptRuleReq(req interceptRuleReq) error {
 	return nil
 }
 
+// interceptAuditWire 是审批详情 audit 的输出形状（P03 R04）。
+//
+// db.InterceptAudit.ProfileID 必须保持「int64 且无 ,string」：整个 InterceptAudit 会被
+// db.firstAudit Marshal 进 intercept_pending.audit 列，并由 db.GetInterceptDetail
+// json.Unmarshal 原样回读（db/intercept_detail.go）。Go 标准库的 ,string 解码**拒绝**
+// 未加引号的数字，给 tag 加 ,string 会让历史行的数字 profile_id 直接解码失败
+// （详情接口 500），所以只能在输出侧覆盖。
+//
+// 外层同名字段按 encoding/json 的浅层优先规则屏蔽嵌入的 int64（与 W4b-1
+// saveMCPRequest、W4b-2b assetWire 同一模式）；0 时外层 omitempty 与内层一样省略。
+type interceptAuditWire struct {
+	db.InterceptAudit
+	ProfileID string `json:"profile_id,omitempty"`
+}
+
+// interceptDetailWire 是 GET /api/intercept/{id} 的响应（P03 R04）。
+// 审批行本身（R03 的 id / rule_id / conversation_id）由 db tag 直接保护，
+// 这里只覆盖 audit；audit 缺失时字段仍是 null（无 omitempty，语义未变）。
+type interceptDetailWire struct {
+	db.InterceptApprovalRow
+	Audit *interceptAuditWire `json:"audit"`
+}
+
+// interceptDetailDTO 把 db 详情转成 wire 形状；nil 原样返回 nil。
+func interceptDetailDTO(d *db.InterceptDetail) *interceptDetailWire {
+	if d == nil {
+		return nil
+	}
+	out := &interceptDetailWire{InterceptApprovalRow: d.InterceptApprovalRow}
+	if d.Audit != nil {
+		audit := interceptAuditWire{InterceptAudit: *d.Audit}
+		if d.Audit.ProfileID != 0 {
+			audit.ProfileID = i64s(d.Audit.ProfileID)
+		}
+		out.Audit = &audit
+	}
+	return out
+}
+
 func (s *Server) interceptDetail(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -537,7 +576,8 @@ func (s *Server) interceptDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	writeJSON(w, 200, detail)
+	// P03 R04：audit.profile_id 只能在 server 输出侧 string 化（见 interceptAuditWire）。
+	writeJSON(w, 200, interceptDetailDTO(detail))
 }
 
 // The navigation endpoint returns only the original call and its paired result.
@@ -582,5 +622,14 @@ func (s *Server) interceptExecution(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "审批记录已被删除或不存在")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"conversation_id": target.ConversationID, "task_id": target.TaskID, "session": target.Session, "seq": target.Seq, "items": activityDTOs(target.Items)})
+	// P03 R05：这个响应是 map，db tag 不生效，必须在此显式转换：
+	// conversation_id 是 64 位会话 ID（nil 保持 null，不会变成 "0"），
+	// seq 承载 db.Activity.ID（BIGINT 主键别名，见 db.GetInterceptExecution）。
+	writeJSON(w, 200, map[string]any{
+		"conversation_id": i64Ptr(target.ConversationID),
+		"task_id":         target.TaskID,
+		"session":         target.Session,
+		"seq":             i64s(target.Seq),
+		"items":           activityDTOs(target.Items),
+	})
 }

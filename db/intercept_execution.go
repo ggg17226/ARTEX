@@ -13,11 +13,15 @@ var ErrInterceptExecutionUnavailable = errors.New("未找到可唯一关联的�
 
 // InterceptExecution is a navigation target read from original activity rows.
 // It is not model context and never falls back to matching command text.
+//
+// P03 R05：conversation_id 是 64 位会话 ID；seq 承载的是 activity 主键
+// （out.Seq = call.ID，见本文件 GetInterceptExecution），两者对外都是 string。
+// conversation_id 保留 omitempty：nil 仍被省略，不会变成 "0"。
 type InterceptExecution struct {
-	ConversationID *int64     `json:"conversation_id,omitempty"`
+	ConversationID *int64     `json:"conversation_id,omitempty,string"`
 	TaskID         *string    `json:"task_id,omitempty"`
 	Session        string     `json:"session"`
-	Seq            int64      `json:"seq"`
+	Seq            int64      `json:"seq,string"`
 	Items          []Activity `json:"-"`
 }
 

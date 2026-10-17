@@ -11,8 +11,11 @@ import (
 // on_task_timeout / on_tool_call / on_task_create. ToolNames scopes the tool-call
 // trigger to a non-empty set of tool keys (empty is rejected at the API layer for
 // on_tool_call).
+//
+// P03 R21：id 是 64 位实体 ID，对外 string。tool_names 列虽存 JSON 文本，但只有
+// []string 会被 Marshal/Unmarshal（见 marshalToolNames / scanTrigger），tag 变化不影响。
 type AgentTrigger struct {
-	ID                 int64      `json:"id"`
+	ID                 int64      `json:"id,string"`
 	AgentKey           string     `json:"agent_key"`
 	Enabled            bool       `json:"enabled"`
 	IntervalSec        int        `json:"interval_sec"`

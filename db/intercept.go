@@ -10,7 +10,7 @@ import (
 
 // InterceptRule is one row of intercept_rules.
 type InterceptRule struct {
-	ID             int64     `json:"id"`
+	ID             int64     `json:"id,string"` // P03 R02：64 位实体 ID 对外 string
 	Name           string    `json:"name"`
 	Enabled        bool      `json:"enabled"`
 	Priority       int       `json:"priority"`
@@ -27,10 +27,14 @@ type InterceptRule struct {
 }
 
 // InterceptPending is one row of intercept_pending.
+//
+// P03 R03：id / rule_id / conversation_id 是 64 位实体 ID，对外 string。
+// 两个 *int64 没有 omitempty，nil 仍序列化为 null（语义未变）。
+// InterceptApprovalRow 嵌入本类型，自动继承同样的 tag。
 type InterceptPending struct {
-	ID             int64           `json:"id"`
-	RuleID         *int64          `json:"rule_id"`
-	ConversationID *int64          `json:"conversation_id"`
+	ID             int64           `json:"id,string"`
+	RuleID         *int64          `json:"rule_id,string"`
+	ConversationID *int64          `json:"conversation_id,string"`
 	TaskID         *string         `json:"task_id"`
 	AgentName      string          `json:"agent_name"`
 	ToolName       string          `json:"tool_name"`

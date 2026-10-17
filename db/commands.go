@@ -8,9 +8,11 @@ import (
 
 // CommandRecord is a paired tool_use + tool_result from the activity table
 // (any tool, not just Bash). Command holds the raw tool input (JSON).
+//
+// P03 R15：id（activity 主键）与 exploration_id（任务主键）对外是 string。
 type CommandRecord struct {
-	ID        int64     `json:"id"`
-	ExpID     int64     `json:"exploration_id"`
+	ID        int64     `json:"id,string"`
+	ExpID     int64     `json:"exploration_id,string"`
 	Worker    string    `json:"worker"`
 	Tool      string    `json:"tool"`
 	Command   string    `json:"command"`
@@ -127,8 +129,10 @@ LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
 }
 
 // LLMRecord is one recorded LLM API call (request + response).
+//
+// P03 R16：id（llm_records 主键）对外是 string；TaskID / SessionID 本来就是 string。
 type LLMRecord struct {
-	ID           int64     `json:"id"`
+	ID           int64     `json:"id,string"`
 	Ts           time.Time `json:"ts"`
 	Model        string    `json:"model"`
 	ProfileName  string    `json:"profile_name"`
