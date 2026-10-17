@@ -200,9 +200,12 @@ func (f *sideHTTPFixture) checkpoint(t *testing.T, p sidequestion.Parent) sidequ
 	}
 	return snap
 }
-func decodeSide(t *testing.T, w *httptest.ResponseRecorder) sidequestion.Exchange {
+
+// decodeSide 解析旁路 HTTP 响应。wire 是 server 包的 side wire DTO（P03：
+// ordinal / model.profile_id 对外 string），不再直接解成 sidequestion.Exchange。
+func decodeSide(t *testing.T, w *httptest.ResponseRecorder) sideExchangeWire {
 	t.Helper()
-	var e sidequestion.Exchange
+	var e sideExchangeWire
 	if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +309,7 @@ func TestSideHTTPBusyIsolationClearAndReconnect(t *testing.T) {
 
 func TestSideHTTPGlobalLimitTaskWorkerAndDeletion(t *testing.T) {
 	f := newSideHTTPFixture(t)
-	var requests []sidequestion.Exchange
+	var requests []sideExchangeWire
 	for i := 0; i < 20; i++ {
 		p, path := f.conversation(t)
 		f.checkpoint(t, p)

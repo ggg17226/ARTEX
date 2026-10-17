@@ -577,7 +577,7 @@ func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Available || got.Source != "task_chain" || got.ProfileID == nil || *got.ProfileID != profileID {
+	if got.Available || got.Source != "task_chain" || got.ProfileID == nil || *got.ProfileID != i64s(profileID) {
 		t.Fatalf("resolution=%+v, want unavailable explicit task profile", got)
 	}
 }

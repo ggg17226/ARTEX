@@ -495,12 +495,12 @@ func (s *Server) pgGetAgent(w http.ResponseWriter, r *http.Request) {
 	llmProfiles := make([]map[string]any, 0, len(profs))
 	for _, p := range profs {
 		llmProfiles = append(llmProfiles, map[string]any{
-			"id": p.ID, "name": p.Name, "model": p.Model, "is_default": p.IsDefault,
+			"id": i64s(p.ID), "name": p.Name, "model": p.Model, "is_default": p.IsDefault,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
 		"agent": agentDTO(a), "prompt": cur, "variables": vars, "versions": vers,
-		"visibility":   map[string]any{"mcp": mcp, "skill": sk},
+		"visibility":   map[string]any{"mcp": idStrings(mcp), "skill": sk},
 		"llm_profiles": llmProfiles, // 可绑定的 LLM 配置候选
 
 		"wrapup_prompt":            a.WrapupPrompt,                  // 已保存的收尾提示词(空=用内置默认)
@@ -718,7 +718,7 @@ func (s *Server) pgGetAgentVisibility(w http.ResponseWriter, r *http.Request) {
 	if sk == nil {
 		sk = []string{}
 	}
-	writeJSON(w, 200, map[string]any{"mcp": mcp, "skill": sk})
+	writeJSON(w, 200, map[string]any{"mcp": idStrings(mcp), "skill": sk})
 }
 
 // agentVisibilityRequest 是 PUT /api/agents/{key}/visibility 的请求体。
@@ -927,7 +927,7 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		}
 		cancel()
 	}
-	writeJSON(w, 200, map[string]any{"id": id})
+	writeJSON(w, 200, map[string]any{"id": i64s(id)})
 }
 
 func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {

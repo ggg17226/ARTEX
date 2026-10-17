@@ -21,7 +21,7 @@ import (
 // 前端把掩码值原样提交回来即表示「这个字段没改」，服务端据此保留库中原值
 // （见 notify.MergeConfig）。
 type notifyChannelDTO struct {
-	ID         int64          `json:"id"`
+	ID         int64          `json:"id,string"` // P03：64 位 ID 对外 string
 	Name       string         `json:"name"`
 	Kind       string         `json:"kind"`
 	Enabled    bool           `json:"enabled"`
@@ -38,16 +38,16 @@ type notifyChannelDTO struct {
 
 // notifyDeliveryDTO 是投递历史的对外表述。
 type notifyDeliveryDTO struct {
-	ID          int64      `json:"id"`
+	ID          int64      `json:"id,string"`
 	FindingID   int64      `json:"finding_id,string"`
 	EventKind   string     `json:"event_kind"`
-	ChannelID   int64      `json:"channel_id"`
+	ChannelID   int64      `json:"channel_id,string"`
 	ChannelName string     `json:"channel_name"`
 	ChannelKind string     `json:"channel_kind"`
 	State       string     `json:"state"`
 	Attempts    int        `json:"attempts"`
 	LastError   string     `json:"last_error"`
-	BatchID     *int64     `json:"batch_id,omitempty"`
+	BatchID     *int64     `json:"batch_id,omitempty,string"`
 	CreatedAt   time.Time  `json:"created_at"`
 	SentAt      *time.Time `json:"sent_at,omitempty"`
 	NextAttempt time.Time  `json:"next_attempt_at"`
@@ -248,7 +248,7 @@ func (s *Server) notifyCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": id})
+	writeJSON(w, 200, map[string]any{"id": i64s(id)})
 }
 
 func (s *Server) notifyUpdateChannel(w http.ResponseWriter, r *http.Request) {
@@ -364,14 +364,14 @@ func (s *Server) notifyUpdateChannel(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, 200, map[string]any{"id": id})
+		writeJSON(w, 200, map[string]any{"id": i64s(id)})
 		return
 	}
 	if _, err := pg.SaveNotificationChannel(r.Context(), ch); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": id})
+	writeJSON(w, 200, map[string]any{"id": i64s(id)})
 }
 
 func (s *Server) notifyDeleteChannel(w http.ResponseWriter, r *http.Request) {

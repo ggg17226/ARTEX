@@ -15,7 +15,7 @@ import (
 // LogLine is one captured backend log entry exposed by the /api/logs endpoints.
 type LogLine struct {
 	Seq   int64  `json:"seq"`
-	DBID  int64  `json:"db_id,omitempty"` // server_logs.id; 0 for pre-persistence entries
+	DBID  string `json:"db_id,omitempty"` // server_logs.id（P03：wire string）；未落库为空串并 omit
 	TS    string `json:"ts"`
 	Level string `json:"level"` // info | warn | error
 	Tag   string `json:"tag"`   // the leading [tag] (pg / planner / activity / …), if any
@@ -71,7 +71,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 				s.seq++
 				restored = append(restored, LogLine{
 					Seq:   s.seq,
-					DBID:  l.ID,
+					DBID:  i64s(l.ID),
 					TS:    l.CreatedAt.Format(time.RFC3339),
 					Level: l.Level,
 					Tag:   l.Tag,
@@ -104,7 +104,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 					s.mu.Lock()
 					for i := range s.ring {
 						if s.ring[i].Seq == req.seq {
-							s.ring[i].DBID = id
+							s.ring[i].DBID = i64s(id)
 							break
 						}
 					}

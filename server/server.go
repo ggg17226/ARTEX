@@ -1233,7 +1233,7 @@ func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[task] #%s 意图 #%d 已重开(重跑)", t.ID, iid)
-	writeJSON(w, 200, map[string]any{"id": t.ID, "reopened": iid, "queued": queued})
+	writeJSON(w, 200, map[string]any{"id": t.ID, "reopened": i64s(iid), "queued": queued})
 }
 
 // rerunBlocked 批量重跑本任务全部 blocked 意图(适合一次网络/LLM 断连导致多条 blocked 后
@@ -1455,12 +1455,12 @@ type createTaskReq struct {
 	CategoryID           json.RawMessage   `json:"category_id,omitempty"`
 	Description          string            `json:"description"`
 	Goal                 string            `json:"goal"`
-	LLMProfileID         *string           `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []string          `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string          `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
-	CompanyIDs           []json.RawMessage `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
-	TimeoutSeconds       int               `json:"timeout_seconds"`           // 任务级超时(秒);0/省略=不限时
-	PlanHeartbeatSeconds int               `json:"plan_heartbeat_seconds"`    // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	LLMProfileID         *string           `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs        []string          `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs        []string          `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
+	CompanyIDs           []json.RawMessage `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	TimeoutSeconds       int               `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
+	PlanHeartbeatSeconds int               `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool             `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool             `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
@@ -2676,7 +2676,7 @@ func csvValues(s string) []string {
 func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.URL.Query().Get("task"))
 	if t == nil {
-		writeJSON(w, 200, map[string]any{"items": []any{}, "cursor": 0})
+		writeJSON(w, 200, map[string]any{"items": []any{}, "cursor": "0"})
 		return
 	}
 	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
@@ -2702,7 +2702,7 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": cursor})
+	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": i64s(cursor)})
 }
 
 // parseActivitySession maps a stable session key (main | plan | intent:<ID>) to a
@@ -2834,8 +2834,8 @@ func (s *Server) activityHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"items":           activityDTOs(items),
-		"snapshot_cursor": snapshot,
-		"earliest_cursor": earliest,
+		"snapshot_cursor": i64s(snapshot),
+		"earliest_cursor": i64s(earliest),
 		"has_more":        hasMore,
 	})
 }
@@ -2947,7 +2947,7 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 	items := make([]LogLine, 0, len(rows))
 	for _, r := range rows {
 		items = append(items, LogLine{
-			DBID:  r.ID,
+			DBID:  i64s(r.ID),
 			TS:    r.CreatedAt.Format(time.RFC3339),
 			Level: r.Level,
 			Tag:   r.Tag,

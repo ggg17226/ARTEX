@@ -86,7 +86,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 		ConversationID int64         `json:"conversation_id"`
 		Items          []ActivityDTO `json:"items"`
 	}
-	if sourceReply.Code != 200 || json.Unmarshal(sourceReply.Body.Bytes(), &execution) != nil || execution.Seq != seq || execution.ConversationID != conv.ID || len(execution.Items) != 1 || execution.Items[0].Seq != seq {
+	if sourceReply.Code != 200 || json.Unmarshal(sourceReply.Body.Bytes(), &execution) != nil || execution.Seq != seq || execution.ConversationID != conv.ID || len(execution.Items) != 1 || execution.Items[0].Seq != i64s(seq) {
 		t.Fatalf("source reply: %d %s", sourceReply.Code, sourceReply.Body.String())
 	}
 

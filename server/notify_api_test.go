@@ -141,13 +141,17 @@ func (f *notifyFixture) createChannel(t *testing.T, payload map[string]any) int6
 		t.Fatalf("建渠道失败 %d: %s", r.Code, r.Body)
 	}
 	var res struct {
-		ID int64 `json:"id"`
+		ID string `json:"id"` // P03：渠道 ID 对外 string
 	}
-	if err := json.Unmarshal(r.Body.Bytes(), &res); err != nil || res.ID == 0 {
+	if err := json.Unmarshal(r.Body.Bytes(), &res); err != nil {
 		t.Fatalf("建渠道返回异常: %s (%v)", r.Body, err)
 	}
-	t.Cleanup(func() { f.pg.Exec(`DELETE FROM notification_channels WHERE id=$1`, res.ID) })
-	return res.ID
+	id, err := strconv.ParseInt(res.ID, 10, 64)
+	if err != nil || id == 0 {
+		t.Fatalf("建渠道返回异常: %s (%v)", r.Body, err)
+	}
+	t.Cleanup(func() { f.pg.Exec(`DELETE FROM notification_channels WHERE id=$1`, id) })
+	return id
 }
 
 // fakeWebhook 是记录收到的请求体的假接收端。
@@ -274,7 +278,7 @@ func TestNotifyChannelAPIMasksSecretsAndPreservesOnUpdate(t *testing.T) {
 	}
 	var listed struct {
 		Channels []struct {
-			ID         int64          `json:"id"`
+			ID         string         `json:"id"` // P03：渠道 ID 对外 string
 			Config     map[string]any `json:"config"`
 			SecretKeys []string       `json:"secret_keys"`
 		} `json:"channels"`
@@ -283,12 +287,12 @@ func TestNotifyChannelAPIMasksSecretsAndPreservesOnUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	var mine *struct {
-		ID         int64          `json:"id"`
+		ID         string         `json:"id"`
 		Config     map[string]any `json:"config"`
 		SecretKeys []string       `json:"secret_keys"`
 	}
 	for i := range listed.Channels {
-		if listed.Channels[i].ID == chID {
+		if listed.Channels[i].ID == i64s(chID) {
 			mine = &listed.Channels[i]
 		}
 	}

@@ -104,7 +104,7 @@ func (s *Server) detachTaskAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task.Notify()
-	writeJSON(w, http.StatusOK, map[string]any{"detached": assetID})
+	writeJSON(w, http.StatusOK, map[string]any{"detached": i64s(assetID)})
 }
 
 func (s *Server) taskIntentAssets(w http.ResponseWriter, r *http.Request) {

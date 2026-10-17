@@ -30,7 +30,7 @@ type taskAgentBundle struct {
 }
 
 type llmAuditProfile struct {
-	ID     int64  `json:"id"`
+	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Format string `json:"format"`
 	Model  string `json:"model"`
@@ -647,9 +647,9 @@ func (s *Server) llmAuditProfile(id int64) *llmAuditProfile {
 	}
 	p, err := s.m.pg.ProfileByID(id)
 	if err != nil || p == nil {
-		return &llmAuditProfile{ID: id, Name: fmt.Sprintf("配置 #%d", id)}
+		return &llmAuditProfile{ID: i64s(id), Name: fmt.Sprintf("配置 #%d", id)}
 	}
-	return &llmAuditProfile{ID: p.ID, Name: p.Name, Format: p.Format, Model: p.Model}
+	return &llmAuditProfile{ID: i64s(p.ID), Name: p.Name, Format: p.Format, Model: p.Model}
 }
 
 func llmAuditProfileLabel(profile *llmAuditProfile) string {
@@ -658,7 +658,7 @@ func llmAuditProfileLabel(profile *llmAuditProfile) string {
 	}
 	name := profile.Name
 	if name == "" {
-		name = fmt.Sprintf("配置 #%d", profile.ID)
+		name = fmt.Sprintf("配置 #%s", profile.ID)
 	}
 	detail := []string{}
 	if profile.Format != "" {

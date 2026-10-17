@@ -40,6 +40,63 @@ type sideQuestionState struct {
 	outputTokens int
 }
 
+// sideModelWire / sideExchangeWire 是旁路问答的对外 wire 表述（P03：64 位 ID 一律
+// string）。sidequestion.Exchange / sidequestion.Model 本身不能改 JSON tag：
+// db/side_questions.go 会从持久化 JSON 列 unmarshal 回读（model 列、snapshot 回读），
+// 改 tag 会破坏存量数据。wire 转换只发生在 server 包的响应输出点。
+type sideModelWire struct {
+	ProfileID    string `json:"profile_id"` // sidequestion.Model.ProfileID（LLM 配置 ID）
+	Name         string `json:"name"`
+	Format       string `json:"format"`
+	Model        string `json:"model"`
+	Identity     string `json:"identity"`
+	Streaming    bool   `json:"streaming"`
+	WindowTokens int    `json:"window_tokens"`
+}
+
+type sideExchangeWire struct {
+	ID         string                   `json:"id"`
+	ClientID   string                   `json:"client_request_id"`
+	Question   string                   `json:"question"`
+	Answer     string                   `json:"answer"`
+	Status     string                   `json:"status"`
+	Error      string                   `json:"error,omitempty"`
+	Model      sideModelWire            `json:"model"`
+	SnapshotAt time.Time                `json:"snapshot_at"`
+	CreatedAt  time.Time                `json:"created_at"`
+	Sequence   int64                    `json:"sequence"` // 回答内序号计数，保持 number
+	Usage      llm.Usage                `json:"usage"`
+	Ordinal    string                   `json:"ordinal"` // DB 64 位 identity → string
+	Context    sidequestion.ContextInfo `json:"context"`
+}
+
+func sideModelWireOf(m sidequestion.Model) sideModelWire {
+	return sideModelWire{
+		ProfileID: i64s(m.ProfileID), Name: m.Name, Format: m.Format, Model: m.Model,
+		Identity: m.Identity, Streaming: m.Streaming, WindowTokens: m.WindowTokens,
+	}
+}
+
+func sideExchangeWireOf(e *sidequestion.Exchange) *sideExchangeWire {
+	if e == nil {
+		return nil
+	}
+	return &sideExchangeWire{
+		ID: e.ID, ClientID: e.ClientID, Question: e.Question, Answer: e.Answer,
+		Status: e.Status, Error: e.Error, Model: sideModelWireOf(e.Model),
+		SnapshotAt: e.SnapshotAt, CreatedAt: e.CreatedAt, Sequence: e.Sequence,
+		Usage: e.Usage, Ordinal: i64s(e.Ordinal), Context: e.Context,
+	}
+}
+
+func sideExchangeWireOfSlice(in []sidequestion.Exchange) []sideExchangeWire {
+	out := make([]sideExchangeWire, 0, len(in))
+	for i := range in {
+		out = append(out, *sideExchangeWireOf(&in[i]))
+	}
+	return out
+}
+
 func sideModel(cfg agent.Config, id int64, name string) sidequestion.Model {
 	b, _ := json.Marshal([]any{cfg.Format, cfg.BaseURL, cfg.Model, cfg.ThinkingType, cfg.ReasoningEffort, cfg.Stream, cfg.MaxTokensField, cfg.SessionHeaderKey})
 	h := sha256.Sum256(b)
@@ -333,9 +390,9 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 			if modelErr != nil {
 				reason = modelErr.Error()
 			}
-			meta = map[string]any{"captured_at": snap.CapturedAt, "model": snap.Model, "available": modelErr == nil, "reason": reason}
+			meta = map[string]any{"captured_at": snap.CapturedAt, "model": sideModelWireOf(snap.Model), "available": modelErr == nil, "reason": reason}
 		}
-		writeJSON(w, 200, map[string]any{"items": items, "current": current, "next_cursor": next, "snapshot": meta})
+		writeJSON(w, 200, map[string]any{"items": sideExchangeWireOfSlice(items), "current": sideExchangeWireOf(current), "next_cursor": i64s(next), "snapshot": meta})
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
@@ -366,7 +423,7 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 			writeErr(w, 409, "同一请求 ID 不能用于不同问题")
 			return
 		}
-		writeJSON(w, 200, existing)
+		writeJSON(w, 200, sideExchangeWireOf(existing))
 		return
 	}
 	if snap == nil {
@@ -415,7 +472,7 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		s.side.mu.Unlock()
 		go s.runSide(ctx, cancel, *e, p, provider, *snap, agentQuestion)
 	}
-	writeJSON(w, 202, e)
+	writeJSON(w, 202, sideExchangeWireOf(e))
 }
 
 func (s *Server) runSide(ctx context.Context, cancel context.CancelFunc, e sidequestion.Exchange, parent sidequestion.Parent, provider llm.Provider, snapshot sidequestion.Snapshot, agentQuestion string) {
@@ -564,7 +621,7 @@ func (s *Server) sideEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if e.Sequence > seq {
-			b, _ := json.Marshal(e)
+			b, _ := json.Marshal(sideExchangeWireOf(e))
 			fmt.Fprintf(w, "id: %d\nevent: snapshot\ndata: %s\n\n", e.Sequence, b)
 			flusher.Flush()
 			seq = e.Sequence

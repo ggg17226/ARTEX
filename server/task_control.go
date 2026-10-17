@@ -22,7 +22,7 @@ type taskControlResult struct {
 }
 
 type intentControlResult struct {
-	ID      int64             `json:"id"`
+	ID      string            `json:"id"`
 	State   string            `json:"state"`
 	Deleted *db.IntentCleanup `json:"deleted,omitempty"`
 }
@@ -164,7 +164,7 @@ func intentSummaryOf(n *db.Node) string {
 }
 
 func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, action, reason, mode string) (intentControlResult, error) {
-	out := intentControlResult{ID: iid}
+	out := intentControlResult{ID: i64s(iid)}
 	node, err := t.Store.GetNode(iid)
 	if err != nil {
 		return out, err

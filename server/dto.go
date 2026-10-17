@@ -475,7 +475,7 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 // ---- Activity (frontend "Activity") ----
 
 type ActivityDTO struct {
-	Seq          int64           `json:"seq"`                 // db Activity.ID
+	Seq          string          `json:"seq"`                 // db Activity.ID（P03：BIGINT 主键别名，wire 一律 string）
 	IntentID     string          `json:"intent_id,omitempty"` // db NodeID
 	Worker       string          `json:"worker"`
 	TS           string          `json:"ts"` // db CreatedAt
@@ -502,7 +502,7 @@ func activityDTO(a db.Activity) ActivityDTO {
 		intent = i64s(*a.NodeID)
 	}
 	d := ActivityDTO{
-		Seq:              a.ID,
+		Seq:              i64s(a.ID),
 		IntentID:         intent,
 		Worker:           a.Worker,
 		TS:               rfc3339(a.CreatedAt),

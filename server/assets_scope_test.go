@@ -167,11 +167,12 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 		rec := httptest.NewRecorder()
 		s.createCompany(rec, req)
 		var created struct {
-			ID    int64 `json:"id"`
-			Added int   `json:"scope_added"`
+			ID    string `json:"id"` // P03：企业 ID 对外 string
+			Added int    `json:"scope_added"`
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &created)
-		defer func() { _ = m.pg.Companies().DeleteCompany(created.ID) }()
+		companyID, _ := parseIDField(created.ID)
+		defer func() { _ = m.pg.Companies().DeleteCompany(companyID) }()
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}

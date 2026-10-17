@@ -158,7 +158,7 @@ func (s *Server) syncSSDatasource(w http.ResponseWriter, r *http.Request) {
 		_ = s.discoverAndCacheMCP(ctx, m)
 		cancel()
 	}
-	writeJSON(w, 200, map[string]any{"id": id, "enabled": m.Enabled})
+	writeJSON(w, 200, map[string]any{"id": i64s(id), "enabled": m.Enabled})
 }
 
 // ---------- GET /api/sync/scopesentry/projects ----------

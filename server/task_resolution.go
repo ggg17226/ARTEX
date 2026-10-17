@@ -8,20 +8,20 @@ import (
 )
 
 type taskLLMResolution struct {
-	ProfileID *int64 `json:"profile_id,omitempty"`
-	Name      string `json:"name"`
-	Format    string `json:"format"`
-	Model     string `json:"model"`
-	Source    string `json:"source"`
-	Available bool   `json:"available"`
-	Reason    string `json:"reason,omitempty"`
+	ProfileID *string `json:"profile_id,omitempty"`
+	Name      string  `json:"name"`
+	Format    string  `json:"format"`
+	Model     string  `json:"model"`
+	Source    string  `json:"source"`
+	Available bool    `json:"available"`
+	Reason    string  `json:"reason,omitempty"`
 }
 
 func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMResolution {
 	if p == nil {
 		return taskLLMResolution{Source: source, Reason: "LLM 配置不存在"}
 	}
-	id := p.ID
+	id := i64s(p.ID)
 	result := taskLLMResolution{
 		ProfileID: &id,
 		Name:      p.Name,

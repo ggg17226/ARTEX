@@ -130,7 +130,7 @@ func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{
-		"id":            id,
+		"id":            i64s(id),
 		"created":       true,
 		"scope_added":   added,
 		"scope_skipped": skipped,
@@ -528,7 +528,7 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 
 	type result struct {
 		Index int    `json:"index"`
-		ID    int64  `json:"id"`
+		ID    string `json:"id"`
 		Type  string `json:"type"`
 	}
 	type errEntry struct {
@@ -577,7 +577,7 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 		if taskID > 0 {
 			_ = as.SetTaskAssetSource(taskID, id, "api", "通过资产 API 登记", nil)
 		}
-		results = append(results, result{Index: i, ID: id, Type: a.Type})
+		results = append(results, result{Index: i, ID: i64s(id), Type: a.Type})
 	}
 	writeJSON(w, 200, map[string]any{"results": results, "errors": errs})
 }
