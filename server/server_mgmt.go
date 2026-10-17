@@ -346,6 +346,26 @@ func (s *Server) agentByKey(w http.ResponseWriter, r *http.Request) (*db.DB, *db
 	return pg, a, true
 }
 
+// agentConfigRequest 是 PUT /api/agents/{key}/config 的请求体。
+// 所有字段可选（指针 / RawMessage），部分提交（如 triggers 页只发 trigger_* 字段）
+// 不会把 max_turns/run_seconds 归零。
+// llm_profile_id 三态（P03：ID 对外一律 string）：
+//   - 字段缺省（RawMessage == nil）= 不动；
+//   - 显式 null = 解绑（跟随任务 / 全局）；
+//   - 字符串 ID（兼容历史数字写法）= 绑定该 profile，经 parseOptionalIDRaw 严格解析，
+//     0 / 负数 / 非数字 / >MaxInt64 一律 400，不得冒充 null。
+type agentConfigRequest struct {
+	MaxTurns         *int            `json:"max_turns"`
+	RunSeconds       *int            `json:"run_seconds"`
+	WebSearch        *bool           `json:"web_search"`
+	InteractiveShell *bool           `json:"interactive_shell"`
+	LLMProfileID     json.RawMessage `json:"llm_profile_id"`
+	// P3 触发后处理策略(三者一起可选,提供任一即整体写入;未提供则不动)。
+	TriggerRunMode     *string `json:"trigger_run_mode"`
+	TriggerMergeMode   *string `json:"trigger_merge_mode"`
+	TriggerMaxParallel *int    `json:"trigger_max_parallel"`
+}
+
 // pgSaveAgentConfig updates an agent's runtime config (currently max_turns) and
 // re-applies the live LLM so the change takes effect immediately.
 func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
@@ -353,30 +373,17 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// All fields optional (pointers) so a partial patch (e.g. the triggers tab sending
-	// only trigger_* fields) leaves the untouched settings alone instead of resetting
-	// max_turns/run_seconds to 0.
-	var req struct {
-		MaxTurns         *int  `json:"max_turns"`
-		RunSeconds       *int  `json:"run_seconds"`
-		WebSearch        *bool `json:"web_search"`
-		InteractiveShell *bool `json:"interactive_shell"`
-		// llm_profile_id 三态:字段缺省=不动;显式 null=解绑(跟随任务/全局);数字=绑定该 profile。
-		LLMProfileID json.RawMessage `json:"llm_profile_id"`
-		// P3 触发后处理策略(三者一起可选,提供任一即整体写入;未提供则不动)。
-		TriggerRunMode     *string `json:"trigger_run_mode"`
-		TriggerMergeMode   *string `json:"trigger_merge_mode"`
-		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
-	}
+	var req agentConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	profileChanged := false
-	if req.LLMProfileID != nil { // key present (数字 或 null)
-		var id *int64
-		if err := json.Unmarshal(req.LLMProfileID, &id); err != nil {
-			writeErr(w, 400, "llm_profile_id 格式错误")
+	if req.LLMProfileID != nil { // key present (字符串 ID、数字 或 null)
+		// null → (nil, nil) 解绑；"5" / 5 → 绑定；0、负数、非数字、越界 → 错误。
+		id, err := parseOptionalIDRaw(req.LLMProfileID)
+		if err != nil {
+			writeErr(w, 400, "llm_profile_id 格式错误: "+err.Error())
 			return
 		}
 		if id != nil { // 绑定:校验目标 profile 有效
@@ -714,20 +721,35 @@ func (s *Server) pgGetAgentVisibility(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"mcp": mcp, "skill": sk})
 }
 
+// agentVisibilityRequest 是 PUT /api/agents/{key}/visibility 的请求体。
+// P03：mcp 在 wire 上是 string ID 数组（64 位 ID 一律 string），逐项经 parseIDField
+// 严格解析后才转成内部 []int64；任一项非法即 400。skill 侧一直是名称字符串，不变。
+type agentVisibilityRequest struct {
+	MCP   []string `json:"mcp"`
+	Skill []string `json:"skill"`
+}
+
+// parsedMCP 把 wire 的 string MCP ID 列表解析为内部 []int64（未提供 → nil）。
+func (q agentVisibilityRequest) parsedMCP() ([]int64, error) {
+	return parseIDListField(q.MCP)
+}
+
 func (s *Server) pgSetAgentVisibility(w http.ResponseWriter, r *http.Request) {
 	pg, a, ok := s.agentByKey(w, r)
 	if !ok {
 		return
 	}
-	var body struct {
-		MCP   []int64  `json:"mcp"`
-		Skill []string `json:"skill"`
-	}
+	var body agentVisibilityRequest
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.SetAgentVisibilityKind(a.ID, "mcp", body.MCP); err != nil {
+	mcpIDs, err := body.parsedMCP()
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := pg.SetAgentVisibilityKind(a.ID, "mcp", mcpIDs); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -860,16 +882,34 @@ func (s *Server) pgListMCP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"servers": ms})
 }
 
+// saveMCPRequest 是 POST /api/mcp 的请求体：整体沿用 db.MCPServer，只把 id 换成
+// RawMessage（P03：id 对外是 string；0 / 未提供 = 新建，>0 = 更新）。外层同名字段按
+// Go encoding/json 的浅层优先规则屏蔽 db.MCPServer.ID 的 int64 解码，
+// 与 pgSaveProfile 的 db.LLMProfile + ID 同一模式。
+type saveMCPRequest struct {
+	db.MCPServer
+	ID json.RawMessage `json:"id"`
+}
+
 func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	var m db.MCPServer
-	if err := decode(r, &m); err != nil {
+	var body saveMCPRequest
+	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// parseProfileSaveID 是 save 类请求共用的「新建 0 / 编辑 >0」ID helper：
+	// ""、null、"0"、0 → 0（新建）；"12" / 12 → 12；负数、小数、非数字、越界 → 400。
+	mcpID, err := parseProfileSaveID(body.ID)
+	if err != nil {
+		writeErr(w, 400, "id 无效: "+err.Error())
+		return
+	}
+	m := body.MCPServer
+	m.ID = mcpID
 	isNew := m.ID == 0
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
@@ -1754,22 +1794,37 @@ func (s *Server) pgResourceVisibility(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"agents": idStrings(agents)})
 }
 
+// toggleVisibilityRequest 是 POST /api/visibility/toggle 的请求体。
+// P03：agent_id 与 resource_id 在 wire 上都是 string（64 位 ID 一律 string），
+// 经 parseIDField 严格解析（1..MaxInt64）；0 / 负数 / 非数字 / 越界一律 400。
+type toggleVisibilityRequest struct {
+	AgentID    string `json:"agent_id"`
+	Kind       string `json:"kind"`
+	ResourceID string `json:"resource_id"`
+	Visible    bool   `json:"visible"`
+}
+
 func (s *Server) pgToggleVisibility(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	var body struct {
-		AgentID    int64  `json:"agent_id,string"`
-		Kind       string `json:"kind"`
-		ResourceID int64  `json:"resource_id"`
-		Visible    bool   `json:"visible"`
-	}
+	var body toggleVisibilityRequest
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.ToggleVisibility(body.AgentID, body.Kind, body.ResourceID, body.Visible); err != nil {
+	agentID, err := parseIDField(body.AgentID)
+	if err != nil {
+		writeErr(w, 400, "agent_id "+err.Error())
+		return
+	}
+	resourceID, err := parseIDField(body.ResourceID)
+	if err != nil {
+		writeErr(w, 400, "resource_id "+err.Error())
+		return
+	}
+	if err := pg.ToggleVisibility(agentID, body.Kind, resourceID, body.Visible); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

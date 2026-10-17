@@ -417,15 +417,25 @@ func (s *Server) assetCounts(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/assets
 // =====================================================================
 
+// deleteAssetsRequest 是 DELETE /api/assets 的请求体。
+// P03：ids 在 wire 上是 string 数组（64 位 ID 一律 string），逐项经 parseIDField
+// 严格解析后才转成内部 []int64；任一项非法即 400。
+type deleteAssetsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// parsedIDs 把 wire 的 string ID 列表解析为内部 []int64。
+func (q deleteAssetsRequest) parsedIDs() ([]int64, error) {
+	return parseIDListField(q.IDs)
+}
+
 func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 	as := s.assetStore()
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
-	var req struct {
-		IDs []int64 `json:"ids"`
-	}
+	var req deleteAssetsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
@@ -434,7 +444,12 @@ func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "ids required")
 		return
 	}
-	deleted, err := as.DeleteByIDs(req.IDs)
+	ids, err := req.parsedIDs()
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	deleted, err := as.DeleteByIDs(ids)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -446,50 +461,68 @@ func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 // POST /api/assets
 // =====================================================================
 
+// insertAssetInput 是 POST /api/assets 单条资产的入参（wire 形状与前端/外部录入方一致）。
+type insertAssetInput struct {
+	Type string `json:"type"`
+	// root_domain / subdomain
+	Domain      string   `json:"domain"`
+	ICP         string   `json:"icp"`
+	RecordType  string   `json:"record_type"`
+	RecordValue []string `json:"record_value"`
+	// ip
+	IP           string           `json:"ip"`
+	BoundDomains []string         `json:"bound_domains"`
+	OpenPorts    []db.PortService `json:"open_ports"`
+	// app
+	AppName     string `json:"app_name"`
+	BundleID    string `json:"bundle_id"`
+	Category    string `json:"category"`
+	Description string `json:"description"`
+	AppICP      string `json:"app_icp"`
+	// service http
+	URL           string           `json:"url"`
+	Technologies  []string         `json:"technologies"`
+	StatusCode    *int             `json:"status_code"`
+	ContentLength *int64           `json:"content_length"`
+	PageTitle     string           `json:"page_title"`
+	FaviconMMH3   string           `json:"favicon_mmh3"`
+	Auth          []map[string]any `json:"auth"`
+	ServiceIP     string           `json:"service_ip"`
+	// service other
+	Port        int    `json:"port"`
+	ServiceName string `json:"service_name"`
+	// endpoint
+	Method string           `json:"method"`
+	Params []map[string]any `json:"params"`
+}
+
+// insertAssetsRequest 是 POST /api/assets 的请求体。
+// P03：task_id 在 wire 上是 string（64 位 ID 一律 string）；未提供或 "0" 保持
+// 「不绑定任务」的 0 哨兵语义，其余经 parseIDField 严格解析后才是内部 int64。
+type insertAssetsRequest struct {
+	TaskID string             `json:"task_id"`
+	Assets []insertAssetInput `json:"assets"`
+}
+
+// parsedTaskID 把 wire 的 string task_id 解析为内部 int64（""/"0" → 0）。
+func (q insertAssetsRequest) parsedTaskID() (int64, error) {
+	return parseOptionalIDString(q.TaskID)
+}
+
 func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 	as := s.assetStore()
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
-	var req struct {
-		TaskID int64 `json:"task_id"`
-		Assets []struct {
-			Type string `json:"type"`
-			// root_domain / subdomain
-			Domain      string   `json:"domain"`
-			ICP         string   `json:"icp"`
-			RecordType  string   `json:"record_type"`
-			RecordValue []string `json:"record_value"`
-			// ip
-			IP           string           `json:"ip"`
-			BoundDomains []string         `json:"bound_domains"`
-			OpenPorts    []db.PortService `json:"open_ports"`
-			// app
-			AppName     string `json:"app_name"`
-			BundleID    string `json:"bundle_id"`
-			Category    string `json:"category"`
-			Description string `json:"description"`
-			AppICP      string `json:"app_icp"`
-			// service http
-			URL           string           `json:"url"`
-			Technologies  []string         `json:"technologies"`
-			StatusCode    *int             `json:"status_code"`
-			ContentLength *int64           `json:"content_length"`
-			PageTitle     string           `json:"page_title"`
-			FaviconMMH3   string           `json:"favicon_mmh3"`
-			Auth          []map[string]any `json:"auth"`
-			ServiceIP     string           `json:"service_ip"`
-			// service other
-			Port        int    `json:"port"`
-			ServiceName string `json:"service_name"`
-			// endpoint
-			Method string           `json:"method"`
-			Params []map[string]any `json:"params"`
-		} `json:"assets"`
-	}
+	var req insertAssetsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	taskID, err := req.parsedTaskID()
+	if err != nil {
+		writeErr(w, 400, "task_id "+err.Error())
 		return
 	}
 
@@ -510,29 +543,29 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 		var err error
 		switch a.Type {
 		case "root_domain":
-			id, err = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: a.Domain, ICP: a.ICP, TaskID: req.TaskID})
+			id, err = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: a.Domain, ICP: a.ICP, TaskID: taskID})
 		case "ip":
-			id, err = as.UpsertIP(db.UpsertIPReq{IP: a.IP, BoundDomains: a.BoundDomains, OpenPorts: a.OpenPorts, TaskID: req.TaskID})
+			id, err = as.UpsertIP(db.UpsertIPReq{IP: a.IP, BoundDomains: a.BoundDomains, OpenPorts: a.OpenPorts, TaskID: taskID})
 		case "subdomain":
-			id, err = as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: a.Domain, RecordType: a.RecordType, RecordValue: a.RecordValue, ICP: a.ICP, TaskID: req.TaskID})
+			id, err = as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: a.Domain, RecordType: a.RecordType, RecordValue: a.RecordValue, ICP: a.ICP, TaskID: taskID})
 		case "app":
-			id, err = as.UpsertApp(db.UpsertAppReq{Name: a.AppName, BundleID: a.BundleID, Category: a.Category, Description: a.Description, ICP: a.AppICP, TaskID: req.TaskID})
+			id, err = as.UpsertApp(db.UpsertAppReq{Name: a.AppName, BundleID: a.BundleID, Category: a.Category, Description: a.Description, ICP: a.AppICP, TaskID: taskID})
 		case "service":
 			if a.URL != "" {
 				svcIP := a.ServiceIP
 				if svcIP == "" {
 					svcIP = a.IP
 				}
-				id, err = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: a.URL, Technologies: a.Technologies, StatusCode: a.StatusCode, ContentLength: a.ContentLength, PageTitle: a.PageTitle, FaviconMMH3: a.FaviconMMH3, Auth: a.Auth, IP: svcIP, TaskID: req.TaskID})
+				id, err = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: a.URL, Technologies: a.Technologies, StatusCode: a.StatusCode, ContentLength: a.ContentLength, PageTitle: a.PageTitle, FaviconMMH3: a.FaviconMMH3, Auth: a.Auth, IP: svcIP, TaskID: taskID})
 			} else {
-				id, err = as.UpsertOtherService(db.UpsertOtherServiceReq{Domain: a.Domain, IP: a.IP, Port: a.Port, ServiceName: a.ServiceName, Auth: a.Auth, TaskID: req.TaskID})
+				id, err = as.UpsertOtherService(db.UpsertOtherServiceReq{Domain: a.Domain, IP: a.IP, Port: a.Port, ServiceName: a.ServiceName, Auth: a.Auth, TaskID: taskID})
 			}
 		case "endpoint":
 			svcIP := a.ServiceIP
 			if svcIP == "" {
 				svcIP = a.IP
 			}
-			id, err = as.UpsertEndpoint(db.UpsertEndpointReq{URL: a.URL, Method: a.Method, Params: a.Params, IP: svcIP, TaskID: req.TaskID})
+			id, err = as.UpsertEndpoint(db.UpsertEndpointReq{URL: a.URL, Method: a.Method, Params: a.Params, IP: svcIP, TaskID: taskID})
 		default:
 			errs = append(errs, errEntry{Index: i, Error: "unknown type: " + a.Type})
 			continue
@@ -541,8 +574,8 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, errEntry{Index: i, Error: err.Error()})
 			continue
 		}
-		if req.TaskID > 0 {
-			_ = as.SetTaskAssetSource(req.TaskID, id, "api", "通过资产 API 登记", nil)
+		if taskID > 0 {
+			_ = as.SetTaskAssetSource(taskID, id, "api", "通过资产 API 登记", nil)
 		}
 		results = append(results, result{Index: i, ID: id, Type: a.Type})
 	}

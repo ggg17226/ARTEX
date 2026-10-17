@@ -701,6 +701,35 @@ func parseIDFieldLenient(s string) *int64 {
 	return &v
 }
 
+// parseIDListField 严格解析请求体里的 64 位 ID 字符串数组（P03：ID 对外一律 string）。
+// 逐项经 parseIDField 校验（1..math.MaxInt64）；任一项非法即整体返回错误，调用方回 400。
+// 未提供 / 空数组返回 nil，「未指定」语义由调用方决定。
+func parseIDListField(in []string) ([]int64, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]int64, 0, len(in))
+	for i, raw := range in {
+		v, err := parseIDField(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("ids[%d]: %w", i, err)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// parseOptionalIDString 解析请求体里可选的 string ID：未提供（""）与 "0" 保持 0 哨兵
+// 语义（如 insertAssets 的 task_id=0 表示不绑定任务，逐端点保留，不是全局放宽）；
+// 其余经 parseIDField 严格解析（1..math.MaxInt64），非数字/负数/越界返回错误。
+func parseOptionalIDString(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	return parseIDField(s)
+}
+
 // parseRequiredIDRaw 严格解析必填的 ID（支持 string 或 number 兼容格式）。
 // 必须为 1..math.MaxInt64 正整数。未提供、null、空串、0、负数、小数、非数字、越界均报错。
 func parseRequiredIDRaw(raw json.RawMessage) (int64, error) {
