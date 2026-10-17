@@ -471,9 +471,9 @@ func (s *Server) notifyListDeliveries(w http.ResponseWriter, r *http.Request) {
 		State:     r.URL.Query().Get("state"),
 		EventKind: r.URL.Query().Get("event_kind"),
 	}
-	if v := r.URL.Query().Get("channel_id"); v != "" {
-		f.ChannelID = int64(atoiDefault(v, 0))
-	}
+	// P03 §2.3 / E10：channel_id 是可选过滤器 → 显式 64 位 lenient 解析
+	// （非法 / 溢出 = 不过滤），不再经 int 宽度的 atoiDefault 耦合平台位宽。
+	f.ChannelID = queryFilterID(r.URL.Query().Get("channel_id"))
 	page := queryInt(r, "page", 1)
 	pageSize := queryInt(r, "page_size", 50)
 	items, total, err := pg.ListNotificationDeliveries(r.Context(), f, page, pageSize)

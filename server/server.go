@@ -1200,7 +1200,8 @@ func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	iid, err := strconv.ParseInt(r.PathValue("iid"), 10, 64)
+	// P03 E09：intent 是实体 ID，严格 1..MaxInt64（原来只查 err，0 / 负数会进 store）。
+	iid, err := parseIDField(r.PathValue("iid"))
 	if err != nil {
 		writeErr(w, 400, "bad intent id")
 		return
@@ -1828,8 +1829,10 @@ func (s *Server) taskAssetRefs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	assetID, _ := strconv.ParseInt(r.URL.Query().Get("asset_id"), 10, 64)
-	if assetID <= 0 {
+	// P03 E10：asset_id 是必填实体 ID → 严格解析（原来忽略 ParseInt error，
+	// >MaxInt64 会被截成 MaxInt64 并通过 >0 检查进入 store）。
+	assetID, err := parseIDField(r.URL.Query().Get("asset_id"))
+	if err != nil {
 		writeErr(w, 400, "需要 asset_id")
 		return
 	}
@@ -1917,7 +1920,8 @@ func (s *Server) taskScopeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	scopeID, err := strconv.ParseInt(r.PathValue("sid"), 10, 64)
+	// P03 E09：task_scope 行 ID 是实体 ID，严格 1..MaxInt64。
+	scopeID, err := parseIDField(r.PathValue("sid"))
 	if err != nil {
 		writeErr(w, 400, "invalid scope id")
 		return
@@ -2092,8 +2096,11 @@ func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
 // getFinding returns one finding by its standalone-table id (DTO finding_id),
 // with anchored assets resolved for display.
 func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
-	id := int64(atoiDefault(r.PathValue("id"), 0))
-	if id <= 0 {
+	// P03 §2.3 / E09：finding 是实体 ID → 显式 64 位严格解析（1..MaxInt64）。
+	// 旧的 int64(atoiDefault(...)) 在 32 位构建上会截断高 32 位，>MaxInt64 也只会
+	// 变成 0 而不是被拒绝。
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
@@ -2253,8 +2260,11 @@ func findingProvenanceInTask(contextTask *Task, findingTaskID *int64) (sourceTas
 // the detail page can show "how this finding was reached". Empty {nodes,edges}
 // when the finding has no node/task (e.g. the originating task was deleted).
 func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
-	id := int64(atoiDefault(r.PathValue("id"), 0))
-	if id <= 0 {
+	// P03 §2.3 / E09：finding 是实体 ID → 显式 64 位严格解析（1..MaxInt64）。
+	// 旧的 int64(atoiDefault(...)) 在 32 位构建上会截断高 32 位，>MaxInt64 也只会
+	// 变成 0 而不是被拒绝。
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
@@ -2290,8 +2300,11 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 // mirrored onto the originating exploration node so the per-task view stays in
 // sync. Returns the updated finding DTO.
 func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
-	id := int64(atoiDefault(r.PathValue("id"), 0))
-	if id <= 0 {
+	// P03 §2.3 / E09：finding 是实体 ID → 显式 64 位严格解析（1..MaxInt64）。
+	// 旧的 int64(atoiDefault(...)) 在 32 位构建上会截断高 32 位，>MaxInt64 也只会
+	// 变成 0 而不是被拒绝。
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
@@ -2382,8 +2395,11 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 // deleteFinding removes a finding (findings row + originating exploration node).
 // id is the standalone findings-table id (DTO finding_id).
 func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
-	id := int64(atoiDefault(r.PathValue("id"), 0))
-	if id <= 0 {
+	// P03 §2.3 / E09：finding 是实体 ID → 显式 64 位严格解析（1..MaxInt64）。
+	// 旧的 int64(atoiDefault(...)) 在 32 位构建上会截断高 32 位，>MaxInt64 也只会
+	// 变成 0 而不是被拒绝。
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
@@ -2424,7 +2440,13 @@ func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
 	// worker session list can reach past the old fixed 300 boundary on scroll. It
 	// also includes immutable intent results from directly related tasks; those
 	// rows never participate in this task's frontier or claim path.
-	before := int64(atoiDefault(q.Get("before"), 0))
+	// P03 E10 / §2.3：?before= 是 intent 节点主键游标（BIGINT ID，不是页码），
+	// 用 cursor helper：""/"0" = 最新一页，非法 / 溢出 → 400。
+	before, err := parseCursorID(q.Get("before"))
+	if err != nil {
+		writeErr(w, 400, "bad before")
+		return
+	}
 	in, hasMore, err := taskIntentHistoryPage(t.Store, before, limit, false, 0)
 	if err != nil {
 		log.Printf("[intents] task=%s before=%d limit=%d: %v", t.ID, before, limit, err)
@@ -2679,19 +2701,18 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"items": []any{}, "cursor": "0"})
 		return
 	}
-	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
-	limit := atoiDefault(r.URL.Query().Get("limit"), 300)
-	var intentPtr *int64
-	if iv := r.URL.Query().Get("intent"); iv != "" {
-		if n, err := strconv.ParseInt(iv, 10, 64); err == nil {
-			intentPtr = &n
-		}
+	// P03 E10 / §2.3：since 是 activity_logs 主键游标（BIGINT ID，不是页码）：
+	// ""/"0" = 从头，非法 / 溢出 → 400（旧 atoiDefault 会把非数字静默当 0、
+	// 把 >MaxInt64 截成 MaxInt64）。intent 过滤器保持 lenient：0 / 非法 = 不过滤。
+	since, err := parseCursorID(r.URL.Query().Get("since"))
+	if err != nil {
+		writeErr(w, 400, "bad since")
+		return
 	}
-	var (
-		items  []db.Activity
-		cursor int64
-		err    error
-	)
+	limit := atoiDefault(r.URL.Query().Get("limit"), 300)
+	intentPtr := parseIDFieldLenient(r.URL.Query().Get("intent"))
+	var items []db.Activity
+	var cursor int64
 	if intentPtr != nil {
 		items, cursor, err = t.Store.ActivityListWithSources(*intentPtr, since, limit)
 	} else {
@@ -2722,7 +2743,10 @@ func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 	case sess == "plan":
 		return db.ActivitySessionFilter{Worker: "planner"}, true
 	case strings.HasPrefix(sess, "intent:"):
-		id, err := strconv.ParseInt(strings.TrimPrefix(sess, "intent:"), 10, 64)
+		// P03 E09/E10：session 里嵌的是 intent 实体 ID → 严格 1..MaxInt64。
+		// 原来只查 err，"intent:0" / "intent:-1" 会带着 0 / 负数去查 store。
+		// main:<seg> 的分段编号是内存序号，不是 64 位实体 ID，保持 Atoi 不变。
+		id, err := parseIDField(strings.TrimPrefix(sess, "intent:"))
 		if err != nil {
 			return db.ActivitySessionFilter{}, false
 		}
@@ -2789,7 +2813,13 @@ func (s *Server) activityHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		filter.MainSeg = &seg
 	}
-	before := int64(atoiDefault(q.Get("before"), 0))
+	// P03 E10 / §2.3：?before= 是 activity_logs 主键游标（BIGINT ID，不是页码）：
+	// ""/"0" = 最新一页，非法 / 溢出 → 400。
+	before, err := parseCursorID(q.Get("before"))
+	if err != nil {
+		writeErr(w, 400, "bad before")
+		return
+	}
 	limit := min(atoiDefault(q.Get("limit"), 200), 500) // cap so one request can't pull an unbounded slice
 	store, sourceTaskID, err := activitySessionStore(t, filter)
 	if err != nil {
@@ -2925,16 +2955,20 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"items": []any{}, "has_more": false})
 		return
 	}
-	before := int64(atoiDefault(r.URL.Query().Get("before"), 0))
+	// P03 E10 / §2.3：?before= 是 server_logs.id（BIGINT 主键游标，不是页码）：
+	// ""/"0" = 最新一页，非法 / 溢出 → 400。注意上面的 getLogs / streamLogs 的
+	// ?since= 是 logSink 的**内存 counter**（R1 §5.3），不是 64 位实体 ID，保持不变。
+	before, err := parseCursorID(r.URL.Query().Get("before"))
+	if err != nil {
+		writeErr(w, 400, "bad before")
+		return
+	}
 	limit := atoiDefault(r.URL.Query().Get("limit"), 200)
 	if limit > 500 {
 		limit = 500
 	}
 	// If no before given, return the most recent DB rows (mirrors ring restore).
-	var (
-		rows []*db.DBLog
-		err  error
-	)
+	var rows []*db.DBLog
 	if before <= 0 {
 		rows, err = s.m.pg.RecentLogs(limit)
 	} else {
@@ -3021,19 +3055,25 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "streaming unsupported")
 		return
 	}
-	var intentPtr *int64
-	if iv := r.URL.Query().Get("intent"); iv != "" {
-		if n, err := strconv.ParseInt(iv, 10, 64); err == nil {
-			intentPtr = &n
-		}
-	}
+	// P03 E10：intent 是可选过滤器 → lenient（非法 / 0 / 溢出 = 不按 intent 过滤），
+	// 不再让 ParseInt 溢出把过滤器变成 MaxInt64。
+	intentPtr := parseIDFieldLenient(r.URL.Query().Get("intent"))
 	// Cursor precedence: the browser's automatic reconnect sends Last-Event-ID (the
 	// last id it received) — trust it over the query so an auto-reconnect resumes
 	// exactly where it dropped. A fresh/manual connect has no header and passes
 	// since=<snapshot_cursor> from the history page instead.
-	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
+	//
+	// P03 E10：?since= 是 activity_logs 主键游标 → 非法 / 溢出直接 400（在写 SSE 头之前）。
+	// Last-Event-ID 例外：**故意保持 lenient**——该头由浏览器在自动重连时回显，
+	// 值可能是旧版本 / 其它来源的 id；解析失败时按「无 cursor」处理（沿用 ?since=），
+	// 让重连退化成「从 since 起重放」而不是整条流失败，宁可重复也不能断流。
+	since, err := parseCursorID(r.URL.Query().Get("since"))
+	if err != nil {
+		writeErr(w, 400, "bad since")
+		return
+	}
 	if le := r.Header.Get("Last-Event-ID"); le != "" {
-		if n, err := strconv.ParseInt(le, 10, 64); err == nil {
+		if n, cursorErr := parseCursorID(le); cursorErr == nil {
 			since = n
 		}
 	}
@@ -3115,7 +3155,13 @@ func (s *Server) activityDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "no task")
 		return
 	}
-	seq, _ := strconv.ParseInt(r.PathValue("seq"), 10, 64)
+	// P03 E09：seq 是 activity_logs 主键（实体 ID 别名）。原来**完全忽略** ParseInt
+	// error，"abc"/"0"/"-1" 都会变成 0 去查 store；现在严格 1..MaxInt64 → 否则 400。
+	seq, ok := pathInt(r, "seq")
+	if !ok {
+		writeErr(w, 400, "bad seq")
+		return
+	}
 	d, err := taskActivityDetail(t, seq)
 	if err != nil {
 		writeErr(w, 500, err.Error())

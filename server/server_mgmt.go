@@ -73,9 +73,24 @@ func (s *Server) pg(w http.ResponseWriter) *db.DB {
 	return s.m.pg
 }
 
+// pathInt 解析路径参数里的 64 位实体 ID（P03 E08）。
+//
+// 全部 39 个调用点都是实体 / DB 主键语义（task / company / rule / asset / retest /
+// trigger / category / template / notify channel & delivery / archive / MCP /
+// agent 资源可见性 / conversation id / conversation_activities 主键 seq），没有
+// 分页页码、内存计数或端口之类的非实体用途，因此这里统一走 parseIDField 严格语义：
+// 只接受 1..MaxInt64 的十进制正整数；空串 / 0 / 负数 / 小数 / 非数字 / >MaxInt64
+// 一律返回 false，调用方回 400（入口校验先于实体查找，不再让 0 或负数进 store）。
+//
+// 非实体入参不走本函数：分页 page/size/limit/offset、端口、内存日志 seq、
+// main segment 保持原解析；DB 主键游标（?since= / ?before=）用 parseCursorID，
+// 因为它要保留 "0" 哨兵。
 func pathInt(r *http.Request, name string) (int64, bool) {
-	n, err := strconv.ParseInt(r.PathValue(name), 10, 64)
-	return n, err == nil
+	n, err := parseIDField(r.PathValue(name))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
@@ -954,7 +969,11 @@ func (s *Server) pgRefreshMCP(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	id, _ := pathInt(r, "id")
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "bad mcp id")
+		return
+	}
 	all, err := pg.ListMCP()
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -987,7 +1006,11 @@ func (s *Server) pgMCPTools(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	id, _ := pathInt(r, "id")
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "bad mcp id")
+		return
+	}
 	tools, err := pg.MCPToolsDetailed(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -1757,21 +1780,32 @@ func (s *Server) pgSkillVisibility(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"agents": idStrings(agents)})
 }
 
+// toggleSkillVisibilityRequest 是 POST /api/visibility/skill/toggle 的请求体。
+// P03 R20 M-2：agent_id 在 wire 上仍是 string（前端传字符串 ID），但必须经
+// parseIDField 严格校验 1..MaxInt64；"0" / "-1" / 非数字 / 越界一律 400，
+// 不再把 0 或负数直接送进 ToggleSkillVisibility（与同批 E06 toggleVisibilityRequest 对齐）。
+type toggleSkillVisibilityRequest struct {
+	AgentID   string `json:"agent_id"`
+	SkillName string `json:"skill_name"`
+	Visible   bool   `json:"visible"`
+}
+
 func (s *Server) pgToggleSkillVisibility(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	var body struct {
-		AgentID   int64  `json:"agent_id,string"`
-		SkillName string `json:"skill_name"`
-		Visible   bool   `json:"visible"`
-	}
+	var body toggleSkillVisibilityRequest
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := pg.ToggleSkillVisibility(body.AgentID, body.SkillName, body.Visible); err != nil {
+	agentID, err := parseIDField(body.AgentID)
+	if err != nil {
+		writeErr(w, 400, "agent_id "+err.Error())
+		return
+	}
+	if err := pg.ToggleSkillVisibility(agentID, body.SkillName, body.Visible); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -1785,7 +1819,11 @@ func (s *Server) pgResourceVisibility(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	id, _ := pathInt(r, "id")
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "bad resource id")
+		return
+	}
 	agents, err := pg.ResourceAgents(r.PathValue("kind"), id)
 	if err != nil {
 		writeErr(w, 500, err.Error())

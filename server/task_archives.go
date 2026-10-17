@@ -50,11 +50,21 @@ type taskArchiveWire struct {
 
 // taskArchivePageWire 覆盖 TaskArchivePage.Items（逐项转换）；total / page / size
 // 是分页计数，保持 number。
+//
+// R23 M-3：改为**嵌入 pgdb.TaskArchivePage** + 外层同名 Items 字段屏蔽（与
+// taskArchiveWire / assetWire 的「浅层优先」模式一致）。之前逐字段重建 4 个字段，
+// 以后 TaskArchivePage 新增字段会被静默丢弃；嵌入后 total/page/size 及未来字段
+// 自动跟随，只有 Items 需要显式覆盖。
 type taskArchivePageWire struct {
+	pgdb.TaskArchivePage
 	Items []taskArchiveWire `json:"items"`
-	Total int               `json:"total"`
-	Page  int               `json:"page"`
-	Size  int               `json:"size"`
+}
+
+// taskArchivePageDTO 把分页结果转成 wire 形状（分页计数字段原样保留）。
+func taskArchivePageDTO(page pgdb.TaskArchivePage) taskArchivePageWire {
+	out := taskArchivePageWire{TaskArchivePage: page}
+	out.Items = taskArchiveWires(page.Items)
+	return out
 }
 
 // taskArchiveDTO 转换单条归档；nil 原样返回 nil（调用方已保证非 nil 时才有输出）。
@@ -79,16 +89,6 @@ func taskArchiveWires(items []pgdb.TaskArchive) []taskArchiveWire {
 		})
 	}
 	return out
-}
-
-// taskArchivePageDTO 把分页结果转成 wire 形状（分页计数字段原样保留）。
-func taskArchivePageDTO(page pgdb.TaskArchivePage) taskArchivePageWire {
-	return taskArchivePageWire{
-		Items: taskArchiveWires(page.Items),
-		Total: page.Total,
-		Page:  page.Page,
-		Size:  page.Size,
-	}
 }
 
 func (s *Server) startTaskArchiveWorker() {

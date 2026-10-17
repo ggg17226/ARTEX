@@ -8,7 +8,14 @@ package server
 //   1. string 形式的 ID（含 >2^53 的大 ID）能解码并解析成内部 int64；
 //   2. 非法字符串（"0"、"-1"、"abc"、""、小数、>MaxInt64）解析报错，handler 据此回 400；
 //   3. llm_profile_id 三态（缺省 / null / 字符串 ID）互不混淆。
-// 每个用例都同时断言「数字写法不再被接受」，把 P03 的 string-only 契约钉住。
+// 数字兼容的过渡口径（R20 M-1 修正，原文声称「每个用例都断言数字写法不再被接受」，
+// 对 E04/E07 不成立）：
+//   - E01 / E02 / E03 / E05 / E06 是 **string-only**：JSON number 解码即失败，用例显式钉住；
+//   - E04（POST /api/mcp 的 save-ID）与 E07（agent 的 llm_profile_id）走
+//     parseProfileSaveID / parseOptionalIDRaw，**过渡期仍接受 string|number**。
+//     这不是松懈：它们的输出侧（MCPServer.ID、profile ID）在 W4b-2 之前仍以数字上线，
+//     前端回传的就是 number；先切 string-only 会把可用的编辑流程打成 400。
+//     待输出侧全量 string 化（W4b-2 已落地）后，才可在后续批次收紧这两处。
 
 import (
 	"encoding/json"
@@ -19,11 +26,11 @@ import (
 
 func TestParseIDListField(t *testing.T) {
 	t.Run("string ids incl. big id", func(t *testing.T) {
-		got, err := parseIDListField([]string{"1", "9007199254740992", "9223372036854775807"})
+		got, err := parseIDListField([]string{"1", "9007199254740993", "9223372036854775807"})
 		if err != nil {
 			t.Fatalf("want ok, got %v", err)
 		}
-		want := []int64{1, 9007199254740992, math.MaxInt64}
+		want := []int64{1, 9007199254740993, math.MaxInt64}
 		if len(got) != len(want) {
 			t.Fatalf("got %v want %v", got, want)
 		}
@@ -71,7 +78,7 @@ func TestParseOptionalIDStringKeepsZeroSentinel(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
 		want int64
-	}{{"1", 1}, {"9007199254740992", 9007199254740992}, {"9223372036854775807", math.MaxInt64}} {
+	}{{"1", 1}, {"9007199254740993", 9007199254740993}, {"9223372036854775807", math.MaxInt64}} {
 		if v, err := parseOptionalIDString(tc.in); err != nil || v != tc.want {
 			t.Fatalf("parseOptionalIDString(%q) = %d, %v; want %d", tc.in, v, err, tc.want)
 		}
@@ -86,15 +93,16 @@ func TestParseOptionalIDStringKeepsZeroSentinel(t *testing.T) {
 // --- POST /api/tasks/{id}/assets (E01) ---
 
 func TestAttachTaskAssetsRequestAcceptsStringAssetIDs(t *testing.T) {
+	// R20 M-3：大 ID 用 2^53+1 与 MaxInt64（2^53 本身 float64 可精确表示，不能单独作 >2^53 证据）。
 	var req attachTaskAssetsRequest
-	if err := json.Unmarshal([]byte(`{"asset_ids":["1","9007199254740992"],"source_summary":" s "}`), &req); err != nil {
+	if err := json.Unmarshal([]byte(`{"asset_ids":["1","9007199254740993","9223372036854775807"],"source_summary":" s "}`), &req); err != nil {
 		t.Fatalf("string asset_ids must decode: %v", err)
 	}
 	ids, err := req.assetIDs()
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(ids) != 2 || ids[0] != 1 || ids[1] != 9007199254740992 {
+	if len(ids) != 3 || ids[0] != 1 || ids[1] != 9007199254740993 || ids[2] != math.MaxInt64 {
 		t.Fatalf("got %v", ids)
 	}
 }
@@ -134,15 +142,16 @@ func TestAttachTaskAssetsRequestRejectsBadAssetIDs(t *testing.T) {
 // --- DELETE /api/assets (E02) ---
 
 func TestDeleteAssetsRequestAcceptsStringIDs(t *testing.T) {
+	// R20 M-3：补 2^53+1 与 MaxInt64。
 	var req deleteAssetsRequest
-	if err := json.Unmarshal([]byte(`{"ids":["1","9007199254740992"]}`), &req); err != nil {
+	if err := json.Unmarshal([]byte(`{"ids":["1","9007199254740993","9223372036854775807"]}`), &req); err != nil {
 		t.Fatalf("string ids must decode: %v", err)
 	}
 	ids, err := req.parsedIDs()
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(ids) != 2 || ids[1] != 9007199254740992 {
+	if len(ids) != 3 || ids[1] != 9007199254740993 || ids[2] != math.MaxInt64 {
 		t.Fatalf("got %v", ids)
 	}
 }
@@ -167,16 +176,20 @@ func TestDeleteAssetsRequestRejectsBadIDs(t *testing.T) {
 
 func TestInsertAssetsRequestTaskID(t *testing.T) {
 	t.Run("string task id", func(t *testing.T) {
-		var req insertAssetsRequest
-		if err := json.Unmarshal([]byte(`{"task_id":"9007199254740992","assets":[{"type":"ip","ip":"1.2.3.4"}]}`), &req); err != nil {
-			t.Fatalf("string task_id must decode: %v", err)
-		}
-		id, err := req.parsedTaskID()
-		if err != nil || id != 9007199254740992 {
-			t.Fatalf("got %d, %v", id, err)
-		}
-		if len(req.Assets) != 1 || req.Assets[0].IP != "1.2.3.4" {
-			t.Fatalf("assets lost: %+v", req.Assets)
+		// R20 M-3：2^53+1 与 MaxInt64 各测一次（2^53 本身不算 >2^53 证据）。
+		for _, want := range []int64{9007199254740993, math.MaxInt64} {
+			var req insertAssetsRequest
+			body := `{"task_id":"` + i64s(want) + `","assets":[{"type":"ip","ip":"1.2.3.4"}]}`
+			if err := json.Unmarshal([]byte(body), &req); err != nil {
+				t.Fatalf("string task_id must decode: %v", err)
+			}
+			id, err := req.parsedTaskID()
+			if err != nil || id != want {
+				t.Fatalf("got %d, %v", id, err)
+			}
+			if len(req.Assets) != 1 || req.Assets[0].IP != "1.2.3.4" {
+				t.Fatalf("assets lost: %+v", req.Assets)
+			}
 		}
 	})
 	t.Run("absent and zero keep the no-task sentinel", func(t *testing.T) {
@@ -240,7 +253,7 @@ func TestAgentConfigRequestLLMProfileIDTriState(t *testing.T) {
 			want int64
 		}{
 			{`{"llm_profile_id":"5"}`, 5},
-			{`{"llm_profile_id":"9007199254740992"}`, 9007199254740992},
+			{`{"llm_profile_id":"9007199254740993"}`, 9007199254740993}, // 2^53+1（R20 M-3）
 			{`{"llm_profile_id":"9223372036854775807"}`, math.MaxInt64},
 			{`{"llm_profile_id":5}`, 5}, // 历史数字写法仍兼容
 		} {
@@ -280,15 +293,16 @@ func TestAgentConfigRequestLLMProfileIDTriState(t *testing.T) {
 // --- PUT /api/agents/{key}/visibility (E05) ---
 
 func TestAgentVisibilityRequestAcceptsStringMCPIDs(t *testing.T) {
+	// R20 M-3：补 2^53+1 与 MaxInt64。
 	var req agentVisibilityRequest
-	if err := json.Unmarshal([]byte(`{"mcp":["1","9007199254740992"],"skill":["nmap"]}`), &req); err != nil {
+	if err := json.Unmarshal([]byte(`{"mcp":["1","9007199254740993","9223372036854775807"],"skill":["nmap"]}`), &req); err != nil {
 		t.Fatalf("string mcp ids must decode: %v", err)
 	}
 	ids, err := req.parsedMCP()
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(ids) != 2 || ids[1] != 9007199254740992 {
+	if len(ids) != 3 || ids[1] != 9007199254740993 || ids[2] != math.MaxInt64 {
 		t.Fatalf("got %v", ids)
 	}
 	if len(req.Skill) != 1 || req.Skill[0] != "nmap" {
@@ -329,21 +343,24 @@ func TestAgentVisibilityRequestRejectsBadMCPIDs(t *testing.T) {
 
 func TestToggleVisibilityRequestStringIDs(t *testing.T) {
 	t.Run("string ids", func(t *testing.T) {
-		var req toggleVisibilityRequest
-		body := `{"agent_id":"7","kind":"mcp","resource_id":"9007199254740992","visible":true}`
-		if err := json.Unmarshal([]byte(body), &req); err != nil {
-			t.Fatalf("string ids must decode: %v", err)
-		}
-		agentID, err := parseIDField(req.AgentID)
-		if err != nil || agentID != 7 {
-			t.Fatalf("agent_id: %d, %v", agentID, err)
-		}
-		resourceID, err := parseIDField(req.ResourceID)
-		if err != nil || resourceID != 9007199254740992 {
-			t.Fatalf("resource_id: %d, %v", resourceID, err)
-		}
-		if !req.Visible {
-			t.Fatal("visible lost")
+		// R20 M-3：resource_id 用 2^53+1 与 MaxInt64 各测一次。
+		for _, want := range []int64{9007199254740993, math.MaxInt64} {
+			var req toggleVisibilityRequest
+			body := `{"agent_id":"7","kind":"mcp","resource_id":"` + i64s(want) + `","visible":true}`
+			if err := json.Unmarshal([]byte(body), &req); err != nil {
+				t.Fatalf("string ids must decode: %v", err)
+			}
+			agentID, err := parseIDField(req.AgentID)
+			if err != nil || agentID != 7 {
+				t.Fatalf("agent_id: %d, %v", agentID, err)
+			}
+			resourceID, err := parseIDField(req.ResourceID)
+			if err != nil || resourceID != want {
+				t.Fatalf("resource_id: %d, %v", resourceID, err)
+			}
+			if !req.Visible {
+				t.Fatal("visible lost")
+			}
 		}
 	})
 	t.Run("invalid ids", func(t *testing.T) {

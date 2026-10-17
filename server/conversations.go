@@ -339,8 +339,16 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 
 	// Incremental tail: ?since=N returns steps after id N (ASC) — used by the live
 	// poll and the post-send fetch. A generous cap so a burst is never dropped.
+	//
+	// P03 E10：since/before 都是 conversation_activities 主键游标（BIGINT ID）：
+	// 未提供 / "0" 保留哨兵（从头 / 最新一页），非法 / 溢出 → 400。
+	// 原来忽略 ParseInt error，>MaxInt64 会变成 MaxInt64（=「什么都读不到」的空增量）。
 	if sv := q.Get("since"); sv != "" {
-		since, _ := strconv.ParseInt(sv, 10, 64)
+		since, err := parseCursorID(sv)
+		if err != nil {
+			writeErr(w, 400, "bad since")
+			return
+		}
 		items, cursor, err := pg.ConvActivityList(c.ID, since, max(limit, 1000))
 		if err != nil {
 			writeErr(w, 500, err.Error())
@@ -353,7 +361,11 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 	// History page (reverse pagination): no ?since → the latest page; ?before=N →
 	// the page of older steps ending before id N. hasMore lets the client stop
 	// loading earlier history once the top of the thread is reached.
-	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	before, err := parseCursorID(q.Get("before"))
+	if err != nil {
+		writeErr(w, 400, "bad before")
+		return
+	}
 	items, hasMore, err := pg.ConvActivityPage(c.ID, before, limit)
 	if err != nil {
 		writeErr(w, 500, err.Error())

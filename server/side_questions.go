@@ -367,7 +367,13 @@ func (s *Server) handleSideQuestions(w http.ResponseWriter, r *http.Request, p s
 		return
 	}
 	if r.Method == "GET" {
-		before, _ := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
+		// P03 E10：?before= 是旁路历史的主键游标（BIGINT ordinal）：未提供 / "0"
+		// = 最新一页，非法 / 溢出 → 400（原来忽略 ParseInt error，溢出会变 MaxInt64）。
+		before, err := parseCursorID(r.URL.Query().Get("before"))
+		if err != nil {
+			writeErr(w, 400, "bad before")
+			return
+		}
 		items, err := s.m.pg.SideHistory(r.Context(), key, before, 21)
 		if err != nil {
 			writeErr(w, 500, err.Error())

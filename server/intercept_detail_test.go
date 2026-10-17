@@ -81,12 +81,15 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE id=$1`, sourceID) })
 	sourceReply := do(http.MethodGet, fmt.Sprintf("/api/intercept/history/%d/execution", sourceID), "", true)
+	// P03 R05 / R23 I-1：execution 的 map 响应里 seq / conversation_id 都是 string
+	// （i64s / i64Ptr），必须按 string 解码；解成 int64 会在 W5 接库后报
+	// `cannot unmarshal string into Go value of type int64`。
 	var execution struct {
-		Seq            int64         `json:"seq"`
-		ConversationID int64         `json:"conversation_id"`
+		Seq            string        `json:"seq"`
+		ConversationID string        `json:"conversation_id"`
 		Items          []ActivityDTO `json:"items"`
 	}
-	if sourceReply.Code != 200 || json.Unmarshal(sourceReply.Body.Bytes(), &execution) != nil || execution.Seq != seq || execution.ConversationID != conv.ID || len(execution.Items) != 1 || execution.Items[0].Seq != i64s(seq) {
+	if sourceReply.Code != 200 || json.Unmarshal(sourceReply.Body.Bytes(), &execution) != nil || execution.Seq != i64s(seq) || execution.ConversationID != i64s(conv.ID) || len(execution.Items) != 1 || execution.Items[0].Seq != i64s(seq) {
 		t.Fatalf("source reply: %d %s", sourceReply.Code, sourceReply.Body.String())
 	}
 

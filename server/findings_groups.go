@@ -90,8 +90,11 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 // original task. The DB write validates and links the live finding node; task
 // admission then revives or queues the task through the shared concurrency path.
 func (s *Server) deepenFinding(w http.ResponseWriter, r *http.Request) {
-	id := int64(atoiDefault(r.PathValue("id"), 0))
-	if id <= 0 {
+	// P03 §2.3 / E09：finding 是实体 ID → 显式 64 位严格解析（1..MaxInt64）。
+	// 旧的 int64(atoiDefault(...)) 在 32 位构建上会截断高 32 位，>MaxInt64 也只会
+	// 变成 0 而不是被拒绝。
+	id, err := parseIDField(r.PathValue("id"))
+	if err != nil {
 		writeErr(w, 400, "bad finding id")
 		return
 	}

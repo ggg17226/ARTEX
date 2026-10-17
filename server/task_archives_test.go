@@ -62,20 +62,46 @@ func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("archive queue status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
+	// P03 R22 / R23 I-2：db.TaskArchive.ID / TaskID 带 `,string`（fced163 起），
+	// 归档响应里的 id / task_id 都是 string。按 int64 解码在 W5 接库后会直接
+	// 报 `cannot unmarshal string into Go value of type int64`。
 	var queued struct {
-		ID    int64  `json:"id"`
+		ID    string `json:"id"`
 		State string `json:"state"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &queued); err != nil {
 		t.Fatal(err)
 	}
-	if queued.ID <= 0 || queued.State != "archive_queued" {
-		t.Fatalf("unexpected queue response: %+v", queued)
+	queuedID, err := parseIDField(queued.ID)
+	if err != nil || queuedID <= 0 || queued.State != "archive_queued" {
+		t.Fatalf("unexpected queue response: %+v (id err=%v)", queued, err)
 	}
 
 	recorder = request(http.MethodGet, "/api/task-archives?page=1&size=10&q="+task.ID, "")
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), fmt.Sprintf(`"task_id":%d`, taskID)) {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), fmt.Sprintf(`"task_id":"%d"`, taskID)) {
 		t.Fatalf("archive list status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 同页的 items[].id 也必须是带引号的 string（不是数字）。
+	var page struct {
+		Items []struct {
+			ID     string `json:"id"`
+			TaskID string `json:"task_id"`
+		} `json:"items"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("archive page wire: %v body=%s", err, recorder.Body.String())
+	}
+	if page.Total <= 0 || len(page.Items) == 0 {
+		t.Fatalf("archive page empty: %s", recorder.Body.String())
+	}
+	for _, item := range page.Items {
+		if _, err := parseIDField(item.ID); err != nil {
+			t.Fatalf("archive item id wire: %v body=%s", err, recorder.Body.String())
+		}
+		if got, err := parseIDField(item.TaskID); err != nil || got != taskID {
+			t.Fatalf("archive item task_id wire: %v %v body=%s", got, err, recorder.Body.String())
+		}
 	}
 	ids := make([]string, 101)
 	for index := range ids {

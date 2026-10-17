@@ -701,6 +701,47 @@ func parseIDFieldLenient(s string) *int64 {
 	return &v
 }
 
+// queryFilterID 是 parseIDFieldLenient 的 int64/0 哨兵包装，供 store 侧签名是
+// `id int64`（0 = 不过滤）的可选 query 过滤器使用（P03 E10：asset 列表的
+// company_id / task_id、counts 的 task_id、notify 投递历史的 channel_id 等）。
+//
+// 语义与 lenient 完全一致：未提供 / 非数字 / 小数 / 0 / 负数 / > MaxInt64 溢出 → 0
+// （视为未指定，不 400）。关键是**溢出不得变成 MaxInt64 过滤值**：旧的
+// `id, _ := strconv.ParseInt(...)` 在超上限时返回 math.MaxInt64，会让一个写错的
+// task_id 静默变成「按 MaxInt64 过滤」的空结果，而不是「未过滤」。
+func queryFilterID(s string) int64 {
+	if v := parseIDFieldLenient(s); v != nil {
+		return *v
+	}
+	return 0
+}
+
+// parseCursorID 解析「DB 主键游标」类入参（P03 E10）：activity 的 since/before、
+// logs 历史的 before(db_id)、旁路历史的 before、conversation messages 的 since/before、
+// intents 的 before 等都是 activity_logs / task_archives / side_question 序列的 BIGINT 主键，
+// 不是分页页码，因此必须显式 64 位解析并正确处理 error。
+//   - ""（未提供）与 "0" → 0，保留「从头 / 最新一页」哨兵（逐端点约定，不是全局放宽）；
+//   - 合法正十进制且 ≤ MaxInt64 → 该值；
+//   - 其余（非数字、小数、负数、"+1"、> MaxInt64）→ error，调用方回 400。
+//
+// 与 parseIDField 的差别只是允许 0 哨兵；与 parseIDFieldLenient 的差别是非法值必须报错：
+// 游标写错若静默退化成 0，客户端会把「参数错了」误读成「从头重拉」，既丢增量语义又放大流量。
+// 溢出必须报错，绝不能像旧的 `n, _ := ParseInt` 那样把 >MaxInt64 变成 MaxInt64 过滤值。
+func parseCursorID(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cursor 非法: %q", s)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("cursor 非法（必须为 0 或 1..MaxInt64 正整数）: %s", s)
+	}
+	return v, nil
+}
+
 // parseIDListField 严格解析请求体里的 64 位 ID 字符串数组（P03：ID 对外一律 string）。
 // 逐项经 parseIDField 校验（1..math.MaxInt64）；任一项非法即整体返回错误，调用方回 400。
 // 未提供 / 空数组返回 nil，「未指定」语义由调用方决定。

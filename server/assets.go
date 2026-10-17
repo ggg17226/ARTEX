@@ -152,7 +152,8 @@ func (s *Server) getCompany(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	// P03 E09：company 是实体 ID，严格 1..MaxInt64（0 / 负数 / 小数 / 溢出均 400）。
+	id, err := parseIDField(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, 400, "invalid id")
 		return
@@ -184,7 +185,8 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	// P03 E09：company 是实体 ID，严格 1..MaxInt64。
+	id, err := parseIDField(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, 400, "invalid company id")
 		return
@@ -250,7 +252,8 @@ func (s *Server) deleteCompany(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	// P03 E09：company 是实体 ID，严格 1..MaxInt64。
+	id, err := parseIDField(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, 400, "invalid id")
 		return
@@ -382,14 +385,16 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 		}
 		// task_id scopes the DSL search to a task's assets (the task detail
 		// "测试资产" search); 0 means the global asset view.
-		taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
+		// P03 E10：可选 query 过滤器走 lenient —— 非法 / 溢出视为未指定（0），
+		// 不再把 >MaxInt64 的输入静默变成 MaxInt64 过滤值。
+		taskID := queryFilterID(q.Get("task_id"))
 		total, err = as.CountDSL(dsl, typ, taskID)
 		if err == nil && offset < total {
 			assets, err = as.QueryDSL(dsl, typ, taskID, limit, offset)
 		}
 	} else {
-		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
-		taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
+		companyID := queryFilterID(q.Get("company_id"))
+		taskID := queryFilterID(q.Get("task_id"))
 		switch {
 		case companyID > 0:
 			total, err = as.CountByCompany(companyID, typ)
@@ -435,7 +440,8 @@ func (s *Server) assetCounts(w http.ResponseWriter, r *http.Request) {
 	}
 	var counts map[string]int
 	var err error
-	if taskID, _ := strconv.ParseInt(r.URL.Query().Get("task_id"), 10, 64); taskID > 0 {
+	// P03 E10：可选 query 过滤器 lenient（非法 / 溢出 = 未指定，不是 MaxInt64）。
+	if taskID := queryFilterID(r.URL.Query().Get("task_id")); taskID > 0 {
 		counts, err = as.CountsByTypeForTask(taskID)
 	} else {
 		counts, err = as.CountsByType()

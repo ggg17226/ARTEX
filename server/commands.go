@@ -2,7 +2,6 @@ package server
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -140,7 +139,9 @@ func (s *Server) pgDeleteLLMRecords(w http.ResponseWriter, r *http.Request) {
 
 // pgGetLLMRecord returns a single LLM record with full request/response bodies.
 func (s *Server) pgGetLLMRecord(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	// P03 E09：LLM record 是实体 ID，严格 1..MaxInt64（0 / 负数 / 溢出 → 400，
+	// 不再带着 0 去查库后回 404）。
+	id, err := parseIDField(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, 400, "invalid id")
 		return
