@@ -374,9 +374,11 @@ func TestAcquireMaintenance_NoDeadlineBoundedByMaxWait(t *testing.T) {
 }
 
 // 有 deadline 的 ctx 行为不变：仍按 ctx 到期返回 DeadlineExceeded，
-// 不受 maxAcquireWait 影响。
+// 不受 maxAcquireWait 影响。上限刻意设得**短于**调用方 deadline（150ms < 400ms）：
+// 若实现错误地对所有 ctx 一律施加 cap，会在 150ms 就返回 ErrMaintenanceContended，
+// 本用例即失败；正确实现必须等到调用方期限（≈400ms）才返回 DeadlineExceeded。
 func TestAcquireMaintenance_DeadlineCtxUnaffectedByCap(t *testing.T) {
-	withMaxAcquireWait(t, 5*time.Second)
+	withMaxAcquireWait(t, 150*time.Millisecond)
 
 	db, _ := newLockFakeDB(t,
 		func(_ context.Context, query string) (driver.Result, error) {
@@ -392,14 +394,19 @@ func TestAcquireMaintenance_DeadlineCtxUnaffectedByCap(t *testing.T) {
 			return &lockFakeRows{cols: []string{"x"}}, nil
 		})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
+	start := time.Now()
 	err := AcquireMaintenance(ctx, db, "66666666666666666666666666666666")
+	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 	if errors.Is(err, ErrMaintenanceContended) {
 		t.Errorf("deadline ctx must not be capped by maxAcquireWait, got %v", err)
+	}
+	if elapsed < 350*time.Millisecond {
+		t.Errorf("returned after %v, want ≈caller deadline 400ms (cap 150ms must not apply)", elapsed)
 	}
 }
 
@@ -424,5 +431,279 @@ func TestAcquireMaintenance_SuccessNoReconcile(t *testing.T) {
 	}
 	if n := fc.count(qOwnerSelect); n != 0 {
 		t.Errorf("success path must not run reconcile queries, got %d", n)
+	}
+}
+
+// —— Round 1 修复回归（R8 审查 I1/I2/I3/M1）——————————————————————————
+
+// I3：NULL → own → released 确定性序列。第一次复查看到 NULL（晚到写尚未落库），
+// 第二次看到自己的 opID（晚到写已落库）→ 条件释放。回归兜底：若补偿退化为
+// 只查一次 SELECT、或删除轮询，本用例必失败（第一次 NULL 就返回将无 released）。
+func TestAcquireMaintenance_CanceledNullThenOwnReleases(t *testing.T) {
+	const opID = "88888888888888888888888888888888"
+	withShortReconcile(t, 2*time.Second, 10*time.Millisecond)
+
+	ownerCalls := 0
+	db, fc := newLockFakeDB(t,
+		func(ctx context.Context, query string) (driver.Result, error) {
+			switch {
+			case strings.Contains(query, qAcquireUpdate):
+				<-ctx.Done()
+				return nil, ctx.Err()
+			case strings.Contains(query, qReleaseUpdate):
+				return driver.RowsAffected(1), nil
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			switch {
+			case strings.Contains(query, qProbeSelect):
+				return probeRows(), nil
+			case strings.Contains(query, qOwnerSelect):
+				ownerCalls++
+				if ownerCalls == 1 {
+					return ownerRows(""), nil // 晚到写尚未落库
+				}
+				return ownerRows(opID), nil // 晚到写已把 owner 写成自己
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := AcquireMaintenance(ctx, db, opID)
+	if err == nil {
+		t.Fatal("canceled acquire must return error")
+	}
+	if !strings.Contains(err.Error(), "canceled after acquiring, released") {
+		t.Errorf("err = %v, want message containing %q", err, "canceled after acquiring, released")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want chain to contain context.DeadlineExceeded", err)
+	}
+	if errors.Is(err, ErrAcquireUncertain) {
+		t.Errorf("confirmed-and-released path must not report ErrAcquireUncertain: %v", err)
+	}
+	if n := fc.count(qOwnerSelect); n < 2 {
+		t.Errorf("owner queries = %d, want >= 2 (NULL 后必须继续轮询到预算或观察到 own)", n)
+	}
+	if n := fc.count(qReleaseUpdate); n != 1 {
+		t.Errorf("release UPDATE calls = %d, want 1", n)
+	}
+}
+
+// I1：复核的**第一次** owner 查询自身耗尽预算（等池/查询阻塞到 rctx 到期，
+// 从未成功读到过 owner）→ 必须 ErrAcquireUncertain，不得降格为「未持有」的
+// 裸 ctx 错误。
+func TestAcquireMaintenance_CanceledReconcileFirstQueryTimeoutUncertain(t *testing.T) {
+	const opID = "91919191919191919191919191919191"
+	withShortReconcile(t, 150*time.Millisecond, 20*time.Millisecond)
+
+	db, _ := newLockFakeDB(t,
+		func(ctx context.Context, query string) (driver.Result, error) {
+			if strings.Contains(query, qAcquireUpdate) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(ctx context.Context, query string) (driver.Rows, error) {
+			switch {
+			case strings.Contains(query, qProbeSelect):
+				return probeRows(), nil
+			case strings.Contains(query, qOwnerSelect):
+				<-ctx.Done() // 模拟查询阻塞到复核预算到期（等池同理）
+				return nil, ctx.Err()
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := AcquireMaintenance(ctx, db, opID)
+	if !errors.Is(err, ErrAcquireUncertain) {
+		t.Fatalf("query never succeeded must be uncertain, got %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("uncertain error must still chain the ctx error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 1*time.Second {
+		t.Errorf("reconcile must stay bounded by its budget, took %v", elapsed)
+	}
+}
+
+// I1 + M1：先成功读到 NULL，随后一次复核查询返回真实错误（连接/SQL 故障）→
+// 仍必须 ErrAcquireUncertain，且错误链保留**真实查询错误**（sentinel 可判）。
+func TestAcquireMaintenance_CanceledReconcileQueryFailsAfterNullUncertain(t *testing.T) {
+	const opID = "92929292929292929292929292929292"
+	queryErr := errors.New("fake: owner query failed after NULL")
+	withShortReconcile(t, 2*time.Second, 10*time.Millisecond)
+
+	ownerCalls := 0
+	db, _ := newLockFakeDB(t,
+		func(ctx context.Context, query string) (driver.Result, error) {
+			if strings.Contains(query, qAcquireUpdate) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			switch {
+			case strings.Contains(query, qProbeSelect):
+				return probeRows(), nil
+			case strings.Contains(query, qOwnerSelect):
+				ownerCalls++
+				if ownerCalls == 1 {
+					return ownerRows(""), nil
+				}
+				return nil, queryErr
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := AcquireMaintenance(ctx, db, opID)
+	if !errors.Is(err, ErrAcquireUncertain) {
+		t.Fatalf("err = %v, want ErrAcquireUncertain", err)
+	}
+	if !errors.Is(err, queryErr) {
+		t.Errorf("real query error must be kept in the chain (M1), got %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("uncertain error must still chain the ctx error, got %v", err)
+	}
+}
+
+// M1：复核确认持有但**释放 UPDATE 失败** → ErrAcquireUncertain，错误链必须
+// 保留真实释放错误（releaseSentinel 可判），不得只留 sentinel + ctx 错误。
+func TestAcquireMaintenance_CanceledReleaseFailsUncertain(t *testing.T) {
+	const opID = "93939393939393939393939393939393"
+	releaseErr := errors.New("fake: release update failed")
+	withShortReconcile(t, 2*time.Second, 10*time.Millisecond)
+
+	db, fc := newLockFakeDB(t,
+		func(ctx context.Context, query string) (driver.Result, error) {
+			switch {
+			case strings.Contains(query, qAcquireUpdate):
+				<-ctx.Done()
+				return nil, ctx.Err()
+			case strings.Contains(query, qReleaseUpdate):
+				return nil, releaseErr
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			switch {
+			case strings.Contains(query, qProbeSelect):
+				return probeRows(), nil
+			case strings.Contains(query, qOwnerSelect):
+				return ownerRows(opID), nil
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := AcquireMaintenance(ctx, db, opID)
+	if !errors.Is(err, ErrAcquireUncertain) {
+		t.Fatalf("err = %v, want ErrAcquireUncertain", err)
+	}
+	if !errors.Is(err, releaseErr) {
+		t.Errorf("real release error must be kept in the chain (M1), got %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("uncertain error must still chain the ctx error, got %v", err)
+	}
+	if n := fc.count(qReleaseUpdate); n != 1 {
+		t.Errorf("release UPDATE calls = %d, want 1", n)
+	}
+}
+
+// I2：无 deadline 的 maxAcquireWait 上限必须覆盖**单条阻塞的抢锁 UPDATE**
+// （服务端行锁/等池场景）：上限到期即返回 ErrMaintenanceContended，而不是
+// 继续等驱动/服务端（真机 innodb_lock_wait_timeout=50s），且到期后不得再补发
+// UPDATE。
+func TestAcquireMaintenance_NoDeadlineCapCoversBlockingUpdate(t *testing.T) {
+	withMaxAcquireWait(t, 200*time.Millisecond)
+	withShortReconcile(t, 100*time.Millisecond, 20*time.Millisecond)
+
+	db, fc := newLockFakeDB(t,
+		func(ctx context.Context, query string) (driver.Result, error) {
+			switch {
+			case strings.Contains(query, qAcquireUpdate):
+				<-ctx.Done() // 模拟 UPDATE 在服务端行锁上排队
+				return nil, ctx.Err()
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			switch {
+			case strings.Contains(query, qProbeSelect):
+				return probeRows(), nil
+			case strings.Contains(query, qOwnerSelect):
+				return ownerRows(""), nil // 复核窗口内未观察到持有
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	start := time.Now()
+	err := AcquireMaintenance(context.Background(), db, "94949494949494949494949494949494")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrMaintenanceContended) {
+		t.Fatalf("err = %v, want ErrMaintenanceContended", err)
+	}
+	if !strings.Contains(err.Error(), "200ms") {
+		t.Errorf("err = %v, want message to mention the wait budget", err)
+	}
+	// 上限 200ms + 补偿复核 ≤100ms + 调度余量；绝不能等满服务端锁超时。
+	if elapsed < 200*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("waited %v, want ≈maxAcquireWait 200ms + reconcile budget 100ms", elapsed)
+	}
+	if n := fc.count(qAcquireUpdate); n != 1 {
+		t.Errorf("acquire UPDATE calls = %d, want 1 (截止后不得补发 UPDATE)", n)
+	}
+}
+
+// I2 补充：上限到期打断的正是排队中的抢锁 UPDATE，且复核观察到 own owner →
+// 返回值必须以 ErrMaintenanceContended 为准，同时错误链保留补偿的 "released"
+// 结果（上限路径同样不得丢失补偿）。
+func TestAcquireMaintenance_NoDeadlineCapCanceledUpdateReconciles(t *testing.T) {
+	const opID = "95959595959595959595959595959595"
+	withMaxAcquireWait(t, 200*time.Millisecond)
+	withShortReconcile(t, 2*time.Second, 10*time.Millisecond)
+
+	db, fc := newLockFakeDB(t,
+		func(ctx context.Context, query string) (driver.Result, error) {
+			switch {
+			case strings.Contains(query, qAcquireUpdate):
+				<-ctx.Done()
+				return nil, ctx.Err()
+			case strings.Contains(query, qReleaseUpdate):
+				return driver.RowsAffected(1), nil
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			switch {
+			case strings.Contains(query, qProbeSelect):
+				return probeRows(), nil
+			case strings.Contains(query, qOwnerSelect):
+				return ownerRows(opID), nil // 晚到写已落库
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	err := AcquireMaintenance(context.Background(), db, opID)
+	if !errors.Is(err, ErrMaintenanceContended) {
+		t.Fatalf("err = %v, want ErrMaintenanceContended", err)
+	}
+	if !strings.Contains(err.Error(), "canceled after acquiring, released") {
+		t.Errorf("cap path must keep the reconcile result in the chain, got %v", err)
+	}
+	if n := fc.count(qReleaseUpdate); n != 1 {
+		t.Errorf("release UPDATE calls = %d, want 1", n)
 	}
 }

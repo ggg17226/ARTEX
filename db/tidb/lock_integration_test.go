@@ -47,18 +47,35 @@ SELECT HEX(op_id) FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&v
 }
 
 // requireNoMaintenanceOwnerSoon 断言 op_id 最终为 NULL：取消补偿是异步收敛的
-// （服务端晚到写可能在取消之后才落库），故给最多 2s 的轮询窗口。
+// （服务端晚到写可能在取消之后才落库），故给最多 2s 的轮询窗口（单次 SELECT
+// 另有 5s 独立上限，窗口是尽力值而非硬时限）。
+//
+// 调用时机必须在被断言的取消抢锁**返回之后**（errB 已到手）：补偿是 Acquire
+// 返回前同步执行的，errB 先返回才能保证本窗口轮询覆盖「晚到写落库→补偿清空」
+// 的完整过程。轮询同时记录是否观察到非 NULL owner：
+//   - 观察到 owner 出现→最终清空：直接证明晚到写落库且被清掉；
+//   - 始终未观察到：owner 的出现窗口可能短于 50ms 轮询间隔，此时以调用方对
+//     errB 的 "canceled after acquiring, released" 断言作为补偿已执行的证据，
+//     本 helper 只兜底「不早于 errB 返回的最终 NULL」。
 func requireNoMaintenanceOwnerSoon(t *testing.T, db *sql.DB) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
+	sawOwner := false
 	last := maintenanceOwner(t, db)
-	for last != "" && time.Now().Before(deadline) {
+	for {
+		if last != "" {
+			sawOwner = true
+		}
+		if last == "" || !time.Now().Before(deadline) {
+			break
+		}
 		time.Sleep(50 * time.Millisecond)
 		last = maintenanceOwner(t, db)
 	}
 	if last != "" {
 		t.Fatalf("maintenance op_id still %s after 2s, want NULL (canceled competitor left an owner)", last)
 	}
+	t.Logf("owner poll window done: non-NULL observed during window = %v (late write seen by poller)", sawOwner)
 }
 
 func TestAcquireReleaseMaintenance_Real(t *testing.T) {
@@ -106,9 +123,11 @@ func TestAcquireReleaseMaintenance_Real(t *testing.T) {
 	if err != nil || !released {
 		t.Fatalf("ReleaseMaintenance(A) = (%v, %v), want (true, nil)", released, err)
 	}
-	// 释放后可再获取
+	// 释放后可再获取（有界 ctx：抢锁一律禁止 context.Background() 裸抢）
 	const opIDC = "99999999999999999999999999999999"
-	if err := tidb.AcquireMaintenance(ctx, db, opIDC); err != nil {
+	ctxC, cancelC := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelC()
+	if err := tidb.AcquireMaintenance(ctxC, db, opIDC); err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
 	t.Cleanup(func() {
@@ -161,6 +180,13 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 	if errors.Is(errB, tidb.ErrAcquireUncertain) {
 		t.Errorf("canceled acquire reported uncertain outcome: %v", errB)
 	}
+	// 核心回归断言：B 的错误必须来自「复核观察到 own owner 并条件释放」分支——
+	// 仅凭 DeadlineExceeded + 最终 NULL 无法排除「补偿根本没执行、晚到写也没落库
+	// 或被别人清掉」的假绿调度；错误文本精确锁定补偿执行路径。
+	if !strings.Contains(errB.Error(), "canceled after acquiring, released") {
+		t.Fatalf("canceled acquire err = %v, want chain through the reconcile release branch (%q)",
+			errB, "canceled after acquiring, released")
+	}
 	// 补偿在独立预算内收敛，调用不得无限期挂起
 	if elapsed := time.Since(start); elapsed >= 5*time.Second {
 		t.Errorf("canceled acquire took %v, want well under the reconcile budget", elapsed)
@@ -170,7 +196,9 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 	if err := <-commitDone; err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	// 核心断言：被 300ms 取消的竞争者 B 不得留下 owner（最多 2s 内必须收敛为 NULL）
+	// 核心断言（此时 errB 已返回、补偿已同步执行完）：被 300ms 取消的竞争者 B
+	// 不得留下 owner（最多 2s 内必须收敛为 NULL；补偿执行本身由上面 errB 的
+	// "released" 断言证明）。
 	requireNoMaintenanceOwnerSoon(t, db)
 
 	// tx 提交后行锁释放，可再获取（有界 ctx，禁止再用 Background 裸抢）
