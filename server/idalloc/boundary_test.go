@@ -55,8 +55,18 @@ func TestBoundary_ZeroAndAboveMaxInt64(t *testing.T) {
 
 // ---- 真实 TiDB 边界（env 门控）----
 
-// §11.1：插入 9223372036854775813（>MaxInt64）后 LAST_INSERT_ID()=0；
-// 其后正常自增得 9223372036854775814 仍为 0 → AllocID 必须显式失败，不 fallback。
+// §11.1：插入 9223372036854775813（>MaxInt64）后 LAST_INSERT_ID()=0 → AllocID 必须显式失败，不 fallback。
+//
+// 计划 §11.1 假设 vs TiDB v8.5.8 实测（192.168.27.79:6000，本用例第二步）：
+//   - 假设：显式插入高值后的**后续自增插入**，LAST_INSERT_ID() 仍为 0（→ ErrReadbackZero）。
+//   - 实测：TiDB 把自增计数器**接续**到显式高值 +1，
+//     SELECT LAST_INSERT_ID() = 9223372036854775814（= 9223372036854775813 + 1）> MaxInt64。
+//
+// 两步都必须 fail closed，但由**不同层**承担：
+//   - 第一步（显式高值插入）：TiDB 不把高值写入 session last_insert_id → 回读 0，
+//     fail closed 由 AllocID 的「回读 0」守卫（ErrReadbackZero）承担；
+//   - 第二步（后续自增插入）：回读到的是越域高值而非 0，
+//     fail closed 由 idalloc 的**兼容域校验** ValidateUint64（ErrOutOfSafeRange）承担。
 func TestTiDB_HighValueLastInsertIDZero(t *testing.T) {
 	db := openTiDB(t)
 	ctx := context.Background()
@@ -85,17 +95,42 @@ func TestTiDB_HighValueLastInsertIDZero(t *testing.T) {
 		t.Fatalf("AllocID after high-value insert = %v, want ErrReadbackZero（LAST_INSERT_ID()=0 实测）", err)
 	}
 
-	// 补齐后续自增插入（logical_key = "high_2"），断言自增获得的 LAST_INSERT_ID() 依然为 0 并被 AllocID 拒绝
+	// 第二步：补齐后续自增插入（logical_key = "high_2"）。
+	// 先显式 SELECT LAST_INSERT_ID() 证明 TiDB 的「自增计数器接续显式高值」行为，
+	// 再断言 AllocID 以兼容域校验 fail closed（不得放宽为「任意 error 即可」）。
 	if _, err := tx.ExecContext(ctx, "INSERT INTO idalloc_t (logical_key) VALUES (?)", "high_2"); err != nil {
 		t.Fatalf("insert auto-increment after high value: %v", err)
 	}
-	if _, err := AllocID(ctx, tx); !errors.Is(err, ErrReadbackZero) {
-		t.Fatalf("AllocID after subsequent auto-increment = %v, want ErrReadbackZero（LAST_INSERT_ID()=0 实测）", err)
+	var seqReadback uint64
+	if err := tx.QueryRowContext(ctx, "SELECT LAST_INSERT_ID()").Scan(&seqReadback); err != nil {
+		t.Fatalf("readback LAST_INSERT_ID after subsequent auto-increment: %v", err)
+	}
+	// v8.5.8 实测值：9223372036854775814（= 显式高值 9223372036854775813 + 1）。
+	// 计划 §11.1 假设此处为 0（→ ErrReadbackZero）；实测为接续高值 +1，
+	// 因此本步断言 > MaxInt64，fail closed 由 ValidateUint64 的越域校验（ErrOutOfSafeRange）承担。
+	if seqReadback <= math.MaxInt64 {
+		t.Fatalf("后续自增 LAST_INSERT_ID() = %d，未复现「接续显式高值 >MaxInt64」形态（v8.5.8 实测 9223372036854775814）；若 TiDB 版本行为变化需更新本用例并记录", seqReadback)
+	}
+	t.Logf("后续自增 LAST_INSERT_ID() 实测 = %d（> MaxInt64 = %d）；计划 §11.1 的「回读 0」假设在 v8.5.8 不成立", seqReadback, uint64(math.MaxInt64))
+
+	if _, err := AllocID(ctx, tx); !errors.Is(err, ErrOutOfSafeRange) {
+		t.Fatalf("AllocID after subsequent auto-increment = %v, want ErrOutOfSafeRange（回读值 %d 越域，fail closed 由兼容域校验承担）", err, seqReadback)
 	}
 }
 
 // §11.1：MaxUint64 显式插入成功且可回读（roundtrip 合法），
-// 随后自增回绕 id=0（另一次 ERROR 1105 auto increment action failed）→ allocator 必须 fail closed。
+// 随后自增必须 fail closed。
+//
+// 计划 §11.1 假设 vs TiDB v8.5.8 实测（192.168.27.79:6000）：
+//   - 假设形态 A：自增回绕 id=0（LAST_INSERT_ID()=0）→ 由 idalloc 的「回读 0」守卫 fail closed；
+//   - 假设形态 B：ERROR 1105 "auto increment action failed"；
+//   - **实测形态 B′**：`Error 1467 (HY000): Failed to read auto-increment value from storage engine`
+//     —— 本实例不出现 1105，也不回绕到 0，而是由 TiDB 存储层直接拒绝写入。
+//
+// 即：本实例的 fail closed 由 **MySQL/TiDB SQL 层（errno 1467）** 承担，
+// idalloc 层（ErrReadbackZero/ErrOutOfSafeRange）只在形态 A 时才被触发；
+// 两种形态都必须被精准识别，非白名单错误一律 t.Fatalf，禁止静默通过。
+//
 // 注意：按 Task 2 补充说明强制修正：
 // 1. 公开业务 ID 回读 AllocIDByIdentity 对 MaxUint64 必须返回 ErrOutOfSafeRange；
 // 2. 物理主键高值回读必须使用 AllocPhysicalRowIDByIdentity 并验证 roundtrip。
@@ -141,25 +176,36 @@ func TestTiDB_MaxUint64RoundtripThenWrap(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	// 2) 随后自增：回绕 id=0 或 ERROR 1105 → 两种形态都必须 fail closed：
+	// 2) 随后自增：回绕 id=0 / ERROR 1105 / ERROR 1467 → 各形态都必须 fail closed：
 	tx2, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin2: %v", err)
 	}
 	defer tx2.Rollback()
 	if _, err := tx2.ExecContext(ctx, "INSERT INTO idalloc_t (logical_key) VALUES ('after')"); err != nil {
-		// 形态 B：ERROR 1105 auto increment action failed —— 分配器本身拒绝，fail closed 达成
-		// 精准断言错误确实源自 allocator 耗尽，杜绝非预期错误假绿
+		// 形态 B：自增计数器耗尽时由 SQL/存储层直接拒绝写入 —— fail closed 由 **TiDB 层**达成。
+		// 精准白名单断言错误确实源自 allocator 耗尽，杜绝非预期错误假绿：
+		//   - 1467：v8.5.8 实测 "Failed to read auto-increment value from storage engine"
+		//   - 1105：计划 §11.1 假设的 errno（本实例未出现，保留跨版本兼容）
+		//   - 文本 "auto increment action failed"：计划 §11.1 假设的错误文案（保留兼容）
 		var mysqlErr *mysql.MySQLError
-		isMySQL1105 := errors.As(err, &mysqlErr) && mysqlErr.Number == 1105
+		hasMySQL := errors.As(err, &mysqlErr)
+		isMySQL1467 := hasMySQL && mysqlErr.Number == 1467
+		isMySQL1105 := hasMySQL && mysqlErr.Number == 1105
 		isAutoIncActionFailed := strings.Contains(strings.ToLower(err.Error()), "auto increment action failed")
-		if !isMySQL1105 && !isAutoIncActionFailed {
+		if !isMySQL1467 && !isMySQL1105 && !isAutoIncActionFailed {
 			t.Fatalf("unexpected insert error: %v", err)
 		}
-		t.Logf("allocator 拒绝自增（fail closed，精准命中 allocator exhaustion）: %v", err)
+		if isMySQL1467 {
+			t.Logf("allocator 拒绝自增（fail closed，v8.5.8 实测 errno 1467，由 TiDB 存储层承担）: %v", err)
+			return
+		}
+		t.Logf("allocator 拒绝自增（fail closed，计划 §11.1 假设形态 1105/文案兼容）: %v", err)
 		return
 	}
-	// 形态 A：自增回绕 id=0 → LAST_INSERT_ID()=0 或 identity 回读到 0 → 显式错误
+	// 形态 A（计划 §11.1 假设分支，v8.5.8 实测**未触达**——本实例走上面的 errno 1467）：
+	// 自增回绕 id=0 → LAST_INSERT_ID()=0 或 identity 回读到 0 → 由 idalloc 层显式报错。
+	// 保留本分支以覆盖「TiDB 不回错、只回绕」的其它版本形态；断言本身不变。
 	if _, err := AllocID(ctx, tx2); !errors.Is(err, ErrReadbackZero) && !errors.Is(err, ErrOutOfSafeRange) {
 		t.Fatalf("AllocID after wrap = %v, want ErrReadbackZero/ErrOutOfSafeRange", err)
 	}
@@ -168,7 +214,7 @@ func TestTiDB_MaxUint64RoundtripThenWrap(t *testing.T) {
 		t.Fatalf("scan wrapped: %v", err)
 	}
 	if wrapped != 0 {
-		t.Fatalf("回绕形态未复现：wrapped id = %d（§11.1 预期 0；若 TiDB 版本行为变化需更新本用例并记录）", wrapped)
+		t.Fatalf("回绕形态未复现：wrapped id = %d（计划 §11.1 假设 0；v8.5.8 实测为 errno 1467 直接拒绝，若 TiDB 版本行为变化需更新本用例并记录）", wrapped)
 	}
 }
 
