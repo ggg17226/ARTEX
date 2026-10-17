@@ -11,9 +11,13 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/Autumn-27/artex/db/tidb"
 )
 
-// getTestTiDB 获取外部 TiDB 实例连接；若未配置环境变量则诚实跳过并标记未验证
+// getTestTiDB 获取外部 TiDB 实例连接；若未配置环境变量则诚实跳过并标记未验证。
+// 连接统一走 tidb.OpenTiDB（内部 NormalizeDSN 强制 UTC/time_zone + Ping + 能力探测），
+// 并注册 t.Cleanup 关闭连接池；OpenTiDB 失败即 t.Fatalf（DSN 经 RedactDSN 脱敏）。
 func getTestTiDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("ARTEX_TIDB_DSN")
@@ -21,16 +25,29 @@ func getTestTiDB(t *testing.T) *sql.DB {
 		t.Skip("跳过：环境变量 ARTEX_TIDB_DSN 未配置，标记为「未验证」(Honest Skip)")
 		return nil
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
-		t.Fatalf("failed to open mysql: %v", err)
+		t.Fatalf("failed to open tidb: %v (dsn=%s)", err, tidb.RedactDSN(dsn))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		t.Skipf("跳过：TiDB 连接无法 Ping 通 (%v)，标记为「未验证」", err)
-	}
+	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// cleanupRow 注册「按主键删除本用例插入行」的 t.Cleanup。
+// t.Cleanup 为 LIFO：按插入顺序注册即得到依赖逆序删除（先子后父）。
+// 目标库是共享持久库，禁止 TRUNCATE / DROP TABLE；级联已删掉的行删除 0 行属正常。
+func cleanupRow(t *testing.T, db *sql.DB, table string, id uint64) {
+	t.Helper()
+	if id == 0 {
+		t.Fatalf("cleanupRow: table %s got zero id", table)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := db.ExecContext(ctx, "DELETE FROM "+table+" WHERE id = ?", id); err != nil {
+			t.Errorf("cleanup: delete %s id=%d failed: %v", table, id, err)
+		}
+	})
 }
 
 func TestClosureTaskEndToEndVerification(t *testing.T) {
@@ -58,9 +75,10 @@ func TestClosureTaskEndToEndVerification(t *testing.T) {
 		t.Fatalf("get exploration last insert id failed: %v", err)
 	}
 	expID = uint64(expIDInt)
+	cleanupRow(t, db, "explorations", expID)
 
-	// 插入 task
-	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, exploration_id, created_at, updated_at) VALUES ('test_task', 'g', 'd', 'running', ?, NOW(3), NOW(3))`, expID)
+	// 插入 task (queue_mode 为 TEXT NOT NULL 无默认，必须显式提供)
+	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, queue_mode, exploration_id, created_at, updated_at) VALUES ('test_task', 'g', 'd', 'running', '', ?, NOW(3), NOW(3))`, expID)
 	if err != nil {
 		t.Fatalf("insert task failed: %v", err)
 	}
@@ -69,9 +87,10 @@ func TestClosureTaskEndToEndVerification(t *testing.T) {
 		t.Fatalf("get task last insert id failed: %v", err)
 	}
 	taskID = uint64(taskIDInt)
+	cleanupRow(t, db, "tasks", taskID)
 
-	// 插入关联的 exploration_nodes (对齐 catalog：无 label 列)
-	res, err = tx.ExecContext(ctx, `INSERT INTO exploration_nodes (exploration_id, kind, state, created_at, updated_at) VALUES (?, 'intent', 'open', NOW(3), NOW(3))`, expID)
+	// 插入关联的 exploration_nodes (对齐 catalog：无 label 列；payload 为 JSON 载荷 NOT NULL 无默认)
+	res, err = tx.ExecContext(ctx, `INSERT INTO exploration_nodes (exploration_id, kind, state, payload, created_at, updated_at) VALUES (?, 'intent', 'open', '{}', NOW(3), NOW(3))`, expID)
 	if err != nil {
 		t.Fatalf("insert node failed: %v", err)
 	}
@@ -80,12 +99,19 @@ func TestClosureTaskEndToEndVerification(t *testing.T) {
 		t.Fatalf("get node last insert id failed: %v", err)
 	}
 	nodeID := uint64(nodeIDInt)
+	cleanupRow(t, db, "exploration_nodes", nodeID)
 
-	// 插入关联的 findings (弱关联，对齐 catalog：无 title、无 updated_at，使用 name)
-	_, err = tx.ExecContext(ctx, `INSERT INTO findings (task_id, node_id, name, severity, status, created_at) VALUES (?, ?, 'title', 'low', 'confirmed', NOW(3))`, taskID, nodeID)
+	// 插入关联的 findings (弱关联，对齐 catalog：无 title、无 updated_at，使用 name；
+	// vulnclass/summary/evidence/worker/asset_ids/report 均为 NOT NULL 无默认)
+	res, err = tx.ExecContext(ctx, `INSERT INTO findings (task_id, node_id, name, severity, status, vulnclass, summary, evidence, worker, asset_ids, report, created_at) VALUES (?, ?, 'title', 'low', 'confirmed', '', '', '', '', '[]', '', NOW(3))`, taskID, nodeID)
 	if err != nil {
 		t.Fatalf("insert finding failed: %v", err)
 	}
+	findingIDInt, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("get finding last insert id failed: %v", err)
+	}
+	cleanupRow(t, db, "findings", uint64(findingIDInt))
 
 	// 2. 计算闭包
 	closure, err := ComputeTaskClosure(ctx, tx, taskID)
@@ -150,8 +176,9 @@ func TestClosureConcurrentOrphanPrevention(t *testing.T) {
 		t.Fatalf("get exploration last insert id failed: %v", err)
 	}
 	expID = uint64(expIDInt)
+	cleanupRow(t, db, "explorations", expID)
 
-	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, exploration_id, created_at, updated_at) VALUES ('test_concurrent', 'g', 'd', 'running', ?, NOW(3), NOW(3))`, expID)
+	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, queue_mode, exploration_id, created_at, updated_at) VALUES ('test_concurrent', 'g', 'd', 'running', '', ?, NOW(3), NOW(3))`, expID)
 	if err != nil {
 		t.Fatalf("insert task failed: %v", err)
 	}
@@ -160,6 +187,7 @@ func TestClosureConcurrentOrphanPrevention(t *testing.T) {
 		t.Fatalf("get task last insert id failed: %v", err)
 	}
 	taskID = uint64(taskIDInt)
+	cleanupRow(t, db, "tasks", taskID)
 
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit setup tx failed: %v", err)
@@ -247,6 +275,7 @@ func TestClosureCompanyEndToEndVerification(t *testing.T) {
 		t.Fatalf("get company last insert id failed: %v", err)
 	}
 	compID := uint64(compIDInt)
+	cleanupRow(t, db, "companies", compID)
 
 	// 插入 company_scope (级联删除表)
 	res, err = tx.ExecContext(ctx, `INSERT INTO company_scope (company_id, kind, raw, created_at) VALUES (?, 'domain', 'example.com', NOW(3))`, compID)
@@ -258,6 +287,7 @@ func TestClosureCompanyEndToEndVerification(t *testing.T) {
 		t.Fatalf("get company_scope last insert id failed: %v", err)
 	}
 	scopeID := uint64(scopeIDInt)
+	cleanupRow(t, db, "company_scope", scopeID)
 
 	// 插入 exploration (为创建 task 所需)
 	res, err = tx.ExecContext(ctx, `INSERT INTO explorations (goal, status, created_at, updated_at) VALUES ('company task exploration', 'open', NOW(3), NOW(3))`)
@@ -269,9 +299,10 @@ func TestClosureCompanyEndToEndVerification(t *testing.T) {
 		t.Fatalf("get exploration last insert id failed: %v", err)
 	}
 	expID := uint64(expIDInt)
+	cleanupRow(t, db, "explorations", expID)
 
-	// 插入 task (弱关联置空表：company_id = compID)
-	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, exploration_id, company_id, created_at, updated_at) VALUES ('company_task', 'g', 'd', 'running', ?, ?, NOW(3), NOW(3))`, expID, compID)
+	// 插入 task (弱关联置空表：company_id = compID；queue_mode NOT NULL 无默认)
+	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, queue_mode, exploration_id, company_id, created_at, updated_at) VALUES ('company_task', 'g', 'd', 'running', '', ?, ?, NOW(3), NOW(3))`, expID, compID)
 	if err != nil {
 		t.Fatalf("insert task failed: %v", err)
 	}
@@ -280,11 +311,12 @@ func TestClosureCompanyEndToEndVerification(t *testing.T) {
 		t.Fatalf("get task last insert id failed: %v", err)
 	}
 	taskID := uint64(taskIDInt)
+	cleanupRow(t, db, "tasks", taskID)
 
-	// 插入 task_scope (级联删除表：kind='company' 且 company_id = compID)
+	// 插入 task_scope (级联删除表：kind='company' 且 company_id = compID；source NOT NULL 无默认)
 	tsIdent := []byte("test_task_scope_identity")
 	tsHash := sha256.Sum256(tsIdent)
-	res, err = tx.ExecContext(ctx, `INSERT INTO task_scope (task_id, kind, company_id, identity, identity_hash, created_at) VALUES (?, 'company', ?, ?, ?, NOW(3))`, taskID, compID, tsIdent, tsHash[:])
+	res, err = tx.ExecContext(ctx, `INSERT INTO task_scope (task_id, kind, company_id, source, identity, identity_hash, created_at) VALUES (?, 'company', ?, 'auto', ?, ?, NOW(3))`, taskID, compID, tsIdent, tsHash[:])
 	if err != nil {
 		t.Fatalf("insert task_scope failed: %v", err)
 	}
@@ -293,9 +325,11 @@ func TestClosureCompanyEndToEndVerification(t *testing.T) {
 		t.Fatalf("get task_scope last insert id failed: %v", err)
 	}
 	taskScopeID := uint64(taskScopeIDInt)
+	cleanupRow(t, db, "task_scope", taskScopeID)
 
-	// 插入 asset (弱关联置空表：company_id = compID)
-	res, err = tx.ExecContext(ctx, `INSERT INTO assets (type, company_id, created_at, last_seen, updated_at) VALUES ('domain', ?, NOW(3), NOW(3), NOW(3))`, compID)
+	// 插入 asset (弱关联置空表：company_id = compID；
+	// company_source 与全部 JSON 载荷列均 NOT NULL 无默认，需显式提供语义等价默认值)
+	res, err = tx.ExecContext(ctx, `INSERT INTO assets (type, company_id, company_source, task_ids, bound_domains, open_ports, record_value, technologies, auth, params, extra, created_at, last_seen, updated_at) VALUES ('domain', ?, 'explicit', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '{}', NOW(3), NOW(3), NOW(3))`, compID)
 	if err != nil {
 		t.Fatalf("insert asset failed: %v", err)
 	}
@@ -304,6 +338,7 @@ func TestClosureCompanyEndToEndVerification(t *testing.T) {
 		t.Fatalf("get asset last insert id failed: %v", err)
 	}
 	assetID := uint64(assetIDInt)
+	cleanupRow(t, db, "assets", assetID)
 
 	// 2. 计算闭包
 	closure, err := ComputeCompanyClosure(ctx, tx, compID)
@@ -378,6 +413,7 @@ func TestClosureConversationEndToEndVerification(t *testing.T) {
 		t.Fatalf("get conversation last insert id failed: %v", err)
 	}
 	convID := uint64(convIDInt)
+	cleanupRow(t, db, "conversations", convID)
 
 	// 插入 conversation_activities (级联删除表)
 	res, err = tx.ExecContext(ctx, `INSERT INTO conversation_activities (conversation_id, kind, created_at) VALUES (?, 'message', NOW(3))`, convID)
@@ -389,9 +425,11 @@ func TestClosureConversationEndToEndVerification(t *testing.T) {
 		t.Fatalf("get conversation_activities last insert id failed: %v", err)
 	}
 	activityID := uint64(activityIDInt)
+	cleanupRow(t, db, "conversation_activities", activityID)
 
-	// 插入 intercept_pending (级联删除表)
-	res, err = tx.ExecContext(ctx, `INSERT INTO intercept_pending (conversation_id, tool_name, created_at) VALUES (?, 'bash', NOW(3))`, convID)
+	// 插入 intercept_pending (级联删除表；agent_name/tool_input/status/reason/decision_source
+	// 均 NOT NULL 无默认)
+	res, err = tx.ExecContext(ctx, `INSERT INTO intercept_pending (conversation_id, tool_name, agent_name, tool_input, status, reason, decision_source, created_at) VALUES (?, 'bash', '', '{}', 'pending', '', '', NOW(3))`, convID)
 	if err != nil {
 		t.Fatalf("insert intercept_pending failed: %v", err)
 	}
@@ -400,9 +438,10 @@ func TestClosureConversationEndToEndVerification(t *testing.T) {
 		t.Fatalf("get intercept_pending last insert id failed: %v", err)
 	}
 	interceptID := uint64(interceptIDInt)
+	cleanupRow(t, db, "intercept_pending", interceptID)
 
-	// 插入 finding (为 finding_retests 外键所需)
-	res, err = tx.ExecContext(ctx, `INSERT INTO findings (name, severity, status, created_at) VALUES ('test vuln', 'low', 'confirmed', NOW(3))`)
+	// 插入 finding (为 finding_retests 外键所需；NOT NULL 无默认列显式补齐)
+	res, err = tx.ExecContext(ctx, `INSERT INTO findings (name, severity, status, vulnclass, summary, evidence, worker, asset_ids, report, created_at) VALUES ('test vuln', 'low', 'confirmed', '', '', '', '', '[]', '', NOW(3))`)
 	if err != nil {
 		t.Fatalf("insert finding failed: %v", err)
 	}
@@ -411,9 +450,12 @@ func TestClosureConversationEndToEndVerification(t *testing.T) {
 		t.Fatalf("get finding last insert id failed: %v", err)
 	}
 	findingID := uint64(findingIDInt)
+	cleanupRow(t, db, "findings", findingID)
 
-	// 插入 finding_retests (弱关联置空表：conversation_id = convID)
-	res, err = tx.ExecContext(ctx, `INSERT INTO finding_retests (finding_id, conversation_id, status, snapshot, created_at) VALUES (?, ?, 'pending', '{}', NOW(3))`, findingID, convID)
+	// 插入 finding_retests (弱关联置空表：conversation_id = convID；
+	// verdict/notes/summary/evidence/error 均 NOT NULL 无默认；
+	// active_finding_id 是 STORED 生成列，不得出现在 INSERT 中)
+	res, err = tx.ExecContext(ctx, `INSERT INTO finding_retests (finding_id, conversation_id, status, snapshot, verdict, notes, summary, evidence, error, created_at) VALUES (?, ?, 'pending', '{}', '', '', '', '', '', NOW(3))`, findingID, convID)
 	if err != nil {
 		t.Fatalf("insert finding_retests failed: %v", err)
 	}
@@ -422,6 +464,7 @@ func TestClosureConversationEndToEndVerification(t *testing.T) {
 		t.Fatalf("get finding_retests last insert id failed: %v", err)
 	}
 	retestID := uint64(retestIDInt)
+	cleanupRow(t, db, "finding_retests", retestID)
 
 	// 2. 计算闭包
 	closure, err := ComputeConversationClosure(ctx, tx, convID)
