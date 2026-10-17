@@ -12,12 +12,88 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// 测试替身：委托型可观察门禁（R11 M-R11-2 握手用）
+// 测试替身：委托型可观察门禁（R11 M-R11-2 / R13 M2 握手用）
 // ---------------------------------------------------------------------------
+
+// waitSignalContext 是"已抵达等待点"探针（R13 M2 / M-R13-1 的最小修复）。
+//
+// 依据被测实现的固定调用顺序 —— ctxMutex.lock 与 sleepContext 都是
+//
+//	① if err := ctx.Err(); err != nil { return err }    // 入口早退
+//	② select { case …: case <-ctx.Done(): }              // 真正的等待点
+//
+// 因此"Err() 已被观测为 nil 之后 Done() 被求值、且此刻 Err() 仍为 nil"
+// 等价于"该调用已经越过入口早退分支、正在进入 select 等待"：入口分支若命中，
+// 函数早已返回，Done() 根本不会被求值。用它取代"goroutine 一起跑就发信号"，
+// 消除"发完信号就被调度暂停"造成的假绿窗口。
+//
+// 只在首次满足条件的那一次 Done() 求值上回调一次；回调不阻塞、不改变被测行为。
+type waitSignalContext struct {
+	context.Context
+	onWait func()
+
+	mu       sync.Mutex
+	errIsNil bool
+	fired    bool
+}
+
+func newWaitSignalContext(ctx context.Context, onWait func()) *waitSignalContext {
+	return &waitSignalContext{Context: ctx, onWait: onWait}
+}
+
+func (c *waitSignalContext) Err() error {
+	err := c.Context.Err()
+	if err == nil {
+		c.mu.Lock()
+		c.errIsNil = true
+		c.mu.Unlock()
+	}
+	return err
+}
+
+func (c *waitSignalContext) Done() <-chan struct{} {
+	ch := c.Context.Done()
+	c.mu.Lock()
+	fire := !c.fired && c.errIsNil && c.Context.Err() == nil
+	if fire {
+		c.fired = true
+	}
+	c.mu.Unlock()
+	if fire {
+		c.onWait()
+	}
+	return ch
+}
+
+// newWaitSignalChan 返回一个容量 1 的信号通道与配套回调（回调满则丢弃，不阻塞被测方）
+func newWaitSignalChan() (chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	return ch, func() {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// waitSignal 在 timeout 内等待"已抵达等待点"探针信号。
+// 超时视为测试失败：它只用于证明"被测阶段确实已经发生"，不作为放行手段。
+func waitSignal(t *testing.T, ch <-chan struct{}, what string, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+		t.Fatalf("timed out after %v waiting for %s", timeout, what)
+	}
+}
 
 // trackedGateManager 把门禁调用原样委托给 inner（默认传 DefaultGateManager()，
 // 互斥语义完全由被测实现提供，本类型不参与加锁），只额外暴露：
-//   - hook：每次"进入等待 / 等待返回 / 释放"事件，供测试做确定性握手；
+//   - hook：每次"抵达 inner 的等待点 / 等待返回 / 释放"事件，供测试做确定性握手；
+//     其中 acquire-wait 由 waitSignalContext 探针在 inner **内部**求值 ctx.Done()
+//     时发出（R13 M2：不是"调用前发信号"，见该类型文档）；
 //   - acquired/released：获取与释放的顺序；
 //   - releaseRollbacks：每次释放时的 driver 回滚计数，用于断言"回滚先于释放"。
 type trackedGateManager struct {
@@ -41,12 +117,22 @@ func (g *trackedGateManager) emit(event string) {
 	}
 }
 
+// tracked 在挂了 hook 时把 ctx 包一层"已抵达等待点"探针；未挂 hook 的用例
+// （panic 顺序用例）原样透传，行为完全不变。
+func (g *trackedGateManager) tracked(ctx context.Context, label string) context.Context {
+	if g.hook == nil {
+		return ctx
+	}
+	return newWaitSignalContext(ctx, func() { g.emit("acquire-wait:" + label) })
+}
+
 func (g *trackedGateManager) AcquireLocalBusiness(ctx context.Context) error {
 	g.mu.Lock()
 	g.acquired = append(g.acquired, "business")
 	g.mu.Unlock()
-	g.emit("acquire-start:business")
-	err := g.inner.AcquireLocalBusiness(ctx)
+	// R13 M2：这里**不发**"起跑"信号。acquire-wait 由探针在 inner 越过入口
+	// ctx.Err() 检查、求值 ctx.Done()（即进入 select 等待）时发出。
+	err := g.inner.AcquireLocalBusiness(g.tracked(ctx, "business"))
 	g.emit("acquire-return:business")
 	return err
 }
@@ -55,8 +141,7 @@ func (g *trackedGateManager) AcquireLocalNamespace(ctx context.Context, ns strin
 	g.mu.Lock()
 	g.acquired = append(g.acquired, "ns:"+ns)
 	g.mu.Unlock()
-	g.emit("acquire-start:ns:" + ns)
-	err := g.inner.AcquireLocalNamespace(ctx, ns)
+	err := g.inner.AcquireLocalNamespace(g.tracked(ctx, "ns:"+ns), ns)
 	g.emit("acquire-return:ns:" + ns)
 	return err
 }
@@ -137,6 +222,13 @@ func TestDefaultGateManager_IsProcessWideSingleton(t *testing.T) {
 
 // TestTxRunner_DefaultGatesSerializeSameNamespace 两个使用默认门禁的并发 Run
 // （不同 TxRunner、不同 *sql.DB）必须在同一 namespace 的本地门禁层互斥（R2 C1）。
+//
+// R13 M2 的握手方式（全程事件驱动，不用"窗口内没有事件"当作 B 已在等待的证据）：
+//  1. B 的 acquire-wait 事件由探针在 inner 门禁**内部**发出（已越过入口 ctx.Err()
+//     早退分支、正在 select 上等待），不是"调用前发个信号就去抢跑"；
+//  2. A 仍持有时取消 B，要求 B 以 context.Canceled 结束、payload 恰 0 次 —— 这是
+//     正向事件断言：若门禁退化为不互斥，B 会先返回 nil 并进入 payload，必被捕获；
+//  3. 全过程不释放 A；释放 A 之后再独立验证同 namespace 的后继 Run 可以进入。
 func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 	ns := "w6a-c1-shared-" + t.Name()
 
@@ -144,6 +236,8 @@ func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 	defer dbA.Close()
 	dbB := getMockDB(t)
 	defer dbB.Close()
+	dbC := getMockDB(t)
+	defer dbC.Close()
 
 	var (
 		mu     sync.Mutex
@@ -153,6 +247,11 @@ func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 			events = append(events, ev)
 			mu.Unlock()
 		}
+		observed = func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), events...)
+		}
 	)
 
 	enteredA := make(chan struct{})
@@ -160,10 +259,8 @@ func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseA) }) }
 
-	// 握手（R11 M-R11-2 第 1 点）：两个 Run 各自包一层"委托给默认单例"的门禁管理器。
-	// 互斥仍由 DefaultGateManager() 这同一实例提供（被测语义不变），包装只暴露
-	// "已到达门禁 / 门禁已返回"事件，用来确定性地证明 B 确实在 A 持有期间到达门禁，
-	// 而不是靠 time.Sleep 猜 B 有没有被调度。
+	// 两个 Run 各自包一层"委托给默认单例"的门禁管理器。互斥仍由 DefaultGateManager()
+	// 这同一实例提供（被测语义不变），包装只上报"抵达等待点 / 等待返回 / 释放"事件。
 	gateEvents, hook := newGateEventHook()
 	gmA := &trackedGateManager{inner: DefaultGateManager(), tag: "A", hook: hook}
 	gmB := &trackedGateManager{inner: DefaultGateManager(), tag: "B", hook: hook}
@@ -172,16 +269,17 @@ func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	defer wg.Wait() // 先注册：最后执行，确保两个 Run 都退出
+	defer wg.Wait() // 先注册：最后执行，确保所有 Run goroutine 都退出
 	defer release()
 
 	runA := NewTxRunner(dbA)
 	runB := NewTxRunner(dbB)
 
+	aDone := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := runA.Run(ctx, TxRunnerOptions{RequiredNamespaces: []string{ns}, GateManager: gmA},
+		aDone <- runA.Run(ctx, TxRunnerOptions{RequiredNamespaces: []string{ns}, GateManager: gmA},
 			func(ctx context.Context, tx *sql.Tx, lockCtx *LockContext) error {
 				record("A:enter")
 				close(enteredA)
@@ -189,9 +287,6 @@ func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 				record("A:exit")
 				return nil
 			})
-		if err != nil {
-			t.Errorf("run A failed: %v", err)
-		}
 	}()
 
 	// 等 A 真正进入 payload（即已持有 ns 门禁）后再启动 B，避免调度顺序造成的假阴性
@@ -200,49 +295,82 @@ func TestTxRunner_DefaultGatesSerializeSameNamespace(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("run A never entered payload")
 	}
-	// A 的门禁获取早于 payload 返回，先把这两个事件排掉，后面只观察 B 的事件
+	// A 的门禁获取早于 payload，先把 A 自己的事件排掉，后面只观察 B 的事件
 	waitGateEvent(t, gateEvents, "A:acquire-return:ns:"+ns, 5*time.Second)
 
+	// —— B：在 A 仍持有门禁时到达同一个共享 namespace 门禁 ——
+	bCtx, cancelB := context.WithCancel(ctx)
+	defer cancelB()
+	bDone := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := runB.Run(ctx, TxRunnerOptions{RequiredNamespaces: []string{ns}, GateManager: gmB},
+		bDone <- runB.Run(bCtx, TxRunnerOptions{RequiredNamespaces: []string{ns}, GateManager: gmB},
 			func(ctx context.Context, tx *sql.Tx, lockCtx *LockContext) error {
 				record("B:enter")
 				return nil
 			})
-		if err != nil {
-			t.Errorf("run B failed: %v", err)
-		}
 	}()
 
-	// 握手 1：B 确实已经到达共享 namespace 门禁（证明它已起跑并正在等待，
-	// 而不是"还没被调度"，从而消除旧实现 200ms 窗口的假绿）
-	waitGateEvent(t, gateEvents, "B:acquire-start:ns:"+ns, 5*time.Second)
+	// 握手 1（明确事件，不是时间窗口）：B 已经越过入口 ctx.Err() 早退分支，
+	// 正在共享 namespace 门禁的 select 上等待。
+	waitGateEvent(t, gateEvents, "B:acquire-wait:ns:"+ns, 5*time.Second)
 
-	// 握手 2：A 仍持有门禁期间，B 既不得从门禁返回、也不得进入 payload。
-	// 若实现退化为"每次 Run 新建 manager"，B 的 acquire 会立即返回并被这里捕获。
-	// 下面 200ms 只是"本应立刻发生的事件"的观测窗口（B 已证明在 select 上等待），
-	// 不是让 B 起跑的同步手段。
+	// 握手 2（明确事件，不是时间窗口）：A 仍持有门禁，B 唯一的返回路径是 ctx 结束。
+	// 取消 B，要求它以"未取得门禁"结束。若门禁退化为不互斥（例如每次 Run 新建
+	// manager），B 的 Acquire 会先返回 nil 并进入 payload，下面的错误分类与
+	// payload 断言必有一项失败。
+	cancelB()
+
+	var errB error
 	select {
-	case ev := <-gateEvents:
-		t.Fatalf("namespace gate did not serialize two concurrent Runs: got %q while A still held the gate", ev)
-	case <-time.After(200 * time.Millisecond):
+	case errB = <-bDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked Run never returned after its ctx was cancelled while A still held the gate")
+	}
+	if !errors.Is(errB, context.Canceled) {
+		t.Fatalf("namespace gate did not serialize two concurrent Runs: B finished with %v while A still held the gate", errB)
 	}
 
-	mu.Lock()
-	observed := append([]string(nil), events...)
-	mu.Unlock()
-	if len(observed) != 1 || observed[0] != "A:enter" {
-		t.Fatalf("namespace gate did not serialize two concurrent Runs, events=%v", observed)
+	// A 仍在 payload 内（release 由本测试在下一步才触发）：此刻既不得有 A:exit，
+	// 更不得有 B:enter。
+	if got := observed(); len(got) != 1 || got[0] != "A:enter" {
+		t.Fatalf("namespace gate did not serialize two concurrent Runs, events=%v", got)
 	}
 
+	// —— 释放 A：A 正常结束，其门禁由 Run 逆序释放 ——
 	release()
-	wg.Wait()
+	select {
+	case err := <-aDone:
+		if err != nil {
+			t.Fatalf("run A failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run A never returned after release")
+	}
+
+	// —— 后继 Run：A 释放后同一 namespace 必须可再次进入（B 的取消没有把门禁留在
+	// 持有态）。这里刻意不注入 GateManager，顺带覆盖"为 nil 时选默认单例"的分支。
+	cDone := make(chan error, 1)
+	go func() {
+		cDone <- NewTxRunner(dbC).Run(ctx, TxRunnerOptions{RequiredNamespaces: []string{ns}},
+			func(ctx context.Context, tx *sql.Tx, lockCtx *LockContext) error {
+				record("C:enter")
+				return nil
+			})
+	}()
+	select {
+	case err := <-cDone:
+		if err != nil {
+			t.Fatalf("successor Run on the same namespace failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("successor Run never entered after A released the namespace gate")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	want := []string{"A:enter", "A:exit", "B:enter"}
+	want := []string{"A:enter", "A:exit", "C:enter"}
 	if len(events) != len(want) {
 		t.Fatalf("unexpected event sequence: got %v, want %v", events, want)
 	}
@@ -455,18 +583,18 @@ func TestMemoryGateManager_WaitIsCancellable(t *testing.T) {
 	}
 
 	// 主动取消（business gate）。business 门禁此刻已被本测试持有，因此
-	// AcquireLocalBusiness 唯一的返回路径就是 ctx 取消：用"起跑握手 → cancel"
-	// 取代 time.Sleep 触发取消（R11 M-R11-2），消除调度窗口。
+	// AcquireLocalBusiness 唯一的返回路径就是 ctx 取消：用"已抵达等待点探针 → cancel"
+	// 取代 time.Sleep 触发取消（R11 M-R11-2，R13 M2 把探针从"起跑"改为"已进入等待"）。
 	ctxCancel, cancel := context.WithCancel(bg)
 	defer cancel()
 
+	businessWaiting, notifyBusinessWaiting := newWaitSignalChan()
 	businessErr := make(chan error, 1)
-	started := make(chan struct{})
 	go func() {
-		close(started) // 握手：等待方已起跑
-		businessErr <- gm.AcquireLocalBusiness(ctxCancel)
+		businessErr <- gm.AcquireLocalBusiness(newWaitSignalContext(ctxCancel, notifyBusinessWaiting))
 	}()
-	<-started
+	// 探针：AcquireLocalBusiness 已越过入口 ctx.Err() 检查、正在 select 上等待
+	waitSignal(t, businessWaiting, "AcquireLocalBusiness reached its wait point", 5*time.Second)
 
 	start = time.Now()
 	cancel()
@@ -565,26 +693,38 @@ func TestTxRunner_BackoffSleepIsCancellable(t *testing.T) {
 	}
 }
 
-// TestSleepContext_CancelsWhileSleeping 直接证明默认退避休眠"真的在等待"，
-// 并在 ctx 取消时立即返回：补上 Run 级用例无法区分的"入口 ctx.Err() 早退"与
-// "select 等待中被取消"两条路径（R11 M-R11-2 第 2 点）。
+// TestSleepContext_CancelsWhileSleeping 直接证明默认退避休眠"真的在 select 上等待"，
+// 并在 ctx 取消时立即返回（R11 M-R11-2 第 2 点；R13 M-R13-1 补起跑握手）。
+//
+// 握手语义：探针只在"Err() 已被观测为 nil 之后 Done() 被求值、且此刻 Err() 仍为 nil"
+// 时发信号。sleepContext 的顺序是 ①入口 ctx.Err() 早退 ②d<=0 早退 ③select，
+// 因此收到信号即证明它已经走过两条早退分支、只剩 select 一条路径可走 ——
+// "取消后才被调度、走入口早退"的执行根本不会求值 Done()，也就永远发不出该信号，
+// 用例会在握手处超时失败，而不是全绿。
 func TestSleepContext_CancelsWhileSleeping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	const sleepFor = 60 * time.Second
 
+	waiting, notifyWaiting := newWaitSignalChan()
 	done := make(chan error, 1)
-	go func() { done <- sleepContext(ctx, sleepFor) }()
+	go func() {
+		done <- sleepContext(newWaitSignalContext(ctx, notifyWaiting), sleepFor)
+	}()
 
-	// 60s 的休眠不得自行返回：若在取消前就返回，说明它没有真正等待
-	// （这里的 100ms 是"60s vs 立刻"的观测窗口，不是被测阶段的同步手段）
+	// 握手：确认已进入 select 等待点（超时即失败，不以"窗口内没返回"作为等待证据）
+	waitSignal(t, waiting, "sleepContext reached its select wait point", 5*time.Second)
+
+	// 早退分支已被上面的握手排除：此刻不得返回。
+	// （done 的写入严格晚于探针回调，因此这是一次确定性的即时检查，不是观测窗口）
 	select {
 	case err := <-done:
 		t.Fatalf("sleepContext(%v) returned before cancellation: %v", sleepFor, err)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 
+	start := time.Now()
 	cancel()
 
 	select {
@@ -594,6 +734,9 @@ func TestSleepContext_CancelsWhileSleeping(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("sleepContext did not return after cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("sleepContext not cancellable at its wait point, took %v", elapsed)
 	}
 }
 
@@ -764,6 +907,10 @@ func TestLockAPIs_NilTxRejected(t *testing.T) {
 // TestLockAPIs_OrderCheckPrecedesNilTx R11 I-R11-1 回归：两个导出执行入口对
 // "乱序 / 重复候选 + nil tx" 必须给出同一分类 ErrOutOfOrderLock（且不得命中 ErrNilTx）；
 // "有序（含空候选集）+ nil tx" 仍必须 ErrNilTx fail closed。
+//
+// R13 M-R13-2：断言改为对**每个「入口 × 输入」组合**都保留各自的 LockContext，
+// 并在错误分类之后断言 `len(lc.ReleaseEvents()) == 0` —— 失败路径不得登记任何锁事件；
+// verifier 总次数断言移到全部调用之后。
 func TestLockAPIs_OrderCheckPrecedesNilTx(t *testing.T) {
 	ctx := context.Background()
 
@@ -777,70 +924,80 @@ func TestLockAPIs_OrderCheckPrecedesNilTx(t *testing.T) {
 	duplicate := []EntityKey{{Table: TableOrderTasks, PK: 10}, {Table: TableOrderTasks, PK: 10}}
 	ordered := []EntityKey{{Table: TableOrderTasks, PK: 10}, {Table: TableOrderTasks, PK: 20}}
 
-	// ① 乱序 / 重复 + nil tx → 两入口一致先报 ErrOutOfOrderLock
-	for _, tc := range []struct {
+	// 两个导出执行入口：底层 / 组合
+	entries := []struct {
 		name string
-		keys []EntityKey
+		call func(context.Context, *sql.Tx, *LockContext, []EntityKey) error
 	}{
-		{"unsorted", unsorted},
-		{"duplicate", duplicate},
-	} {
-		err := LockEntitiesInOrder(ctx, nil, NewLockContext(), tc.keys)
-		if !errors.Is(err, ErrOutOfOrderLock) || errors.Is(err, ErrNilTx) {
-			t.Errorf("LockEntitiesInOrder(%s): expected ErrOutOfOrderLock only, got %v", tc.name, err)
-		}
+		{"LockEntitiesInOrder", func(ctx context.Context, tx *sql.Tx, lc *LockContext, keys []EntityKey) error {
+			return LockEntitiesInOrder(ctx, tx, lc, keys)
+		}},
+		{"LockAndVerify", func(ctx context.Context, tx *sql.Tx, lc *LockContext, keys []EntityKey) error {
+			_, err := LockAndVerify(ctx, tx, lc, &LocatorSnapshot{CandidateKeys: keys}, verifier)
+			return err
+		}},
+	}
 
-		_, err = LockAndVerify(ctx, nil, NewLockContext(), &LocatorSnapshot{CandidateKeys: tc.keys}, verifier)
-		if !errors.Is(err, ErrOutOfOrderLock) {
-			t.Errorf("LockAndVerify(%s): expected ErrOutOfOrderLock, got %v", tc.name, err)
-		}
-		if errors.Is(err, ErrNilTx) {
-			t.Errorf("LockAndVerify(%s): nil tx must not mask the ordering error, got %v", tc.name, err)
+	// ① 每个「入口 × 输入」组合：错误分类互斥且正确 + 被拒调用不得登记任何锁事件
+	for _, e := range entries {
+		for _, tc := range []struct {
+			name string
+			keys []EntityKey
+			want error
+		}{
+			{"unsorted", unsorted, ErrOutOfOrderLock},
+			{"duplicate", duplicate, ErrOutOfOrderLock},
+			{"ordered", ordered, ErrNilTx},
+			{"empty", nil, ErrNilTx},
+		} {
+			other := ErrNilTx
+			if tc.want == ErrNilTx {
+				other = ErrOutOfOrderLock
+			}
+
+			lc := NewLockContext()
+			err := e.call(ctx, nil, lc, tc.keys)
+			if !errors.Is(err, tc.want) {
+				t.Errorf("%s(%s): expected %v, got %v", e.name, tc.name, tc.want, err)
+			}
+			if errors.Is(err, other) {
+				t.Errorf("%s(%s): must not be classified as %v, got %v", e.name, tc.name, other, err)
+			}
+			if n := len(lc.ReleaseEvents()); n != 0 {
+				t.Errorf("%s(%s): rejected call must not record locks, history=%d", e.name, tc.name, n)
+			}
 		}
 	}
 
-	// ② 有序（含空候选集）+ nil tx → 两入口均 ErrNilTx，绝不"离线假成功"
-	for _, tc := range []struct {
-		name string
-		keys []EntityKey
-	}{
-		{"ordered", ordered},
-		{"empty", nil},
-	} {
+	// ② 可诊断性：组合入口的 nil tx 错误必须透出真正失败的步骤（同样不得登记）
+	{
 		lc := NewLockContext()
-		if err := LockEntitiesInOrder(ctx, nil, lc, tc.keys); !errors.Is(err, ErrNilTx) {
-			t.Errorf("LockEntitiesInOrder(%s): expected ErrNilTx, got %v", tc.name, err)
-		} else if errors.Is(err, ErrOutOfOrderLock) {
-			t.Errorf("LockEntitiesInOrder(%s): sorted keys must not report ordering error, got %v", tc.name, err)
+		_, err := LockAndVerify(ctx, nil, lc, &LocatorSnapshot{CandidateKeys: ordered}, verifier)
+		if err == nil || !strings.Contains(err.Error(), "LockEntitiesInOrder") {
+			t.Errorf("combined entry must keep the failing step in the nil tx message, got %v", err)
 		}
 		if n := len(lc.ReleaseEvents()); n != 0 {
-			t.Errorf("LockEntitiesInOrder(%s): rejected call must not record locks, history=%d", tc.name, n)
-		}
-
-		_, err := LockAndVerify(ctx, nil, NewLockContext(), &LocatorSnapshot{CandidateKeys: tc.keys}, verifier)
-		if !errors.Is(err, ErrNilTx) {
-			t.Errorf("LockAndVerify(%s): expected ErrNilTx, got %v", tc.name, err)
-		} else if errors.Is(err, ErrOutOfOrderLock) {
-			t.Errorf("LockAndVerify(%s): sorted keys must not report ordering error, got %v", tc.name, err)
+			t.Errorf("combined entry (ordered): rejected call must not record locks, history=%d", n)
 		}
 	}
 
-	// ③ 可诊断性：组合入口的 nil tx 错误必须透出真正失败的步骤
-	_, err := LockAndVerify(ctx, nil, NewLockContext(), &LocatorSnapshot{CandidateKeys: ordered}, verifier)
-	if err == nil || !strings.Contains(err.Error(), "LockEntitiesInOrder") {
-		t.Errorf("combined entry must keep the failing step in the nil tx message, got %v", err)
+	// ③ nil snapshot 仍是组合入口独有的最前置检查，且不被上面两类错误掩盖；
+	//    它同样声称"拒绝即不登记"，因此也要独立 lc 检查
+	{
+		lc := NewLockContext()
+		if _, err := LockAndVerify(ctx, nil, lc, nil, verifier); err == nil ||
+			errors.Is(err, ErrNilTx) || errors.Is(err, ErrOutOfOrderLock) ||
+			!strings.Contains(err.Error(), "snapshot") {
+			t.Errorf("nil snapshot must be rejected first with its own error, got %v", err)
+		}
+		if n := len(lc.ReleaseEvents()); n != 0 {
+			t.Errorf("nil snapshot: rejected call must not record locks, history=%d", n)
+		}
 	}
 
-	// ④ 加锁失败路径不得触达 verifier（不会"未加锁先核验"）
+	// ④ 加锁失败路径不得触达 verifier（不会"未加锁先核验"）——放在全部调用之后统计
 	if verifierCalls != 0 {
 		t.Errorf("verifier must not be called when locking fails, calls=%d", verifierCalls)
-	}
-
-	// ⑤ nil snapshot 仍是组合入口独有的最前置检查，且不被上面两类错误掩盖
-	if _, err := LockAndVerify(ctx, nil, NewLockContext(), nil, verifier); err == nil ||
-		errors.Is(err, ErrNilTx) || errors.Is(err, ErrOutOfOrderLock) ||
-		!strings.Contains(err.Error(), "snapshot") {
-		t.Errorf("nil snapshot must be rejected first with its own error, got %v", err)
 	}
 }
 
