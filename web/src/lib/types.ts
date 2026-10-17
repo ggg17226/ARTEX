@@ -521,7 +521,8 @@ export interface FindingsPage {
 }
 
 export interface FindingGroup {
-  task_id: string | number | null;
+  // P03：task_id 是 64 位任务主键，wire 一律 string；null = 未分配/任务已删。
+  task_id: string | null;
   task_name?: string; // 可选任务名称;空/缺省=未命名
   task_description: string;
   task_status: string;
@@ -563,7 +564,8 @@ export interface FindingStats {
 // FindingTaskOption 是发现页「按任务」筛选下拉的一项:有漏洞的任务(描述为空表示任务已删除,
 // 前端回退展示 id)及其漏洞条数。
 export interface FindingTaskOption {
-  id: string | number;
+  // P03：任务主键（BIGINT）在 wire 上一律 string。
+  id: string;
   name?: string; // 可选任务名称;空/缺省=未命名
   description: string;
   count: number;
@@ -638,7 +640,9 @@ export interface ChatAttachment {
 }
 
 export interface Activity {
-  seq: number;
+  // P03：seq 是 db.Activity.ID（BIGINT 主键别名），wire 一律 string；
+  // 大小比较必须用 BigInt，禁止字典序。
+  seq: string;
   intent_id?: string;
   worker: string; // session owner: planner | mainagent | work#1 ...
   ts: string;
@@ -750,7 +754,8 @@ export interface Conversation {
 // ---- Backend logs (/logs page) ----
 export interface LogLine {
   seq: number;
-  db_id?: number; // server_logs.id; present for DB-persisted lines
+  // P03：server_logs.id（BIGINT）在 wire 上是 string；未落库时后端 omit 该字段。
+  db_id?: string;
   ts: string;
   level: "info" | "warn" | "error";
   tag: string;
@@ -1607,6 +1612,7 @@ export interface InterceptExecution {
   conversation_id: string | null;
   task_id: string | null;
   session: string;
-  seq: number;
+  // P03 R05：seq 承载 activity 主键（BIGINT），wire 一律 string；比较用 BigInt。
+  seq: string;
   items: Activity[];
 }

@@ -49,13 +49,12 @@ export default function LogsPage() {
   pausedRef.current = paused;
 
   // Minimum db_id seen — used as the cursor for loading older history.
-  const minDbId = React.useMemo(() => {
-    let min = 0;
-    for (const l of lines) {
-      if (l.db_id && (min === 0 || l.db_id < min)) min = l.db_id;
-    }
-    return min;
-  }, [lines]);
+  // P03：db_id 是 server_logs.id（wire string）。求最小值必须按 BigInt 数值语义：
+  // 字典序会把 "1000" 判成比 "999" 小，导致「加载更早」反复拉同一页。
+  const minDbId = React.useMemo(
+    () => lines.reduce((min, l) => (l.db_id && (min === "" || BigInt(l.db_id) < BigInt(min)) ? l.db_id : min), ""),
+    [lines],
+  );
 
   // Live tail via SSE. on connect, replays whatever is in the ring (includes
   // DB-restored history from the last 100 rows written before restart).
@@ -79,14 +78,14 @@ export default function LogsPage() {
 
   // Mark "has more" once we have any db_id in view.
   React.useEffect(() => {
-    if (minDbId > 1) setHasMore(true);
+    if (BigInt(minDbId || "0") > BigInt(1)) setHasMore(true);
   }, [minDbId]);
 
   async function loadOlderHistory() {
     if (loadingHistory) return;
     setLoadingHistory(true);
     try {
-      const params = minDbId > 0 ? `?before=${minDbId}&limit=200` : `?limit=200`;
+      const params = BigInt(minDbId || "0") > BigInt(0) ? `?before=${encodeURIComponent(minDbId)}&limit=200` : `?limit=200`;
       const res = await fetch(`/api/logs/history${params}`);
       if (!res.ok) return;
       const data = await res.json() as { items: LogLine[]; has_more: boolean };
@@ -100,7 +99,7 @@ export default function LogsPage() {
           }));
           // Prepend, dedup by db_id, cap at 5000.
           const merged = [...older, ...prev];
-          const seen = new Set<number>();
+          const seen = new Set<string>();
           const deduped = merged.filter((l) => {
             if (!l.db_id) return true;
             if (seen.has(l.db_id)) return false;

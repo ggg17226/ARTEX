@@ -359,8 +359,10 @@ export const api = {
     }>(`/tasks/${taskId}/intents/${intentId}/messages`, { message, request_id: requestId }),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),
   // 重跑一条没跑成功的意图(blocked/exhausted/stopped)：置回 open，worker 会重新认领、从头再跑。
+  // P03：单条重跑的 reopened 是被重开的 intent 主键（wire string）；
+  // 批量重跑（rerun-blocked）的 reopened 是条数计数，保持 number。
   rerunIntent: (taskId: string, intentId: string) =>
-    post<{ id: string; reopened: number }>(`/tasks/${taskId}/intents/${intentId}/rerun`),
+    post<{ id: string; reopened: string }>(`/tasks/${taskId}/intents/${intentId}/rerun`),
   // 批量重跑本任务全部 blocked 意图（一次网络/LLM 断连导致多条 blocked 时一键全部重试）。
   rerunBlocked: (taskId: string) => post<{ id: string; reopened: number }>(`/tasks/${taskId}/intents/rerun-blocked`),
   setActive: (id: string) => post<{ active: string }>("/active", { id }),
@@ -505,7 +507,9 @@ export const api = {
     }),
   registerTaskAssetScopes: (taskId: string, scope: CompanyScopeRule[]) =>
     post<TaskAssetScopeMutation>(`/tasks/${taskId}/assets`, { scope }),
-  detachTaskAsset: (taskId: string, assetId: string) => del<{ detached: number }>(`/tasks/${taskId}/assets/${assetId}`),
+  // P03：detached 回显的是被摘除的 asset_id（64 位 ID），wire string。
+  detachTaskAsset: (taskId: string, assetId: string) =>
+    del<{ detached: string }>(`/tasks/${taskId}/assets/${assetId}`),
   taskIntentAssets: (taskId: string) =>
     get<{ assets: IntentAsset[] }>(`/tasks/${taskId}/intent-assets`).then((r) => arr(r.assets)),
 
@@ -718,11 +722,12 @@ export const api = {
       assets: r.assets ?? {},
     }));
   },
-  activity: (task?: string, opts?: { intent?: string; since?: string | number; limit?: number }) => {
+  // P03：since 是 activity 主键游标（BIGINT），wire 一律 string；"0" = 从头开始。
+  activity: (task?: string, opts?: { intent?: string; since?: string; limit?: number }) => {
     const q = new URLSearchParams();
     if (task) q.set("task", task);
     if (opts?.intent) q.set("intent", opts.intent);
-    if (opts?.since !== undefined) q.set("since", String(opts.since));
+    if (opts?.since !== undefined) q.set("since", opts.since);
     if (opts?.limit) q.set("limit", String(opts.limit));
     return get<{ items: Activity[]; cursor: string }>(`/exploration/activity?${q.toString()}`).then((r) => ({
       items: arr(r.items),
@@ -735,10 +740,11 @@ export const api = {
   // snapshotCursor is the TASK-level max id at query time — open the task SSE at
   // since=snapshotCursor so history (id≤cursor) and the live tail (id>cursor) meet
   // gap-free. hasMore = still-older steps exist (drives scroll-up loading).
-  activityHistory: (task: string, session: string, before: string | number = "0", limit = 200) => {
+  // P03：before / snapshot_cursor / earliest_cursor 都是 activity 主键游标，一律 string。
+  activityHistory: (task: string, session: string, before = "0", limit = 200) => {
     const q = new URLSearchParams({ session, limit: String(limit) });
     if (task) q.set("task", task);
-    if (String(before) !== "0" && before !== 0) q.set("before", String(before));
+    if (before && before !== "0") q.set("before", before);
     return get<{ items: Activity[]; snapshot_cursor: string; earliest_cursor: string; has_more: boolean }>(
       `/exploration/activity/history?${q.toString()}`,
     ).then((r) => ({
@@ -750,10 +756,11 @@ export const api = {
   },
   // Paged worker (intent) session list — reaches past the legacy fixed 300 cap.
   // before=0 → newest page; before=<id> → older page. has_more = older intents exist.
-  intentsPage: (task: string, before: string | number = "0", limit = 300) => {
+  // P03：before 是 intent 节点主键游标（BIGINT），wire 一律 string。
+  intentsPage: (task: string, before = "0", limit = 300) => {
     const q = new URLSearchParams({ limit: String(limit) });
     if (task) q.set("task", task);
-    q.set("before", String(before));
+    q.set("before", before);
     q.set("page", "1"); // marker so the backend returns the paged {items,has_more} shape
     return get<{ items: TaskNode[]; has_more: boolean }>(`/exploration/intents?${q.toString()}`).then((r) => ({
       items: arr(r.items),
@@ -1017,21 +1024,24 @@ export const api = {
   deleteConversations: (ids: string[]) =>
     post<{ items: { id: string; ok: boolean; error?: string }[] }>("/conversations/delete/batch", { ids }),
   // Incremental tail: steps after `since` (id ASC) — live poll + post-send fetch.
-  conversationMessages: (id: string, since: string | number = "0") =>
-    get<{ items: Activity[]; cursor: string | number; running: boolean }>(`/conversations/${id}/messages?since=${since}`).then(
-      (r) => ({ items: arr(r.items), cursor: r.cursor ?? "0", running: !!r.running }),
-    ),
+  // P03：since / cursor 都是 conversation_activities 主键游标（BIGINT），wire 一律 string。
+  conversationMessages: (id: string, since = "0") =>
+    get<{ items: Activity[]; cursor: string; running: boolean }>(
+      `/conversations/${id}/messages?since=${encodeURIComponent(since)}`,
+    ).then((r) => ({ items: arr(r.items), cursor: r.cursor ?? "0", running: !!r.running })),
   // Reverse pagination: the latest `limit` steps (before=0) or the page of older
   // steps ending before id `before`. hasMore = still-older steps exist.
-  conversationHistory: (id: string, before: string | number = "0", limit = 200) => {
+  // P03：before / cursor 同样是主键游标，一律 string。
+  conversationHistory: (id: string, before = "0", limit = 200) => {
     const q = new URLSearchParams({ limit: String(limit) });
-    if (String(before) !== "0" && before !== 0) q.set("before", String(before));
-    return get<{ items: Activity[]; cursor: string | number; running: boolean; hasMore: boolean }>(
+    if (before && before !== "0") q.set("before", before);
+    return get<{ items: Activity[]; cursor: string; running: boolean; hasMore: boolean }>(
       `/conversations/${id}/messages?${q.toString()}`,
     ).then((r) => ({ items: arr(r.items), cursor: r.cursor ?? "0", running: !!r.running, hasMore: !!r.hasMore }));
   },
-  conversationMsgDetail: (id: string, seq: number) =>
-    get<{ detail: string }>(`/conversations/${id}/messages/${seq}`).then((r) => r.detail ?? ""),
+  // P03：seq 是 conversation_activities.id（BIGINT），wire 一律 string。
+  conversationMsgDetail: (id: string, seq: string) =>
+    get<{ detail: string }>(`/conversations/${id}/messages/${encodeURIComponent(seq)}`).then((r) => r.detail ?? ""),
   sendConversationMessage: (id: string, message: string, attachments?: ChatAttachment[]) =>
     post<{ status: string }>(`/conversations/${id}/messages`, { message, attachments }),
   stopConversation: (id: string) => post<{ status: string }>(`/conversations/${id}/stop`, {}),
@@ -1113,8 +1123,9 @@ export const api = {
     get<{ exists: boolean; configured: boolean; enabled: boolean; reachable: boolean; url?: string; tools: string[] }>(
       "/sync/scopesentry/status",
     ),
+  // P03：id 是本地 MCP server 主键（SaveMCP 返回的 64 位 ID），wire 一律 string。
   ssDatasource: (body: { url?: string; api_key?: string }) =>
-    post<{ id: number; enabled: boolean }>("/sync/scopesentry/datasource", body),
+    post<{ id: string; enabled: boolean }>("/sync/scopesentry/datasource", body),
   ssProjects: (page = 1, size = 50, search = "") =>
     get<{ projects: SSProject[]; tag: Record<string, number> }>(
       `/sync/scopesentry/projects?page=${page}&size=${size}${search ? `&search=${encodeURIComponent(search)}` : ""}`,

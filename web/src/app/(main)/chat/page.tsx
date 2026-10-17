@@ -503,8 +503,9 @@ function ChatView({
   // 方式1 文件上传:已上传的附件(落到 sessions/conv-<id>/uploads/),随下条消息一起发。
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>(initial?.attachments ?? []);
   const [uploading, setUploading] = React.useState(false);
-  const cursorRef = React.useRef<string | number>(0); // newest loaded id — incremental-tail anchor
-  const earliestRef = React.useRef(0); // earliest loaded id — reverse-pagination anchor
+  // P03：cursor / earliest 都是 conversation_activities 主键游标，wire 一律 string。
+  const cursorRef = React.useRef<string>("0"); // newest loaded id — incremental-tail anchor
+  const earliestRef = React.useRef<string>("0"); // earliest loaded id — reverse-pagination anchor
   const hasMoreRef = React.useRef(false); // older history remains above the loaded window
   const loadingMoreRef = React.useRef(false); // guard: one scroll-up load at a time
   const [historyLoaded, setHistoryLoaded] = React.useState(false);
@@ -523,7 +524,7 @@ function ChatView({
   }
 
   // conversation-scoped detail fetcher for the reused Transcript renderer.
-  const fetchDetail = React.useCallback((seq: number) => api.conversationMsgDetail(conv.id, seq), [conv.id]);
+  const fetchDetail = React.useCallback((seq: string) => api.conversationMsgDetail(conv.id, seq), [conv.id]);
 
   // seq of the most-recent TodoWrite tool call (for the Todo popover); null if none.
   const latestTodoSeq = React.useMemo(() => {
@@ -540,8 +541,8 @@ function ChatView({
   // page, so the completed result was missing until another message advanced the
   // cursor). Older history streams in on scroll-up (loadEarlier below).
   React.useEffect(() => {
-    cursorRef.current = 0;
-    earliestRef.current = 0;
+    cursorRef.current = "0";
+    earliestRef.current = "0";
     hasMoreRef.current = false;
     setHasMore(false);
     setMessages([]);
@@ -549,12 +550,12 @@ function ChatView({
     setRunning(false);
     let live = true;
     api
-      .conversationHistory(conv.id, 0, HISTORY_PAGE)
+      .conversationHistory(conv.id, "0", HISTORY_PAGE)
       .then((r) => {
         if (!live) return;
         setMessages((current) => mergeActivities(r.items, current));
         if (BigInt(r.cursor || "0") > BigInt(cursorRef.current || "0")) cursorRef.current = r.cursor;
-        earliestRef.current = r.items.length ? r.items[0].seq : 0;
+        earliestRef.current = r.items.length ? r.items[0].seq : "0";
         hasMoreRef.current = r.hasMore;
         setHasMore(r.hasMore);
         setRunning((current) => current || r.running);
@@ -607,7 +608,7 @@ function ChatView({
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 
-  const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
+  const loadFocusPage = React.useCallback((before: string) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
     setMessages((prev) => mergeActivities(page.items, prev));
     earliestRef.current = page.items[0]?.seq ?? earliestRef.current;

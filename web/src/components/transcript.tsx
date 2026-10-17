@@ -76,13 +76,14 @@ function useInView(rootMargin = "400px"): [React.RefObject<HTMLDivElement | null
 // A tool group pairs a tool_use with its matching tool_result (by tool_use_id);
 // a run of consecutive conversational steps (text/thinking/result) from the same
 // agent is one "message".
+// P03：Activity.seq 是 activity 主键（wire string），Group.key 直接沿用。
 type Group =
-  | { type: "user"; key: number; step: Activity; intent?: boolean }
-  | { type: "answer"; key: number; step: Activity }
-  | { type: "round"; key: number; label: string }
-  | { type: "tool"; key: number; worker: string; use?: Activity; result?: Activity }
-  | { type: "msg"; key: number; worker: string; steps: Activity[] }
-  | { type: "intercept"; key: number; step: Activity };
+  | { type: "user"; key: string; step: Activity; intent?: boolean }
+  | { type: "answer"; key: string; step: Activity }
+  | { type: "round"; key: string; label: string }
+  | { type: "tool"; key: string; worker: string; use?: Activity; result?: Activity }
+  | { type: "msg"; key: string; worker: string; steps: Activity[] }
+  | { type: "intercept"; key: string; step: Activity };
 
 function groupSteps(steps: Activity[], chat: boolean): Group[] {
   const out: Group[] = [];
@@ -189,7 +190,7 @@ function InterceptCard({
   getDetail,
 }: {
   step: Activity;
-  getDetail: (seq: number) => Promise<string>;
+  getDetail: (seq: string) => Promise<string>;
 }) {
   // extract pending_id from summary: "工具 Bash 请求审批 (#42)"
   const pendingId = React.useMemo(() => {
@@ -358,7 +359,7 @@ function ToolBlock({
   focused = false,
 }: {
   group: Extract<Group, { type: "tool" }>;
-  getDetail: (seq: number) => Promise<string>;
+  getDetail: (seq: string) => Promise<string>;
   showWorker?: boolean;
   focused?: boolean;
 }) {
@@ -390,7 +391,7 @@ function ToolBlock({
   React.useEffect(() => {
     if (!open || loadedKey.current === detailKey) return;
     let live = true;
-    const segs: { label: string; seq: number }[] = [];
+    const segs: { label: string; seq: string }[] = [];
     if (use) segs.push({ label: "命令", seq: use.seq });
     if (result) segs.push({ label: "输出" + (result.is_error ? " ✕" : " ✓"), seq: result.seq });
     void Promise.all(
@@ -487,7 +488,7 @@ function MessageBlock({
   showWorker,
 }: {
   group: Extract<Group, { type: "msg" }>;
-  getDetail: (seq: number) => Promise<string>;
+  getDetail: (seq: string) => Promise<string>;
   showWorker?: boolean;
 }) {
   const [open, setOpen] = React.useState(false);
@@ -579,7 +580,7 @@ function parseUserBody(body: string): { text: string; attachments: MsgAttachment
   return { text: body, attachments: [] };
 }
 
-function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean; getDetail: (seq: number) => Promise<string> }) {
+function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean; getDetail: (seq: string) => Promise<string> }) {
   const Icon = intent ? CrosshairIcon : UserIcon;
   const [ref, inView] = useInView();
   // Optimistic echoes carry their detail inline; persisted rows lazy-load it on scroll.
@@ -636,7 +637,7 @@ function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean
 // AnswerBlock renders the agent's FINAL answer (kind="result") in full — never
 // collapsed. The summary is a truncated first line, so the full text is pulled
 // from the detail and shown inline.
-function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: number) => Promise<string> }) {
+function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: string) => Promise<string> }) {
   const [ref, inView] = useInView();
   const [full, setFull] = React.useState<string | null>(null);
   React.useEffect(() => {
@@ -686,14 +687,14 @@ function ExecView({
   activity: Activity[];
   taskId?: string;
   chat?: boolean;
-  fetchDetail?: (seq: number) => Promise<string>;
-  focusedSeq?: number;
+  fetchDetail?: (seq: string) => Promise<string>;
+  focusedSeq?: string;
 }) {
   const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
   // its own (conversation-scoped) fetcher instead.
   const getDetail = React.useCallback(
-    (seq: number) => (fetchDetail ? fetchDetail(seq) : api.activityDetail(String(seq), taskId).then((r) => r.detail ?? "")),
+    (seq: string) => (fetchDetail ? fetchDetail(seq) : api.activityDetail(seq, taskId).then((r) => r.detail ?? "")),
     [fetchDetail, taskId],
   );
   return (
@@ -742,8 +743,8 @@ export function Transcript({
   live?: boolean;
   taskId?: string;
   chat?: boolean;
-  fetchDetail?: (seq: number) => Promise<string>;
-  focusedSeq?: number;
+  fetchDetail?: (seq: string) => Promise<string>;
+  focusedSeq?: string;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);

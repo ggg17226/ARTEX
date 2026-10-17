@@ -13,7 +13,9 @@ export const mentionKinds = [
 export type MentionKind = (typeof mentionKinds)[number]["kind"];
 export interface ChatMention {
   kind: MentionKind;
-  id: number;
+  // P03 R25：id 是 64 位实体 ID（finding / company / asset / …），wire 一律 string；
+  // 拼 mention token 前不得再经 number，避免精度丢失。
+  id: string;
   label: string;
   description: string;
 }

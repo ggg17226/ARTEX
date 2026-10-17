@@ -50,6 +50,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
+import { compareSeq } from "@/lib/activity-merge";
 import { api, sseUrl } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
@@ -121,7 +122,8 @@ type SessionState = {
   loading: boolean;
   loadingMore: boolean;
   hasMore: boolean; // older history remains above the loaded window
-  earliestSeq: number; // earliest loaded id — reverse-pagination anchor
+  // P03：earliestSeq 是 activity 主键游标（wire string）；"0" = 尚无锚点。
+  earliestSeq: string; // earliest loaded id — reverse-pagination anchor
   unread: number;
   lastTs: string; // most-recent activity time (drives live badge; updated even when unloaded)
   error?: string;
@@ -135,7 +137,7 @@ function emptyState(): SessionState {
     loading: false,
     loadingMore: false,
     hasMore: false,
-    earliestSeq: 0,
+    earliestSeq: "0",
     unread: 0,
     lastTs: "",
   };
@@ -156,10 +158,11 @@ function sessionKeyOf(a: Activity): string {
 // this, so history responses can never clobber live records received meanwhile.
 function mergeBySeq(current: Activity[], incoming: Activity[]): Activity[] {
   if (!incoming.length) return current;
-  const bySeq = new Map<number, Activity>();
+  const bySeq = new Map<string, Activity>();
   for (const a of current) bySeq.set(a.seq, a);
   for (const a of incoming) bySeq.set(a.seq, a);
-  return [...bySeq.values()].sort((p, q) => p.seq - q.seq);
+  // P03：seq 是 activity 主键（wire string），排序必须走 BigInt，禁止字典序。
+  return [...bySeq.values()].sort((p, q) => compareSeq(p.seq, q.seq));
 }
 
 // statusIcon maps a session status to its icon. Worker terminal states are
@@ -646,7 +649,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const esRef = React.useRef<EventSource | null>(null);
   const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
-  const llmToastSeqRef = React.useRef<Set<number>>(new Set());
+  const llmToastSeqRef = React.useRef<Set<string>>(new Set());
   const chatStatusRequestRef = React.useRef(0);
   const firstIntentsRef = React.useRef<TaskNode[]>([]);
   // Per-key request token: a stale response for a key is ignored (guards fast
@@ -698,7 +701,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               loaded: true,
               loading: false,
               hasMore: false,
-              earliestSeq: items.length ? items[0].seq : 0,
+              earliestSeq: items.length ? items[0].seq : "0",
               unread: 0,
               lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
               error: undefined,
@@ -718,7 +721,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       }
 
       api
-        .activityHistory(taskId, key, 0, PAGE)
+        .activityHistory(taskId, key, "0", PAGE)
         .then((r) => {
           if (reqTokenRef.current[key] !== token) return; // superseded
           if (BigInt(r.snapshotCursor || "0") > BigInt(snapshotRef.current || "0")) snapshotRef.current = r.snapshotCursor;
@@ -730,7 +733,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               loaded: true,
               loading: false,
               hasMore: r.hasMore,
-              earliestSeq: items.length ? items[0].seq : 0,
+              earliestSeq: items.length ? items[0].seq : "0",
               unread: 0,
               error: undefined,
             };
@@ -749,7 +752,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const loadEarlier = React.useCallback(
     (key: string, viewport: () => HTMLElement | null) => {
       const st = store[key];
-      if (!st || st.loadingMore || !st.hasMore || !st.earliestSeq) return;
+      if (!st || st.loadingMore || !st.hasMore || !st.earliestSeq || st.earliestSeq === "0") return;
       const vp = viewport();
       const prevH = vp?.scrollHeight ?? 0;
       const prevTop = vp?.scrollTop ?? 0;
@@ -912,10 +915,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           }
           for (const k of Object.keys(buckets)) {
             const st = buckets[k];
-            st.items.sort((p, q) => p.seq - q.seq);
+            st.items.sort((p, q) => compareSeq(p.seq, q.seq));
             st.loaded = true;
             st.hasMore = false;
-            st.earliestSeq = st.items.length ? st.items[0].seq : 0;
+            st.earliestSeq = st.items.length ? st.items[0].seq : "0";
             st.lastTs = st.items.length ? st.items[st.items.length - 1].ts : "";
           }
           buckets[mainSessionKey(0)] ??= { ...emptyState(), loaded: true };
@@ -951,7 +954,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         loadingKeysRef.current.add(bootKey);
         setActiveId(mainSessionId(ms.current));
         patchStore(bootKey, (s) => ({ ...s, loading: true }));
-        return api.activityHistory(taskId, bootKey, 0, PAGE);
+        return api.activityHistory(taskId, bootKey, "0", PAGE);
       })
       .then((r) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
@@ -964,7 +967,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             loaded: true,
             loading: false,
             hasMore: r.hasMore,
-            earliestSeq: items.length ? items[0].seq : 0,
+            earliestSeq: items.length ? items[0].seq : "0",
             unread: 0,
           };
         });
@@ -1076,7 +1079,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     setOlderIntentsHasMore(false);
     const load = () =>
       api
-        .intentsPage(taskId, 0, 300)
+        .intentsPage(taskId, "0", 300)
         .then((r) => {
           if (!active) return;
           const freshIds = new Set(r.items.map((item) => item.id));
@@ -1309,7 +1312,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
   const focusKey = approvalFocus.state?.source?.session;
   const loadFocusPage = React.useCallback(
-    (before: number) => api.activityHistory(taskId, focusKey ?? "main", before, PAGE),
+    (before: string) => api.activityHistory(taskId, focusKey ?? "main", before, PAGE),
     [taskId, focusKey],
   );
   const mergeFocusPage = React.useCallback(
@@ -1348,7 +1351,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     // message (the task handed to this worker), followed by its execution steps.
     const intentTitle = sessionMeta.get(active.id)?.title ?? active.title;
     const intentMsg: Activity = {
-      seq: -1, // sorts/leads before any real step (real seq ≥ 0)
+      seq: "0", // 合成行：排在任何真实 step 之前（真实 activity 主键 ≥ 1）
       worker: items[0]?.worker ?? active.id, // reuse the lane so no worker chips appear
       ts: active.last_activity || "",
       kind: "intent", // LLM-generated objective — rendered as a distinct (non-human) bubble
@@ -2102,7 +2105,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               <div className="flex items-center border-t px-4 py-2">
                 <TodoPopover
                   seq={latestTodoSeq}
-                  fetchDetail={(seq) => api.activityDetail(String(seq), taskId).then((r) => r.detail ?? "")}
+                  fetchDetail={(seq) => api.activityDetail(seq, taskId).then((r) => r.detail ?? "")}
                 />
               </div>
             )}

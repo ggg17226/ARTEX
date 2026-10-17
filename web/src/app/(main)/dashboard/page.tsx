@@ -21,6 +21,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
+import { compareSeq } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
 import type {
   Activity,
@@ -287,7 +288,8 @@ export default function DashboardPage() {
     () =>
       [...activity]
         .filter((a) => a.kind !== "usage")
-        .sort((a, b) => b.seq - a.seq)
+        // P03：Activity.seq 是 activity 主键（wire string），倒序必须按 BigInt 数值比较。
+        .sort((a, b) => compareSeq(b.seq, a.seq))
         .slice(0, 6),
     [activity],
   );

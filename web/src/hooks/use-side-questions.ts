@@ -55,7 +55,7 @@ export function useSideQuestions(parent: string | null) {
   }, []);
 
   const load = useCallback(
-    async (before: string | number = "0") => {
+    async (before = "0") => {
       if (!parent) return;
       const version = epoch.current;
       try {
@@ -237,7 +237,8 @@ export function useSideQuestions(parent: string | null) {
     loading: !current || loading,
     error: current ? error || loadError : "",
     running,
-    nextCursor: current ? nextCursor : 0,
+    // P03：cursor 契约是 string；"0" = 没有更早的页。
+    nextCursor: current ? nextCursor : "0",
     load,
     ask,
     handleCommand,

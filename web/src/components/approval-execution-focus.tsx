@@ -59,11 +59,13 @@ type HistoryPage = { items: Activity[]; hasMore: boolean };
 
 // Fill the existing transcript continuously back to the call, preserving all
 // intervening messages. Never splice an isolated call into a paginated history.
+// P03：Activity.seq / InterceptExecution.seq 是 activity 主键（wire string）。
+// 相等定位保持 === 严格相等；任何大小比较必须走 BigInt，禁止字典序。
 export function useApprovalHistory(
   source: InterceptExecution | undefined,
   loaded: boolean,
   items: Activity[],
-  loadPage: (before: number) => Promise<HistoryPage>,
+  loadPage: (before: string) => Promise<HistoryPage>,
   mergePage: (page: HistoryPage) => void,
 ) {
   const itemsRef = React.useRef(items);
@@ -74,11 +76,13 @@ export function useApprovalHistory(
     let cancelled = false;
     void (async () => {
       let current = itemsRef.current;
-      let before = current[0]?.seq ?? 0;
+      let before = current[0]?.seq ?? "0";
       while (!current.some((a) => a.seq === source.seq && a.kind === "tool_use")) {
         const page = await loadPage(before);
         if (cancelled) return;
-        if (!page.items.length || (before > 0 && page.items[0].seq >= before)) {
+        const beforeId = BigInt(before);
+        const oldestId = BigInt(page.items[0]?.seq ?? 0);
+        if (!page.items.length || (beforeId > BigInt(0) && oldestId >= beforeId)) {
           throw new Error("会话中未找到对应工具调用，记录可能已删除");
         }
         mergePage(page);

@@ -44,8 +44,9 @@ export const sideAPI = {
   // 历史必须归一化后再交给调用方:items 一旦不是数组,消费端的 setState updater 会抛,
   // 而 React 会把 updater 的异常推迟到 render 阶段重抛 —— 那时调用方的 catch 已经够不着,
   // 整页直接被错误边界接管。
-  history: async (parent: string, before: string | number = "0") => {
-    const data = await request<Partial<SideHistory>>(`${parent}/side-questions?before=${before}`);
+  // P03：before 是 side_question 的 ordinal 游标（64 位 identity），契约上只接受 string。
+  history: async (parent: string, before = "0") => {
+    const data = await request<Partial<SideHistory>>(`${parent}/side-questions?before=${encodeURIComponent(before)}`);
     return {
       items: Array.isArray(data?.items) ? data.items : [],
       current: data?.current ?? null,

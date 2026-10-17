@@ -415,9 +415,11 @@ export default function MCPPage() {
                 <div className="flex flex-wrap gap-x-4 gap-y-2">
                   {agents.map((a) => (
                     <label key={a.key} className="flex items-center gap-2 text-sm">
+                      {/* 可见性按 agent 主键授权（resourceVisibility 返回 agent id 字符串），
+                          不是 agent key —— 传 key 会让 /api/visibility/toggle 直接 400。 */}
                       <Checkbox
-                        checked={(visibility[s.id] ?? []).includes(a.key)}
-                        onCheckedChange={() => toggleVisibility(s.id, a.key, a.name)}
+                        checked={(visibility[s.id] ?? []).includes(a.id)}
+                        onCheckedChange={() => toggleVisibility(s.id, a.id, a.name)}
                       />
                       {a.name}
                     </label>

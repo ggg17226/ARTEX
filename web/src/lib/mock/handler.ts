@@ -184,7 +184,7 @@ function advanceMockRetests() {
     retest.finished_at = new Date().toISOString();
     if (retest.conversation_id) {
       (mockRetestMessages[retest.conversation_id] ??= []).push({
-        seq: 3,
+        seq: "3",
         worker: "retester",
         ts: retest.finished_at,
         kind: "text",
@@ -752,6 +752,19 @@ function mockTaskCategorySnapshot(): TaskCategory[] {
   }));
 }
 
+// P03：ID 在 wire 上是 string；mock 侧「取现有最大 ID + 1」必须按 BigInt 比较，
+// 不得用 Number() 解析（>2^53 会失真）。非数字 ID 直接忽略。
+function maxIdOf(ids: (string | number)[]): bigint {
+  let max = BigInt(0);
+  for (const id of ids) {
+    const raw = String(id).replace(/\D/g, "");
+    if (!raw) continue;
+    const value = BigInt(raw);
+    if (value > max) max = value;
+  }
+  return max;
+}
+
 function mockScopeRows(
   companyID: string | number,
   input: unknown,
@@ -759,7 +772,7 @@ function mockScopeRows(
 ): { rows: ScopeRow[]; invalid: number; skipped: number } {
   if (!Array.isArray(input)) return { rows: [], invalid: 0, skipped: 0 };
   let nextID =
-    mockCompanies.flatMap((company) => company.scope ?? []).reduce((max, row) => Math.max(max, Number(row.id) || 0), 0) + 1;
+    maxIdOf(mockCompanies.flatMap((company) => (company.scope ?? []).map((row) => row.id))) + BigInt(1);
   const rows: ScopeRow[] = [];
   let invalid = 0;
   let skipped = 0;
@@ -861,7 +874,9 @@ type MockWorkerMessage = {
 };
 
 const mockWorkerMessages = new Map<string, MockWorkerMessage>();
-let nextMockWorkerMessageActivitySeq = mockActivity.reduce((maximum, item) => Math.max(maximum, item.seq), 0) + 1;
+// P03：Activity.seq 是 wire string；mock 计数器取最大值必须按 BigInt 比较。
+let nextMockWorkerMessageActivitySeq =
+  Number(mockActivity.reduce((maximum, item) => (BigInt(item.seq) > maximum ? BigInt(item.seq) : maximum), BigInt(0))) + 1;
 
 function controlMockIntent(id: string, action: "pause" | "resume"): MockIntentControlResult {
   const intent = mockIntents.find((item) => item.id === id);
@@ -917,7 +932,7 @@ function sendMockWorkerMessage(
   };
   mockWorkerMessages.set(normalizedRequestId, workerMessage);
   mockActivity.push({
-    seq: activitySeq,
+    seq: String(activitySeq),
     intent_id: id,
     worker: "user",
     ts: new Date().toISOString(),
@@ -1308,7 +1323,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     ) {
       throw new Error("模板名称已存在");
     }
-    const nextID = mockTaskTemplates.reduce((max, template) => Math.max(max, Number(template.id) || 0), 0) + 1;
+    const nextID = maxIdOf(mockTaskTemplates.map((template) => template.id)) + BigInt(1);
     const created: TaskTemplate = {
       id: String(nextID),
       name,
@@ -1803,7 +1818,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (mockCompanies.some((company) => company.name.toLowerCase() === name.toLowerCase())) {
       throw new Error("企业已存在");
     }
-    const id = String(mockCompanies.reduce((max, company) => Math.max(max, Number(company.id) || 0), 0) + 1);
+    const id = String(maxIdOf(mockCompanies.map((company) => company.id)) + BigInt(1));
     const scopeResult = mockScopeRows(id, b.scope);
     const company: Company = { id, name, asset_count: 0, scope: scopeResult.rows };
     mockCompanies.push(company);
@@ -1968,7 +1983,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       mockRetests.unshift(retest);
       mockRetestMessages[conversationID] = [
         {
-          seq: 1,
+          seq: "1",
           worker: "retester",
           ts: now,
           kind: "user",
@@ -1976,7 +1991,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           detail: retest.notes,
         },
         {
-          seq: 2,
+          seq: "2",
           worker: "retester",
           ts: now,
           kind: "text",
@@ -2200,13 +2215,14 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return { items, total: matched.length, page, size, edges, refs, assets };
   }
   if (path === "/exploration/activity" && seg.length === 2) {
-    const since = Number(q.get("since") ?? 0);
+    // P03：since / cursor 是 activity 主键游标（string），比较走 BigInt。
+    const since = BigInt(q.get("since") ?? "0");
     const limit = Math.max(1, Number(q.get("limit") ?? 300));
-    const items = mockActivity.filter((item) => item.seq > since).slice(0, limit);
-    return { items, cursor: items.length ? items[items.length - 1].seq : since };
+    const items = mockActivity.filter((item) => BigInt(item.seq) > since).slice(0, limit);
+    return { items, cursor: items.length ? items[items.length - 1].seq : String(since) };
   }
   if (seg[0] === "exploration" && seg[1] === "activity" && seg.length === 3) {
-    const a = mockActivity.find((x) => x.seq === Number(seg[2]));
+    const a = mockActivity.find((x) => x.seq === seg[2]);
     return { detail: a?.detail ?? a?.summary ?? "" };
   }
   if (path === "/tokens/daily") return D.dailyTokens;
@@ -2259,7 +2275,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/llm/test")
     return { ok: true, latency_ms: 128, model: String(b.model ?? "claude-opus-4-8"), reply: "OK" };
   if (path === "/llm/profiles" && m === "GET") return { profiles: D.llmProfiles };
-  if (path === "/llm/profiles" && m === "POST") return { id: Number(b.id) || 3 };
+  // P03：后端 POST /llm/profiles 返回 {"id":"<string>"}（strconv.FormatInt），mock 同为 string。
+  if (path === "/llm/profiles" && m === "POST") return { id: String(b.id || "3") };
   if (path === "/llm/profiles/active") return { ok: true };
   if (path === "/llm/pool" && m === "GET") return D.llmPool;
   if (path === "/llm/pool/reset")
@@ -2355,11 +2372,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const running = mockRetests.some(
       (item) => item.conversation_id === seg[1] && ["pending", "running"].includes(item.status),
     );
-    return { items, cursor: items.length ? items[items.length - 1].seq : 0, running };
+    return { items, cursor: items.length ? items[items.length - 1].seq : "0", running };
   }
   if (seg[0] === "conversations" && seg[2] === "messages" && seg.length === 4) {
     const msgs = mockRetestMessages[seg[1]] ?? D.conversationMessages[seg[1]] ?? [];
-    const a = msgs.find((x) => x.seq === Number(seg[3]));
+    const a = msgs.find((x) => x.seq === seg[3]);
     return { detail: a?.detail ?? a?.summary ?? "" };
   }
   if (seg[0] === "conversations" && seg[2] === "messages" && m === "POST") return { status: "ok" };
@@ -2412,7 +2429,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (b.decision !== "allowed" && b.decision !== "denied") throw new Error("无效审批动作");
     row.status = b.decision;
     row.decided_at = new Date().toISOString();
-    const detail = mockInterceptDetails[Number(id)];
+    const detail = mockInterceptDetails[id];
     if (detail) {
       detail.effective_action = b.decision === "allowed" ? "allow" : "deny";
       detail.decision_reason = b.decision === "allowed" ? "人工允许执行" : "人工拒绝执行";
@@ -2424,7 +2441,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "intercept" && seg[1] === "history" && seg.length === 3) {
     const row = mockInterceptHistory.find((r) => String(r.id) === String(seg[2]));
     if (!row) throw new Error("审批记录不存在");
-    return { ...row, audit: mockInterceptDetails[Number(row.id)] ?? null };
+    return { ...row, audit: mockInterceptDetails[String(row.id)] ?? null };
   }
   if (seg[0] === "intercept" && seg[1] === "pending" && seg.length === 3 && m === "GET")
     return mockInterceptPending.find((p) => String(p.id) === String(seg[2])) ?? null;

