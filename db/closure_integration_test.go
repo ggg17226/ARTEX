@@ -163,11 +163,16 @@ func TestClosureConcurrentOrphanPrevention(t *testing.T) {
 
 	// 并发模拟：Goroutine A 执行任务删除，Goroutine B 尝试基于该任务创建子节点/关联
 	var expID, taskID uint64
-	tx, err := db.BeginTx(ctx, nil)
+	setupTx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
 	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO explorations (goal, status, created_at, updated_at) VALUES ('test goal', 'open', NOW(3), NOW(3))`)
+	// I1（R9）：BeginTx 成功后立即注册 Rollback。setup 事务内的 INSERT / LastInsertId
+	// 任一步骤 t.Fatalf 提前退出时，函数 defer 会先结束事务再执行 t.Cleanup 的按 id DELETE，
+	// 避免 cleanupRow 用另一连接删除仍被未结束事务持有的行而等到 30s 超时。
+	// 正常 Commit 之后该 defer 返回 sql.ErrTxDone，忽略即可。
+	defer func() { _ = setupTx.Rollback() }()
+	res, err := setupTx.ExecContext(ctx, `INSERT INTO explorations (goal, status, created_at, updated_at) VALUES ('test goal', 'open', NOW(3), NOW(3))`)
 	if err != nil {
 		t.Fatalf("insert exploration failed: %v", err)
 	}
@@ -178,7 +183,7 @@ func TestClosureConcurrentOrphanPrevention(t *testing.T) {
 	expID = uint64(expIDInt)
 	cleanupRow(t, db, "explorations", expID)
 
-	res, err = tx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, queue_mode, exploration_id, created_at, updated_at) VALUES ('test_concurrent', 'g', 'd', 'running', '', ?, NOW(3), NOW(3))`, expID)
+	res, err = setupTx.ExecContext(ctx, `INSERT INTO tasks (name, goal, description, status, queue_mode, exploration_id, created_at, updated_at) VALUES ('test_concurrent', 'g', 'd', 'running', '', ?, NOW(3), NOW(3))`, expID)
 	if err != nil {
 		t.Fatalf("insert task failed: %v", err)
 	}
@@ -189,7 +194,7 @@ func TestClosureConcurrentOrphanPrevention(t *testing.T) {
 	taskID = uint64(taskIDInt)
 	cleanupRow(t, db, "tasks", taskID)
 
-	if err := tx.Commit(); err != nil {
+	if err := setupTx.Commit(); err != nil {
 		t.Fatalf("commit setup tx failed: %v", err)
 	}
 
