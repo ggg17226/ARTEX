@@ -321,9 +321,9 @@ const (
 // task_ids 覆盖成 []string。
 //
 // db.Asset.TaskIDs 必须保持 []int64 —— 该字段由 assets.task_ids 列的
-// json.Unmarshal（数字数组）回读，且 json:",string" 对切片无效（Marshal 直接报错），
-// 所以只能在 server 输出侧转换。外层同名字段按 encoding/json 的浅层优先规则屏蔽
-// 嵌入字段，与 W4b-1 的 saveMCPRequest 同一模式。
+// json.Unmarshal（数字数组）回读，且 encoding/json 会忽略切片上的 ,string
+// （既不生效也不报错），所以只能在 server 输出侧转换。外层同名字段按 encoding/json
+// 的浅层优先规则屏蔽嵌入字段，与 W4b-1 的 saveMCPRequest 同一模式。
 type assetWire struct {
 	db.Asset
 	TaskIDs []string `json:"task_ids"`

@@ -37,7 +37,7 @@ type archiveBatchItem struct {
 //
 // db.TaskArchive.SourceTaskIDs 必须保持 []int64：它由 task_archives.source_task_ids
 // 列的 JSON 文本 json.Unmarshal 回读（db/task_archives.go scanTaskArchive），
-// 且 encoding/json 的 ,string 对切片无效（Marshal 直接报错）。因此只在输出侧用
+// 且 encoding/json 会忽略切片上的 ,string（既不生效也不报错）。因此只在输出侧用
 // 外层同名字段覆盖成 []string（浅层优先屏蔽嵌入字段，模式同 W4b-2b 的 assetWire）；
 // id / task_id / category_id 仍由 db.TaskArchive 上已有的 ,string tag 保护。
 //

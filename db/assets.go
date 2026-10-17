@@ -19,7 +19,8 @@ import (
 //
 // P03（R08）：ID / CompanyID / TaskSourceNodeID 是 BIGINT，对外带引号 string。
 // TaskIDs 保持 []int64 且**不得**加 json:",string"：该字段由 assets.task_ids 列
-// json.Unmarshal 回读（存的是数字数组），给切片加 ,string 会让 Marshal 直接报错。
+// json.Unmarshal 回读（存的是数字数组）；encoding/json 会忽略切片上的 ,string
+// （既不生效也不报错），所以该字段不能靠 tag，必须由 wire DTO 在输出侧覆盖。
 // HTTP 输出侧由 server 的 assetWire 用外层同名字段把 task_ids 覆盖成 []string。
 type Asset struct {
 	ID         int64   `json:"id,string"`

@@ -368,7 +368,7 @@ func TestIDOutputWireR22TaskArchiveWire(t *testing.T) {
 		AggregateStats:          json.RawMessage(`{}`),
 	}
 
-	// 回归锁：db 层仍是数字数组（[]int64 不能加 ,string，Marshal 会直接报错）。
+	// 回归锁：db 层仍是数字数组（[]int64 上的 ,string 会被 encoding/json 忽略，不能靠 tag）。
 	rawDB := mustMarshal(t, archive)
 	if !strings.Contains(rawDB, `"source_task_ids":[`+bigIDStr+`,1,`+maxIDStr+`]`) {
 		t.Fatalf("db.TaskArchive.source_task_ids 必须仍是数字数组（DB JSON 回读依赖）: %s", rawDB)
