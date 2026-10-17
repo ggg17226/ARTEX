@@ -44,9 +44,13 @@ func IsRetryableConflict(err error) bool {
 		return false
 	}
 
+	// 漂移类冲突：一律整体回滚 + 退避后重做非加锁 Locator（P04b Global Constraint 5）。
+	// ErrEntityNotFound（R2 I5）：持锁/复核阶段实体物理缺失等同"实体缺失"漂移，
+	// 不得当作终态业务错误结束事务，必须退避重试并重新定位快照。
 	if errors.Is(err, ErrMembershipDrift) ||
 		errors.Is(err, ErrLowerPKDiscovered) ||
-		errors.Is(err, ErrNewMemberDiscovered) {
+		errors.Is(err, ErrNewMemberDiscovered) ||
+		errors.Is(err, ErrEntityNotFound) {
 		return true
 	}
 
