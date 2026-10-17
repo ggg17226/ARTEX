@@ -16,8 +16,12 @@ import (
 // defaultOperationTimeout 定义真实与测试安全流程的主 context 超时上限（2 分钟）。
 const defaultOperationTimeout = 2 * time.Minute
 
-// defaultCleanupTimeout 定义清理阶段独立有界 context 的超时上限（30 秒）。
-const defaultCleanupTimeout = 30 * time.Second
+// defaultCleanupTimeout 定义清理阶段独立有界 context 的超时上限（2 分钟）。
+// 真实 TiDB v8.5.8（192.168.27.79:6000）实测：单条 DROP TABLE ≈ 0.45s（DDL job 串行 +
+// 跨网 RTT），65 表逆序清理 ≈ 28–30s；30s 上限处于临界，会稳定触发 context deadline
+// exceeded，并让服务端实际已成功的 DROP 在重试时撞上 Error 1051 Unknown table。
+// 放宽到 2 分钟（依旧是有界执行，不改变"独立有界 cleanup context"约束）。
+const defaultCleanupTimeout = 2 * time.Minute
 
 // strictTiDB85Regex 匹配 strict 8.5 LTS 版本线：
 // 必须包含 "TiDB-v8.5." 紧跟补丁版本数字，支持发行后缀（如 -dirty, -alpha 等）。

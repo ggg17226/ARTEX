@@ -16,7 +16,7 @@ func quoteIdentifier(s string) string {
 // 口径与约束：
 // - 标识符全部反引号安全引用；
 // - 先执行 t.Validate()，结构不合法直接返回错误；
-// - 列区保留 NOT NULL / DEFAULT / ON UPDATE；
+// - 列区保留 NOT NULL / DEFAULT / ON UPDATE，但 TText/TJSON 不输出 DEFAULT（见 renderColumnFor，TiDB 8.5 严格模式 Error 1101）；
 // - 生成列渲染 GENERATED ALWAYS AS (expr) STORED，不附加 NOT NULL/DEFAULT/ON UPDATE/AUTO_INCREMENT；
 // - 自增表 (t.AutoIncrement=true) 的 PK 列追加 AUTO_INCREMENT；
 // - AUTO_ID_CACHE 绝不出现在列/索引区，仅在闭括号后的表选项区根据 t.AutoIncrement 追加 AUTO_ID_CACHE=1；
@@ -48,6 +48,14 @@ func GenerateDDL(t *Table) (string, error) {
 // 生成列渲染为 GENERATED ALWAYS AS (expr) STORED；普通列依次附加 NOT NULL / DEFAULT / ON UPDATE。
 // 当且仅当 c.Name == t.PKColumn 且 t.AutoIncrement 为 true 时，追加 AUTO_INCREMENT。
 // CACHE 绝对不在此处输出。
+//
+// DEFAULT 例外（真实 TiDB v8.5.8 实测）：TText/TJSON（均渲染为 MEDIUMTEXT）与
+// TMediumBlob（MEDIUMBLOB）一律不输出 DEFAULT。该实例默认 sql_mode 含
+// STRICT_TRANS_TABLES，声明 MEDIUMTEXT NOT NULL DEFAULT 空串 直接失败
+// （Error 1101 (42000): BLOB/TEXT/JSON column can't have a default value），
+// 且 TiDB 8.5 不支持 DEFAULT 括号表达式默认（语法错误 1064）。
+// 这些列的 Column.Default 只是声明期元数据（应用层默认值语义），写入方必须显式
+// 提供值（fail closed）。其余类型的 DEFAULT 渲染保持原样。
 func renderColumnFor(t *Table, c Column) string {
 	var b strings.Builder
 	b.WriteString(quoteIdentifier(c.Name) + " " + c.SQLType())
@@ -58,7 +66,7 @@ func renderColumnFor(t *Table, c Column) string {
 	if c.NotNull {
 		b.WriteString(" NOT NULL")
 	}
-	if c.Default != "" {
+	if c.Default != "" && !rejectsColumnDefault(c.Type) {
 		b.WriteString(" DEFAULT " + c.Default)
 	}
 	if c.OnUpdate != "" {
@@ -68,6 +76,18 @@ func renderColumnFor(t *Table, c Column) string {
 		b.WriteString(" AUTO_INCREMENT")
 	}
 	return b.String()
+}
+
+// rejectsColumnDefault reports whether TiDB 8.5 rejects a column-level DEFAULT
+// for this column type (TEXT/BLOB 家族：MEDIUMTEXT / MEDIUMBLOB)。
+// TMediumBlob 目录中从不携带 Default（Blob/BlobN 助手不设置），列入此处只为
+// 守住同一条 TiDB 红线，防止未来回归；对当前 65 表 DDL 输出零影响。
+func rejectsColumnDefault(ct ColumnType) bool {
+	switch ct {
+	case TText, TJSON, TMediumBlob:
+		return true
+	}
+	return false
 }
 
 // renderIndex renders one named index line (UNIQUE KEY / KEY，支持 prefix 与 DESC).

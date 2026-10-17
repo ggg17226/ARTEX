@@ -32,8 +32,8 @@ func TestGenerateDDLCompanies(t *testing.T) {
 	for _, want := range []string{
 		"CREATE TABLE IF NOT EXISTS `companies` (",
 		"  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,",
-		"  `name` MEDIUMTEXT NOT NULL DEFAULT '',",
-		"  `nkey` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',",
+		"  `name` MEDIUMTEXT NOT NULL,",
+		"  `nkey` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,",
 		"  `nkey_identity` MEDIUMBLOB NOT NULL,",
 		"  `nkey_hash` BINARY(32) NOT NULL,",
 		"  `logo` MEDIUMTEXT,",
@@ -50,6 +50,16 @@ func TestGenerateDDLCompanies(t *testing.T) {
 	for _, ban := range []string{"FOREIGN KEY", "REFERENCES", "CHECK (", "AUTO_RANDOM", "CREATE DATABASE"} {
 		if strings.Contains(got, ban) {
 			t.Errorf("GenerateDDL(companies) must not contain %q", ban)
+		}
+	}
+	// TiDB 8.5 严格模式回归（Error 1101）：companies 的 MEDIUMTEXT 列
+	// （name / nkey / logo）渲染为 `MEDIUMTEXT [NOT NULL]`，绝不带 DEFAULT。
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.Contains(line, "MEDIUMTEXT") {
+			continue
+		}
+		if strings.Contains(line, " DEFAULT") {
+			t.Errorf("GenerateDDL(companies): MEDIUMTEXT column must not carry DEFAULT: %s", line)
 		}
 	}
 	if strings.Contains(got, ";") {
@@ -1343,5 +1353,108 @@ func TestGenerateDDLBacktickEscaping(t *testing.T) {
 		if !strings.Contains(ddl, frag) {
 			t.Errorf("backtick escaping DDL missing %q\nFull DDL:\n%s", frag, ddl)
 		}
+	}
+}
+
+// TestGenerateDDL_NoTextJSONDefault 是真实 TiDB v8.5.8 的回归测试（Error 1101）。
+//
+// 该实例默认 sql_mode 含 STRICT_TRANS_TABLES，CREATE TABLE 中任何 TEXT/BLOB/JSON 列
+// 带 DEFAULT 都会被直接拒绝（BLOB/TEXT/JSON column can't have a default value），
+// 故 65 条语句里所有 MEDIUMTEXT / MEDIUMBLOB 列定义行都不得出现 " DEFAULT"。
+//
+// 同时锁定"只移除 TEXT/JSON 默认值"这一边界：DATETIME(3) 的 CURRENT_TIMESTAMP(3)、
+// 数值（BIGINT UNSIGNED ... DEFAULT 0）与 TINYINT(1) 布尔默认必须继续存在。
+func TestGenerateDDL_NoTextJSONDefault(t *testing.T) {
+	stmts, err := GenerateStatements()
+	if err != nil {
+		t.Fatalf("GenerateStatements: %v", err)
+	}
+	if len(stmts) != 65 {
+		t.Fatalf("GenerateStatements len = %d, want 65", len(stmts))
+	}
+
+	var (
+		textColLines  int
+		blobColLines  int
+		date3Defs     int
+		bigUIDefs     int
+		boolFalseDefs int
+		boolTrueDefs  int
+	)
+	for _, stmt := range stmts {
+		for _, line := range strings.Split(stmt, "\n") {
+			if !strings.HasPrefix(line, "  `") {
+				continue // 只检查列定义行（跳过 CREATE / PRIMARY KEY / KEY / 表选项行）
+			}
+			isText := strings.Contains(line, "MEDIUMTEXT")
+			isBlob := strings.Contains(line, "MEDIUMBLOB")
+			if isText {
+				textColLines++
+			}
+			if isBlob {
+				blobColLines++
+			}
+			if (isText || isBlob) && strings.Contains(line, " DEFAULT") {
+				t.Errorf("TiDB Error 1101 regression: TEXT/BLOB column must render without DEFAULT: %s", line)
+			}
+			if isText || isBlob {
+				continue
+			}
+			switch {
+			case strings.Contains(line, "DATETIME(3)") && strings.Contains(line, "DEFAULT CURRENT_TIMESTAMP(3)"):
+				date3Defs++
+			case strings.Contains(line, "BIGINT UNSIGNED NOT NULL DEFAULT 0"):
+				bigUIDefs++
+			case strings.Contains(line, "TINYINT(1) NOT NULL DEFAULT 0"):
+				boolFalseDefs++
+			case strings.Contains(line, "TINYINT(1) NOT NULL DEFAULT 1"):
+				boolTrueDefs++
+			}
+		}
+	}
+
+	if textColLines < 100 {
+		t.Errorf("MEDIUMTEXT column lines = %d, catalog drift (want >= 100)", textColLines)
+	}
+	if blobColLines < 1 {
+		t.Errorf("MEDIUMBLOB column lines = %d, want >= 1", blobColLines)
+	}
+	if date3Defs == 0 {
+		t.Error("DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) disappeared; unrelated defaults must be preserved")
+	}
+	if bigUIDefs == 0 {
+		t.Error("BIGINT UNSIGNED NOT NULL DEFAULT 0 disappeared; unrelated defaults must be preserved")
+	}
+	if boolFalseDefs == 0 || boolTrueDefs == 0 {
+		t.Errorf("TINYINT(1) boolean defaults disappeared (false=%d, true=%d); unrelated defaults must be preserved", boolFalseDefs, boolTrueDefs)
+	}
+
+	// 精确列形态：NOT NULL 的 TEXT/JSON 列渲染为 MEDIUMTEXT NOT NULL（不含 DEFAULT）。
+	for _, c := range []struct{ table, want string }{
+		{"companies", "  `name` MEDIUMTEXT NOT NULL,"},
+		{"companies", "  `nkey` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,"},
+		{"assets", "  `task_ids` MEDIUMTEXT NOT NULL,"},
+	} {
+		ddl := genOrFatalAll(t, c.table)
+		if !strings.Contains(ddl, c.want) {
+			t.Errorf("GenerateDDL(%s) missing %q:\n%s", c.table, c.want, ddl)
+		}
+	}
+
+	// 声明期元数据保留：TextN/JSONN 的 def 仍写入 Column.Default（应用层默认值语义），
+	// 只是不再渲染进 DDL。
+	col := findColumn(tableByNameAll(t, "companies"), "name")
+	if col == nil {
+		t.Fatal("companies.name not found")
+	}
+	if col.Default != "''" {
+		t.Errorf("companies.name declarative Default = %q, want \"''\" (声明期元数据必须保留)", col.Default)
+	}
+	jsonCol := findColumn(tableByNameAll(t, "assets"), "task_ids")
+	if jsonCol == nil {
+		t.Fatal("assets.task_ids not found")
+	}
+	if jsonCol.Default != "'[]'" {
+		t.Errorf("assets.task_ids declarative Default = %q, want \"'[]'\" (声明期元数据必须保留)", jsonCol.Default)
 	}
 }

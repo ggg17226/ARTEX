@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"os"
 	"testing"
-	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -59,7 +58,7 @@ func TestSmokeRealTiDBDDL(t *testing.T) {
 
 	h := newTiDBTestHarness(db)
 	t.Cleanup(func() {
-		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanCtx, cancel := context.WithTimeout(context.Background(), defaultCleanupTimeout)
 		defer cancel()
 		if err := h.Cleanup(cleanCtx); err != nil {
 			t.Errorf("cleanup failed: %v", err)
@@ -112,7 +111,7 @@ func TestSmokeRealTiDBDDL(t *testing.T) {
 	}
 
 	// 6. 显式 Cleanup
-	cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cleanCtx, cancel := context.WithTimeout(context.Background(), defaultCleanupTimeout)
 	defer cancel()
 	if err := h.Cleanup(cleanCtx); err != nil {
 		t.Fatalf("explicit Cleanup failed: %v", err)

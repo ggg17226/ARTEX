@@ -37,7 +37,7 @@ type Column struct {
 	Type      ColumnType
 	Length    int // TVarchar/TChar/TBinary/TVarbinary 用
 	NotNull   bool
-	Default   string // SQL 字面量：0 / 'open' / '[]' / CURRENT_TIMESTAMP(3)
+	Default   string // SQL 字面量：0 / 'open' / '[]' / CURRENT_TIMESTAMP(3)；TText/TJSON/TMediumBlob 的取值仅为声明期元数据，不渲染进 DDL（见 TextN/JSONN 与 renderColumnFor）
 	OnUpdate  string // "CURRENT_TIMESTAMP(3)" 或 ""
 	Charset   string // "ascii" 或 ""（继承表默认 utf8mb4）
 	Collation string // "ascii_bin" 或 ""
@@ -217,7 +217,15 @@ func TextNN(name string) Column {
 	return c
 }
 
-// TextN is a MEDIUMTEXT NOT NULL with string default (自动加引号).
+// TextN is a MEDIUMTEXT NOT NULL 列；def 自动加引号后存入 Column.Default，仅作为
+// 声明期元数据（应用层默认值语义），不进入 DDL。
+//
+// 原因（真实 TiDB v8.5.8 实测）：该实例默认 sql_mode 含 STRICT_TRANS_TABLES，
+// TiDB 8.5 严格模式禁止 TEXT/BLOB/JSON 列声明 DEFAULT（Error 1101: BLOB/TEXT/JSON
+// column 不可有 default value），且不支持 DEFAULT 括号表达式默认（语法错误 1064）。
+// 因此 DDL 渲染层（renderColumnFor）对 TText/TJSON 一律不输出 DEFAULT，该列渲染为
+// MEDIUMTEXT NOT NULL；写入方必须显式提供值（fail closed：缺值由 TiDB 严格模式报错，
+// 不会静默补空串）。
 func TextN(name, def string) Column {
 	c := C(name, TText, 0)
 	c.NotNull = true
@@ -235,7 +243,13 @@ func JSONNN(name string) Column {
 	return c
 }
 
-// JSONN is a MEDIUMTEXT JSON payload NOT NULL with JSON default ('{}'/'[]').
+// JSONN is a MEDIUMTEXT JSON 载荷 NOT NULL 列；def（空对象/空数组字面量）自动加引号后
+// 存入 Column.Default，仅作为声明期元数据（应用层默认值语义），不进入 DDL。
+//
+// 原因与 TextN 相同：TiDB 8.5 严格模式禁止 TEXT/BLOB/JSON 列声明 DEFAULT
+// （Error 1101），DEFAULT 括号表达式默认亦不支持（语法错误 1064）。DDL 渲染层对
+// TJSON 不输出 DEFAULT，该列渲染为 MEDIUMTEXT NOT NULL；写入方必须显式提供 JSON 值
+// （fail closed：空载荷须由应用层显式写入空对象/空数组）。
 func JSONN(name, def string) Column {
 	c := C(name, TJSON, 0)
 	c.NotNull = true
