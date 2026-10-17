@@ -1085,7 +1085,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           const freshIds = new Set(r.items.map((item) => item.id));
           const oldestFreshId = r.items.reduce(
             (minimum, item) => (BigInt(item.id) < minimum ? BigInt(item.id) : minimum),
-            BigInt(Number.MAX_SAFE_INTEGER),
+            BigInt("9223372036854775807"),
           );
           const displaced = r.hasMore
             ? firstIntentsRef.current.filter((item) => !freshIds.has(item.id) && BigInt(item.id) < oldestFreshId)
@@ -1118,7 +1118,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     if (all.length === 0) return;
     const minId = all.reduce(
       (m, n) => (BigInt(n.id) < m ? BigInt(n.id) : m),
-      BigInt(Number.MAX_SAFE_INTEGER),
+      BigInt("9223372036854775807"),
     ).toString();
     setLoadingOlderIntents(true);
     api

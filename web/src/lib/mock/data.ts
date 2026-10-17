@@ -3417,6 +3417,7 @@ export const interceptPending: InterceptPending[] = [
   {
     id: "101",
     rule_id: "1",
+    conversation_id: null,
     task_id: "t-acme-web",
     agent_name: "work#3",
     tool_name: "bash",
@@ -3431,6 +3432,7 @@ export const interceptHistory: InterceptApprovalRow[] = [
   {
     id: "90",
     rule_id: "1",
+    conversation_id: null,
     task_id: "t-acme-web",
     agent_name: "work#1",
     tool_name: "bash",
@@ -3445,6 +3447,8 @@ export const interceptHistory: InterceptApprovalRow[] = [
   },
   {
     id: "91",
+    rule_id: null,
+    conversation_id: null,
     task_id: "t-acme-api",
     agent_name: "work#2",
     tool_name: "bash",
@@ -3460,6 +3464,7 @@ export const interceptHistory: InterceptApprovalRow[] = [
   {
     id: "92",
     rule_id: "2",
+    conversation_id: null,
     task_id: "t-acme-web",
     agent_name: "work#13",
     tool_name: "bash",
@@ -3474,6 +3479,8 @@ export const interceptHistory: InterceptApprovalRow[] = [
   },
   {
     id: "93",
+    rule_id: null,
+    conversation_id: null,
     task_id: "t-acme-web",
     agent_name: "work#7",
     tool_name: "bash",
@@ -3490,6 +3497,8 @@ export const interceptHistory: InterceptApprovalRow[] = [
 // Approval detail fixtures use harmless report-writing examples.
 interceptHistory.unshift({
   id: "94",
+  rule_id: null,
+  conversation_id: null,
   task_id: "t-acme-web",
   agent_name: "work#1",
   tool_name: "Write",
@@ -3958,7 +3967,7 @@ export function nodeAssetsFor(nodeId: string): FindingAsset[] {
   });
 }
 
-export function assetRefsFor(_assetId: string | number) {
+export function assetRefsFor(_assetId: string) {
   return {
     intents: [
       { id: "12", kind: "intent", state: "done", summary: "对 www.acme.com 搜索接口做 SQL 注入探测" },
@@ -4156,7 +4165,7 @@ const llmTaskCounts: Record<string, number> = {};
 for (const r of llmRecords) if (r.task_id) llmTaskCounts[r.task_id] = (llmTaskCounts[r.task_id] ?? 0) + 1;
 export const llmTasks: LLMTask[] = Object.entries(llmTaskCounts).map(([task_id, count]) => ({ task_id, count }));
 
-export function llmRecordDetail(id: string | number, records = llmRecords) {
+export function llmRecordDetail(id: string, records = llmRecords) {
   const item = records.find((r) => String(r.id) === String(id)) ?? records[0];
   return {
     ...item,

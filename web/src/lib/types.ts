@@ -1313,9 +1313,10 @@ export interface AssetInterceptRule {
 export interface InterceptPending {
   decision_source?: "rule" | "model" | "unknown" | "";
   id: string;
-  rule_id?: string;
-  conversation_id?: string;
-  task_id?: string;
+  // P03 R03 & O-2: 后端 rule_id / conversation_id / task_id 无 omitempty，nil 序列化为 null。
+  rule_id: string | null;
+  conversation_id: string | null;
+  task_id: string | null;
   agent_name: string;
   tool_name: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

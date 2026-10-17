@@ -870,13 +870,13 @@ type MockWorkerMessage = {
   intentId: string;
   message: string;
   state: "open" | "running";
-  activitySeq: number;
+  activitySeq: bigint;
 };
 
 const mockWorkerMessages = new Map<string, MockWorkerMessage>();
 // P03：Activity.seq 是 wire string；mock 计数器取最大值必须按 BigInt 比较。
 let nextMockWorkerMessageActivitySeq =
-  Number(mockActivity.reduce((maximum, item) => (BigInt(item.seq) > maximum ? BigInt(item.seq) : maximum), BigInt(0))) + 1;
+  mockActivity.reduce((maximum, item) => (BigInt(item.seq) > maximum ? BigInt(item.seq) : maximum), BigInt(0)) + BigInt(1);
 
 function controlMockIntent(id: string, action: "pause" | "resume"): MockIntentControlResult {
   const intent = mockIntents.find((item) => item.id === id);
@@ -893,7 +893,7 @@ function sendMockWorkerMessage(
   id: string,
   message: string,
   requestId: string,
-): MockIntentControlResult & { activitySeq?: number; requestId?: string } {
+): MockIntentControlResult & { activitySeq?: bigint; requestId?: string } {
   const normalizedMessage = message.trim();
   const normalizedRequestId = requestId.trim();
   if (!normalizedRequestId) return { ok: false, error: "request_id 不能为空" };
@@ -923,7 +923,8 @@ function sendMockWorkerMessage(
   // and runs it in a dedicated goroutine outside the worker pool. Keep the mock in
   // sync: flip to running immediately and emit the visible user activity.
   intent.state = "running";
-  const activitySeq = nextMockWorkerMessageActivitySeq++;
+  const activitySeq = nextMockWorkerMessageActivitySeq;
+  nextMockWorkerMessageActivitySeq += BigInt(1);
   const workerMessage: MockWorkerMessage = {
     intentId: id,
     message: normalizedMessage,
@@ -1031,7 +1032,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const candidates = [
       ...D.findings.map((finding, index) => ({
         kind: "finding",
-        id: index + 1,
+        id: String(index + 1),
         label: finding.name || finding.vulnclass,
         description: `${finding.severity} · ${finding.summary}`,
       })),
@@ -1474,12 +1475,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ) {
         throw new Error("Worker 状态已变化");
       }
-      const numId = Number(id.replace(/\D/g, "")) || 0;
       if (b.mode === "hard") {
         // 真删除:从列表移除,返回级联删除计数。
         mockIntents.splice(index, 1);
         return {
-          id: numId,
+          id,
           state: "",
           deleted: {
             intents: 1,
@@ -1492,19 +1492,19 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       // 假删除(默认):置 deleted + 记删除原因,保留节点。
       intent.state = "deleted";
       intent.delete_reason = String(b.reason ?? "");
-      return { id: numId, state: "deleted" };
+      return { id, state: "deleted" };
     }
     const action = b.action === "resume" ? "resume" : "pause";
     const result = controlMockIntent(id, action);
     if (!result.ok) throw new Error(result.error ?? "Worker 状态已变化");
-    return { id: Number(id.replace(/\D/g, "")) || 0, state: result.state };
+    return { id, state: result.state };
   }
   if (seg[0] === "tasks" && seg[2] === "intents" && seg[4] === "messages" && m === "POST") {
     const id = seg[3];
     const result = sendMockWorkerMessage(id, String(b.message ?? ""), String(b.request_id ?? ""));
     if (!result.ok) throw new Error(result.error ?? "Worker 状态已变化");
     return {
-      id: Number(id.replace(/\D/g, "")) || 0,
+      id,
       state: result.state ?? "running",
       accepted: true,
       request_id: result.requestId ?? "",
@@ -1531,7 +1531,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   // ── 覆盖度 / 覆盖图 / 资产关联（任务维度）──
   if (seg[0] === "tasks" && seg[2] === "coverage" && seg.length === 3) return D.coverage;
   if (seg[0] === "tasks" && seg[2] === "coverage-graph") return D.coverageGraph;
-  if (seg[0] === "tasks" && seg[2] === "asset-refs") return D.assetRefsFor(Number(q.get("asset_id") ?? 0));
+  if (seg[0] === "tasks" && seg[2] === "asset-refs") return D.assetRefsFor(q.get("asset_id") ?? "");
 
   // ── 任务测试范围（增删查）──
   if (seg[0] === "tasks" && seg[2] === "scope" && seg.length === 3 && m === "GET") {
@@ -2155,10 +2155,13 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
   if (path === "/exploration/intents") {
     if (q.has("page")) {
-      const before = Number(q.get("before") ?? 0);
+      const beforeRaw = q.get("before") ?? "0";
+      const before = BigInt(beforeRaw.replace(/\D/g, "") || "0");
       const limit = Math.max(1, Number(q.get("limit") ?? 300));
       let list = mockIntents;
-      if (before > 0) list = list.filter((intent) => Number(intent.id.replace(/\D/g, "") || intent.id) < before);
+      if (before > BigInt(0)) {
+        list = list.filter((intent) => BigInt(intent.id.replace(/\D/g, "") || "0") < before);
+      }
       return { items: list.slice(0, limit), has_more: list.length > limit };
     }
     return mockIntents;
@@ -2268,7 +2271,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return { tasks: [...counts].map(([task_id, count]) => ({ task_id, count })) };
   }
   if (seg[0] === "llm" && seg[1] === "records" && seg.length === 3 && m === "GET") {
-    return D.llmRecordDetail(Number(seg[2]), mockLLMRecords);
+    return D.llmRecordDetail(seg[2], mockLLMRecords);
   }
   if (path === "/llm" && m === "GET") return D.llmConfig;
   if (path === "/llm" && m === "POST") return { ok: true };
@@ -2282,7 +2285,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/llm/pool/reset")
     return { ...D.llmPool, chain: D.llmPool.chain.map((c) => ({ ...c, state: "ok", fails: 0, cooldown_secs: 0 })) };
   if (seg[0] === "llm" && seg[1] === "profiles" && seg.length === 3 && m === "DELETE")
-    return { deleted: Number(seg[2]) };
+    return { deleted: String(seg[2]) };
 
   // ── agents ──
   if (path === "/agents" && m === "GET") return { agents: D.agents };
@@ -2496,7 +2499,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   // ── 旁路提问(/btw)：demo 无旁路会话 ──
   // 必须显式命中：路径以 s 结尾会被下面的读兜底判成集合返回 []，items 就成了 undefined。
   if (seg.at(-1) === "side-questions") {
-    if (m === "GET") return { items: [], current: null, next_cursor: 0, snapshot: null };
+    if (m === "GET") return { items: [], current: null, next_cursor: "0", snapshot: null };
     if (m === "POST") throw new Error("演示模式不支持旁路提问");
   }
 
