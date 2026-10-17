@@ -35,21 +35,22 @@ func BuildLockSQL(meta TableMeta) string {
 	return fmt.Sprintf("SELECT %s FROM %s WHERE %s = ? FOR UPDATE", meta.PKColumn, meta.Name, meta.PKColumn)
 }
 
-// LockEntitiesInOrder 外层数据事务按严格 (table-order, 物理 PK 升序) 执行 FOR UPDATE
+// LockEntitiesInOrder 外层数据事务按严格 (table-order, 物理 PK 升序) 执行 FOR UPDATE。
+//
+// tx 为 nil 时返回 ErrNilTx：本函数是导出执行入口，绝不允许把"只登记、未加锁"
+// 当作离线成功（R2 I9）。纯锁序校验请直接使用 LockContext / SortEntityKeys。
 func LockEntitiesInOrder(ctx context.Context, tx *sql.Tx, lockCtx *LockContext, keys []EntityKey) error {
 	if !IsSorted(keys) {
 		return fmt.Errorf("%w: candidate keys must be strictly sorted before locking", ErrOutOfOrderLock)
+	}
+	if tx == nil {
+		return fmt.Errorf("%w: LockEntitiesInOrder requires a non-nil *sql.Tx", ErrNilTx)
 	}
 
 	for _, key := range keys {
 		// 登记到锁上下文，验证未违反全序规则
 		if err := lockCtx.RecordEntityLock(key); err != nil {
 			return err
-		}
-
-		// 若 tx 为 nil（用于离线单测），仅验证锁序
-		if tx == nil {
-			continue
 		}
 
 		meta, err := LookupTableOrder(key.Table)
@@ -102,10 +103,14 @@ func VerifyCurrentStates(ctx context.Context, q QueryRower, keys []EntityKey, sn
 	return states, nil
 }
 
-// LockAndVerify 将排序加锁与当前态核验原子组合
+// LockAndVerify 将排序加锁与当前态核验原子组合。
+// tx 为 nil 时返回 ErrNilTx（R2 I9）：加锁与核验必须在真实外层事务内发生。
 func LockAndVerify(ctx context.Context, tx *sql.Tx, lockCtx *LockContext, snapshot *LocatorSnapshot, verifier CurrentVerifier) ([]*EntityState, error) {
 	if snapshot == nil {
 		return nil, errors.New("lockorder: nil snapshot")
+	}
+	if tx == nil {
+		return nil, fmt.Errorf("%w: LockAndVerify requires a non-nil *sql.Tx", ErrNilTx)
 	}
 
 	// 1. 严格全序加锁
@@ -114,11 +119,7 @@ func LockAndVerify(ctx context.Context, tx *sql.Tx, lockCtx *LockContext, snapsh
 	}
 
 	// 2. 持锁下立即进行 current read 核验
-	var qr QueryRower
-	if tx != nil {
-		qr = tx
-	}
-	states, err := VerifyCurrentStates(ctx, qr, snapshot.CandidateKeys, snapshot, verifier)
+	states, err := VerifyCurrentStates(ctx, tx, snapshot.CandidateKeys, snapshot, verifier)
 	if err != nil {
 		// 核验失败直接透出 ErrMembershipDrift 或内部错误，调用层必须整体回滚，严禁追加补锁
 		return nil, err

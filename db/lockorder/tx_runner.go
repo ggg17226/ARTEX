@@ -27,6 +27,9 @@ var (
 
 	ErrRetryExhausted = errors.New("lockorder: transaction retry attempts exhausted")
 	ErrOutcomeUnknown = errors.New("lockorder: transaction commit outcome unknown, local gates held")
+
+	// ErrNilTx 导出执行入口收到 nil *sql.Tx 时返回：禁止把"没有真实加锁"当离线成功（R2 I9）
+	ErrNilTx = errors.New("lockorder: nil transaction handle")
 )
 
 // mysqlErrorNumberExtractor 兼容从不同 mysql driver 错误中提取状态码
@@ -155,6 +158,10 @@ func isOutcomeUnknown(err error) bool {
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// 本地门禁（Local Gates）
+// ---------------------------------------------------------------------------
+
 // GateManager 本地门禁管理器接口
 type GateManager interface {
 	AcquireLocalBusiness(ctx context.Context) error
@@ -163,92 +170,251 @@ type GateManager interface {
 	ReleaseLocalNamespace(ns string)
 }
 
-// MemoryGateManager 基于内存读写锁的本地门禁实现
-type MemoryGateManager struct {
-	businessMu sync.Mutex
-	nsMu       sync.Mutex
-	nsLocks    map[string]*sync.Mutex
+// ctxMutex 可被 context 取消的互斥锁（R2 I3）。
+// 容量为 1 的 channel 即令牌：持有者 = 唯一成功投递令牌者；等待者可在 ctx 结束时脱身，
+// 且 unlock 允许跨 goroutine 调用（与 sync.Mutex 语义一致的部分）。
+type ctxMutex struct {
+	token chan struct{}
 }
 
-// NewMemoryGateManager 创建基于内存的门禁管理器
-func NewMemoryGateManager() *MemoryGateManager {
-	return &MemoryGateManager{
-		nsLocks: make(map[string]*sync.Mutex),
+func newCtxMutex() *ctxMutex {
+	return &ctxMutex{token: make(chan struct{}, 1)}
+}
+
+// lock 获取互斥锁；ctx 先已取消或等待期间结束均立即返回 ctx.Err()，绝不无限等待。
+func (m *ctxMutex) lock(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.token <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
+// unlock 归还令牌；未被持有时为无操作（不 panic，也不误释放他人持有的锁）。
+func (m *ctxMutex) unlock() bool {
+	select {
+	case <-m.token:
+		return true
+	default:
+		return false
+	}
+}
+
+// MemoryGateManager 基于内存互斥锁的本地门禁实现。
+// 锁等待可被 ctx 取消（R2 I3）；同一实例必须跨事务共享才具备跨 Run 互斥语义（R2 C1）。
+type MemoryGateManager struct {
+	business *ctxMutex
+	nsMu     sync.Mutex
+	nsLocks  map[string]*ctxMutex
+}
+
+// NewMemoryGateManager 创建基于内存的门禁管理器（调用方自行决定共享范围；
+// 需要跨 Run/跨事务互斥时使用 DefaultGateManager 进程级单例）
+func NewMemoryGateManager() *MemoryGateManager {
+	return &MemoryGateManager{
+		business: newCtxMutex(),
+		nsLocks:  make(map[string]*ctxMutex),
+	}
+}
+
+// AcquireLocalBusiness 获取本地业务关系门禁，等待期间可被 ctx 取消
 func (m *MemoryGateManager) AcquireLocalBusiness(ctx context.Context) error {
-	m.businessMu.Lock()
-	return nil
+	return m.business.lock(ctx)
 }
 
+// ReleaseLocalBusiness 释放本地业务关系门禁
 func (m *MemoryGateManager) ReleaseLocalBusiness() {
-	m.businessMu.Unlock()
+	m.business.unlock()
 }
 
-func (m *MemoryGateManager) getNSMutex(ns string) *sync.Mutex {
+// getNSMutex 返回（必要时创建）指定 namespace 的互斥锁
+func (m *MemoryGateManager) getNSMutex(ns string) *ctxMutex {
 	m.nsMu.Lock()
 	defer m.nsMu.Unlock()
 	mu, ok := m.nsLocks[ns]
 	if !ok {
-		mu = &sync.Mutex{}
+		mu = newCtxMutex()
 		m.nsLocks[ns] = mu
 	}
 	return mu
 }
 
-func (m *MemoryGateManager) AcquireLocalNamespace(ctx context.Context, ns string) error {
-	mu := m.getNSMutex(ns)
-	mu.Lock()
-	return nil
+// lookupNSMutex 仅查询已存在的 namespace 锁；释放路径不得凭空创建锁对象
+func (m *MemoryGateManager) lookupNSMutex(ns string) (*ctxMutex, bool) {
+	m.nsMu.Lock()
+	defer m.nsMu.Unlock()
+	mu, ok := m.nsLocks[ns]
+	return mu, ok
 }
 
-func (m *MemoryGateManager) ReleaseLocalNamespace(ns string) {
-	mu := m.getNSMutex(ns)
-	mu.Unlock()
+// AcquireLocalNamespace 获取指定 namespace 本地门禁，等待期间可被 ctx 取消
+func (m *MemoryGateManager) AcquireLocalNamespace(ctx context.Context, ns string) error {
+	return m.getNSMutex(ns).lock(ctx)
 }
+
+// ReleaseLocalNamespace 释放指定 namespace 本地门禁；未持有（含从未出现过的 ns）为无操作
+func (m *MemoryGateManager) ReleaseLocalNamespace(ns string) {
+	if mu, ok := m.lookupNSMutex(ns); ok {
+		mu.unlock()
+	}
+}
+
+var (
+	defaultGateManagerOnce sync.Once
+	defaultGateManagerVal  *MemoryGateManager
+)
+
+// DefaultGateManager 返回进程级共享的本地门禁管理器（R2 C1）。
+//
+// TxRunner.Run 在 TxRunnerOptions.GateManager 为 nil 时一律使用该单例，从而保证：
+//   - 同一 namespace 的并发 Run 在本地门禁层互斥（跨 TxRunner 实例、跨 *sql.DB 实例）；
+//   - unknown-outcome 分支刻意 hold 住的门禁在后续 Run 中继续阻塞同一 namespace（fail closed）。
+//
+// 该实例只增不减（每个出现过的 namespace 一条锁），与旧实现一致。
+func DefaultGateManager() *MemoryGateManager {
+	defaultGateManagerOnce.Do(func() {
+		defaultGateManagerVal = NewMemoryGateManager()
+	})
+	return defaultGateManagerVal
+}
+
+// ---------------------------------------------------------------------------
+// 事务执行器
+// ---------------------------------------------------------------------------
 
 // TxRunnerOptions 事务运行器配置
 type TxRunnerOptions struct {
 	RequiresBusinessGate bool
 	RequiredNamespaces   []string
 	BackoffSchedule      []time.Duration
-	GateManager          GateManager
+
+	// GateManager 本地门禁管理器。为 nil 时使用进程级共享单例 DefaultGateManager()，
+	// 以获得跨 Run、跨 TxRunner 的本地互斥与 unknown-outcome fail closed（R2 C1）。
+	// 仅测试或确需隔离门禁域时才注入自定义实现。
+	GateManager GateManager
 }
 
 // TxPayloadFunc 在全序与门禁保护下的核心事务执行逻辑
 type TxPayloadFunc func(ctx context.Context, tx *sql.Tx, lockCtx *LockContext) error
 
-// TxRunner 全事务回滚与退避重试执行器
+// TxRunner 全事务回滚与有界退避重试执行器
 type TxRunner struct {
-	db      *sql.DB
-	sleeper func(time.Duration)
+	db *sql.DB
+	// sleepFn 可取消的退避休眠；默认 sleepContext，测试可经 SetSleeper 注入观测实现
+	sleepFn func(ctx context.Context, d time.Duration) error
 }
 
-// NewTxRunner 创建事务运行器
+// sleepContext 默认退避休眠：timer + select，ctx 结束立即返回其错误（R2 I3）
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// NewTxRunner 创建事务运行器。db 为 nil 时 Run 直接返回 ErrNilDatabase（R2 I9），
+// 不再提供"离线成功"路径。
 func NewTxRunner(db *sql.DB) *TxRunner {
 	return &TxRunner{
 		db:      db,
-		sleeper: time.Sleep,
+		sleepFn: sleepContext,
 	}
 }
 
-// SetSleeper 设置用于单测模拟的休眠函数
+// SetSleeper 设置用于单测模拟的休眠函数。
+// 注入实现仅用于观测退避时长；取消语义由返回后的 ctx 检查保证，
+// 生产路径始终走可取消的 sleepContext。
 func (r *TxRunner) SetSleeper(sleeper func(time.Duration)) {
-	if sleeper != nil {
-		r.sleeper = sleeper
+	if sleeper == nil {
+		return
+	}
+	r.sleepFn = func(ctx context.Context, d time.Duration) error {
+		sleeper(d)
+		if ctx == nil {
+			return nil
+		}
+		return ctx.Err()
 	}
 }
 
-// Run 执行带全序门禁与有界退避重试的悲观事务
+// normalizeNamespaces 复制、按名称升序排序并去重（R2 I4）。
+// 去重必须在加锁之前完成：同名 namespace 第二次 Acquire 会阻塞在本 goroutine
+// 已持有的非重入互斥锁上，永远到不了 LockContext 的 ErrDuplicateLock 检查。
+func normalizeNamespaces(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	sorted := make([]string, len(in))
+	copy(sorted, in)
+	sort.Strings(sorted)
+
+	dedup := make([]string, 0, len(sorted))
+	for i, ns := range sorted {
+		if i > 0 && ns == sorted[i-1] {
+			continue
+		}
+		dedup = append(dedup, ns)
+	}
+	return dedup
+}
+
+// attemptOutcome 单次尝试的结果分类
+type attemptOutcome int
+
+const (
+	// outcomeDone 已结束：err==nil 表示已提交成功；否则为不可重试失败
+	outcomeDone attemptOutcome = iota
+	// outcomeRetry 已整体回滚并释放门禁，可退避重试
+	outcomeRetry
+	// outcomeHeld 提交结果未知：本地门禁按设计保持 hold，不得再进入同一 namespace
+	outcomeHeld
+)
+
+// Run 执行带全序门禁与有界退避重试的悲观事务。
+//
+// 顺序约束保持不变：本地门禁（business → namespace 升序）先于 DB 行锁
+// （business_relations → namespace 升序），释放严格逆序。
+//
+// ctx 契约：门禁等待与退避休眠都可被 ctx 取消；payload 自身也必须尊重 ctx。
 func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayloadFunc) error {
+	if r == nil || r.db == nil {
+		return fmt.Errorf("%w: TxRunner.Run requires a non-nil *sql.DB (offline success path removed)", ErrNilDatabase)
+	}
 	if payload == nil {
 		return errors.New("lockorder: nil payload function")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	gm := opts.GateManager
 	if gm == nil {
-		gm = NewMemoryGateManager()
+		gm = DefaultGateManager()
+	}
+
+	sleepFn := r.sleepFn
+	if sleepFn == nil {
+		sleepFn = sleepContext
 	}
 
 	schedule := opts.BackoffSchedule
@@ -257,175 +423,199 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 	}
 	maxAttempts := len(schedule) + 1
 
-	// 预先对 namespace 按名称升序排序，严格保证全序
-	sortedNamespaces := make([]string, len(opts.RequiredNamespaces))
-	copy(sortedNamespaces, opts.RequiredNamespaces)
-	sort.Strings(sortedNamespaces)
+	// 预先对 namespace 按名称升序排序并去重，严格保证全序且不会自锁
+	sortedNamespaces := normalizeNamespaces(opts.RequiredNamespaces)
 
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			sleepDur := schedule[attempt-1]
-			r.sleeper(sleepDur)
+			if err := sleepFn(ctx, schedule[attempt-1]); err != nil {
+				return err
+			}
 		}
 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		// 创建当前尝试独立的锁上下文
-		lockCtx := NewLockContext()
-
-		// 1. 获取本地门禁（Local Gates）
-		var heldLocalBusiness bool
-		var heldLocalNamespaces []string
-
-		acquireLocalGates := func() error {
-			if opts.RequiresBusinessGate {
-				if err := gm.AcquireLocalBusiness(ctx); err != nil {
-					return err
-				}
-				heldLocalBusiness = true
-				if err := lockCtx.RecordLocalBusinessGate(); err != nil {
-					return err
-				}
-			}
-
-			for _, ns := range sortedNamespaces {
-				if err := gm.AcquireLocalNamespace(ctx, ns); err != nil {
-					return err
-				}
-				heldLocalNamespaces = append(heldLocalNamespaces, ns)
-				if err := lockCtx.RecordLocalNamespaceGate(ns); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
-		// 逆序释放本地门禁闭包
-		releaseLocalGates := func() {
-			// 先逆序释放 namespace gates
-			for i := len(heldLocalNamespaces) - 1; i >= 0; i-- {
-				gm.ReleaseLocalNamespace(heldLocalNamespaces[i])
-			}
-			heldLocalNamespaces = nil
-
-			// 最后释放 business gate
-			if heldLocalBusiness {
-				gm.ReleaseLocalBusiness()
-				heldLocalBusiness = false
-			}
-		}
-
-		if err := acquireLocalGates(); err != nil {
-			releaseLocalGates()
+		err, outcome := r.runAttempt(ctx, gm, opts, sortedNamespaces, payload)
+		switch outcome {
+		case outcomeHeld:
+			// unknown outcome：门禁刻意保持持有，交由上层人工/对账介入
+			return err
+		case outcomeRetry:
+			lastErr = err
+			continue
+		default:
 			return err
 		}
-
-		// 2. 开始外层数据事务
-		var tx *sql.Tx
-		var err error
-		if r.db != nil {
-			tx, err = r.db.BeginTx(ctx, nil)
-			if err != nil {
-				releaseLocalGates()
-				return fmt.Errorf("begin outer data tx: %w", err)
-			}
-		}
-
-		// 3. 在外层数据事务内获取 DB Gate 锁
-		acquireDBGates := func() error {
-			if opts.RequiresBusinessGate {
-				if err := lockCtx.RecordDBBusinessGate(); err != nil {
-					return err
-				}
-				if tx != nil {
-					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name) VALUES ('business_relations')"); err != nil {
-						return fmt.Errorf("lock db business_relations: insert ignore: %w", err)
-					}
-					var name string
-					row := tx.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = 'business_relations' FOR UPDATE")
-					if err := row.Scan(&name); err != nil {
-						if errors.Is(err, sql.ErrNoRows) {
-							return fmt.Errorf("lock db business_relations: row not found under lock")
-						}
-						return fmt.Errorf("lock db business_relations: %w", err)
-					}
-				}
-			}
-
-			for _, ns := range sortedNamespaces {
-				if err := lockCtx.RecordDBNamespaceGate(ns); err != nil {
-					return err
-				}
-				if tx != nil {
-					if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name) VALUES (?)", ns); err != nil {
-						return fmt.Errorf("lock db namespace %s: insert ignore: %w", ns, err)
-					}
-					var name string
-					row := tx.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = ? FOR UPDATE", ns)
-					if err := row.Scan(&name); err != nil {
-						if errors.Is(err, sql.ErrNoRows) {
-							return fmt.Errorf("lock db namespace %s: row not found under lock", ns)
-						}
-						return fmt.Errorf("lock db namespace %s: %w", ns, err)
-					}
-				}
-			}
-			return nil
-		}
-
-		gateErr := acquireDBGates()
-		if gateErr != nil {
-			if tx != nil {
-				_ = tx.Rollback()
-			}
-			releaseLocalGates()
-			lockCtx.Reset()
-			if IsRetryableConflict(gateErr) {
-				lastErr = gateErr
-				continue
-			}
-			return gateErr
-		}
-
-		// 4. 执行业务载荷（包含 fresh locator 与实体加锁重验）
-		payloadErr := payload(ctx, tx, lockCtx)
-		if payloadErr == nil {
-			// 5. 提交事务
-			var commitErr error
-			if tx != nil {
-				commitErr = tx.Commit()
-			}
-			if commitErr == nil {
-				// 成功提交：逆序释放本地门禁，返回成功
-				releaseLocalGates()
-				return nil
-			}
-			if isOutcomeUnknown(commitErr) {
-				log.Printf("[lockorder] tx commit outcome unknown: %v; holding local gates", commitErr)
-				return fmt.Errorf("%w: %v", ErrOutcomeUnknown, commitErr)
-			}
-			payloadErr = commitErr
-		}
-
-		// 执行失败或提交失败：整体回滚外层事务，逆序释放全部门禁
-		if tx != nil {
-			_ = tx.Rollback()
-		}
-		releaseLocalGates()
-		lockCtx.Reset()
-
-		if IsRetryableConflict(payloadErr) {
-			lastErr = payloadErr
-			continue
-		}
-
-		// 非可重试错误：立即 fail closed
-		return payloadErr
 	}
 
 	return fmt.Errorf("%w: attempts exhausted (last error: %v)", ErrRetryExhausted, lastErr)
+}
+
+// runAttempt 执行单次尝试。所有资源（外层事务、本地门禁、锁上下文）都在本函数内
+// 通过统一的 per-attempt defer 清理（R2 I1）：
+//   - 正常错误路径：Rollback → 逆序释放本地门禁 → lockCtx.Reset()
+//   - panic 路径：同样清理后以原 panic 值重新 panic（保留调用方的 recover 语义与
+//     堆栈信息；把 panic 降级成 error 会让上层误判为业务错误并可能被重试逻辑吞掉）
+//   - 已提交成功 / unknown-outcome hold：不清理门禁（前者已释放，后者按设计继续封锁）
+func (r *TxRunner) runAttempt(
+	ctx context.Context,
+	gm GateManager,
+	opts TxRunnerOptions,
+	namespaces []string,
+	payload TxPayloadFunc,
+) (error, attemptOutcome) {
+	lockCtx := NewLockContext()
+
+	var (
+		tx           *sql.Tx
+		heldBusiness bool
+		heldNS       []string
+		committed    bool
+		holdGates    bool
+	)
+
+	// 逆序释放本地门禁闭包：namespace 倒序，business 最后；重复调用安全
+	releaseLocalGates := func() {
+		for i := len(heldNS) - 1; i >= 0; i-- {
+			gm.ReleaseLocalNamespace(heldNS[i])
+		}
+		heldNS = nil
+
+		if heldBusiness {
+			gm.ReleaseLocalBusiness()
+			heldBusiness = false
+		}
+	}
+
+	rollbackTx := func() {
+		if tx != nil {
+			_ = tx.Rollback()
+			tx = nil
+		}
+	}
+
+	cleanup := func() {
+		rollbackTx()
+		if !holdGates {
+			releaseLocalGates()
+		}
+		lockCtx.Reset()
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			cleanup()
+			panic(p)
+		}
+		if committed || holdGates {
+			return
+		}
+		cleanup()
+	}()
+
+	// 1. 获取本地门禁（Local Gates）——必须先于任何 DB 锁
+	if opts.RequiresBusinessGate {
+		if err := gm.AcquireLocalBusiness(ctx); err != nil {
+			return err, outcomeDone
+		}
+		heldBusiness = true
+		if err := lockCtx.RecordLocalBusinessGate(); err != nil {
+			return err, outcomeDone
+		}
+	}
+
+	for _, ns := range namespaces {
+		if err := gm.AcquireLocalNamespace(ctx, ns); err != nil {
+			return err, outcomeDone
+		}
+		heldNS = append(heldNS, ns)
+		if err := lockCtx.RecordLocalNamespaceGate(ns); err != nil {
+			return err, outcomeDone
+		}
+	}
+
+	// 2. 开始外层数据事务（Run 已保证 r.db 非 nil）
+	var err error
+	tx, err = r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin outer data tx: %w", err), outcomeDone
+	}
+
+	// 3. 在外层数据事务内获取 DB Gate 锁
+	if err := acquireDBGates(ctx, tx, lockCtx, opts, namespaces); err != nil {
+		if IsRetryableConflict(err) {
+			return err, outcomeRetry
+		}
+		return err, outcomeDone
+	}
+
+	// 4. 执行业务载荷（包含 fresh locator 与实体加锁重验）
+	payloadErr := payload(ctx, tx, lockCtx)
+	if payloadErr == nil {
+		// 5. 提交事务
+		commitErr := tx.Commit()
+		if commitErr == nil {
+			// 成功提交：逆序释放本地门禁，返回成功
+			committed = true
+			tx = nil
+			releaseLocalGates()
+			return nil, outcomeDone
+		}
+		if isOutcomeUnknown(commitErr) {
+			holdGates = true
+			log.Printf("[lockorder] tx commit outcome unknown: %v; holding local gates", commitErr)
+			return fmt.Errorf("%w: %v", ErrOutcomeUnknown, commitErr), outcomeHeld
+		}
+		payloadErr = commitErr
+	}
+
+	// 执行失败或提交失败：整体回滚外层事务，逆序释放全部门禁（由 defer 统一执行）
+	if IsRetryableConflict(payloadErr) {
+		return payloadErr, outcomeRetry
+	}
+	// 非可重试错误：立即 fail closed
+	return payloadErr, outcomeDone
+}
+
+// acquireDBGates 在外层数据事务内按 business_relations → namespace 升序获取 DB 行锁。
+// tx 由 runAttempt 保证非 nil（R2 I9：不再存在 nil tx 的"离线"分支）。
+func acquireDBGates(ctx context.Context, tx *sql.Tx, lockCtx *LockContext, opts TxRunnerOptions, namespaces []string) error {
+	if opts.RequiresBusinessGate {
+		if err := lockCtx.RecordDBBusinessGate(); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name) VALUES ('business_relations')"); err != nil {
+			return fmt.Errorf("lock db business_relations: insert ignore: %w", err)
+		}
+		var name string
+		row := tx.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = 'business_relations' FOR UPDATE")
+		if err := row.Scan(&name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("lock db business_relations: row not found under lock")
+			}
+			return fmt.Errorf("lock db business_relations: %w", err)
+		}
+	}
+
+	for _, ns := range namespaces {
+		if err := lockCtx.RecordDBNamespaceGate(ns); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO locks (name) VALUES (?)", ns); err != nil {
+			return fmt.Errorf("lock db namespace %s: insert ignore: %w", ns, err)
+		}
+		var name string
+		row := tx.QueryRowContext(ctx, "SELECT name FROM locks WHERE name = ? FOR UPDATE", ns)
+		if err := row.Scan(&name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("lock db namespace %s: row not found under lock", ns)
+			}
+			return fmt.Errorf("lock db namespace %s: %w", ns, err)
+		}
+	}
+	return nil
 }
