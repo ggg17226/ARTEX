@@ -171,8 +171,22 @@ type GateManager interface {
 }
 
 // ctxMutex 可被 context 取消的互斥锁（R2 I3）。
-// 容量为 1 的 channel 即令牌：持有者 = 唯一成功投递令牌者；等待者可在 ctx 结束时脱身，
-// 且 unlock 允许跨 goroutine 调用（与 sync.Mutex 语义一致的部分）。
+// 容量为 1 的 channel 即令牌：持有者 = 唯一成功投递令牌的一方；等待者可在 ctx 结束时脱身。
+//
+// 所有权契约（R11 M-R11-1，务必先读）：本锁**不携带、也不校验持有者身份**。
+//   - lock 成功 = 取得令牌；unlock 只归还"一个令牌"，无法验证归还者是否为持有者；
+//   - 因此 acquire/release 必须由同一执行流严格配对：谁 lock 成功，谁负责 unlock；
+//   - 违约示例：A release → B acquire → A 再次 release。第三次调用会取走 **B 的**
+//     令牌（并非无操作），使 C 能在 B 仍持有时进入 —— 属调用方违约，本锁不提供兜底；
+//   - 仅在锁未被持有（channel 为空）时 unlock 才是无操作：返回 false、不 panic，
+//     因此重复释放只会静默失败，不会像 sync.Mutex 那样 panic。
+//
+// 该缺口与旧的 sync.Mutex 实现同源（sync.Mutex 同样允许跨 goroutine Unlock，
+// B 重获后被 A 错误 Unlock 同样会丢失互斥），不是本次改动新引入的漏洞；
+// 但默认门禁已改为进程级单例（DefaultGateManager），误释放的影响域从"单次 Run"
+// 扩大到"整个进程的门禁域"，故不得把 ReleaseLocalBusiness/ReleaseLocalNamespace
+// 当作"安全恢复/强制解封协议"使用。需要可审计的解封能力时，应另行引入带 lease token
+// 的 quarantine/reconcile API（本波不做，见 w6a-b-report.md 剩余风险）。
 type ctxMutex struct {
 	token chan struct{}
 }
@@ -182,6 +196,8 @@ func newCtxMutex() *ctxMutex {
 }
 
 // lock 获取互斥锁；ctx 先已取消或等待期间结束均立即返回 ctx.Err()，绝不无限等待。
+// ctx.Done() 与"投递成功"同时就绪时 select 可能选择投递成功：此时令牌已被本方持有，
+// 由调用方（runAttempt 的 cleanup）正常释放，不会丢失互斥。
 func (m *ctxMutex) lock(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -197,7 +213,12 @@ func (m *ctxMutex) lock(ctx context.Context) error {
 	}
 }
 
-// unlock 归还令牌；未被持有时为无操作（不 panic，也不误释放他人持有的锁）。
+// unlock 归还一个令牌：
+//   - 锁未被持有（channel 为空）→ 无操作，返回 false，不 panic；
+//   - 锁被持有 → 取走令牌并返回 true，**不校验调用者是否为持有者**。
+//
+// 调用方必须保证与成功的 lock 配对（见 ctxMutex 的所有权契约）；错误调用会释放他人的
+// 令牌并破坏互斥，本方法不提供任何检测能力。
 func (m *ctxMutex) unlock() bool {
 	select {
 	case <-m.token:
@@ -229,7 +250,11 @@ func (m *MemoryGateManager) AcquireLocalBusiness(ctx context.Context) error {
 	return m.business.lock(ctx)
 }
 
-// ReleaseLocalBusiness 释放本地业务关系门禁
+// ReleaseLocalBusiness 释放本地业务关系门禁。
+//
+// 契约同 ctxMutex.unlock：只归还一个令牌，不校验调用者身份。必须由成功
+// AcquireLocalBusiness 的同一执行流调用；未持有时调用是无操作（静默返回），
+// 他人持有时调用会**误释放他人的门禁**（调用方违约，见 ctxMutex 文档）。
 func (m *MemoryGateManager) ReleaseLocalBusiness() {
 	m.business.unlock()
 }
@@ -259,7 +284,13 @@ func (m *MemoryGateManager) AcquireLocalNamespace(ctx context.Context, ns string
 	return m.getNSMutex(ns).lock(ctx)
 }
 
-// ReleaseLocalNamespace 释放指定 namespace 本地门禁；未持有（含从未出现过的 ns）为无操作
+// ReleaseLocalNamespace 释放指定 namespace 本地门禁。
+//
+// 未持有（含从未出现过的 ns）时为无操作；契约同 ctxMutex.unlock —— 只归还一个令牌、
+// 不校验调用者身份，必须由成功 AcquireLocalNamespace 的同一执行流配对调用。
+// 在默认单例 DefaultGateManager() 上对**他人正在持有**的 namespace 调用本方法，
+// 会破坏该 namespace 的互斥并让 unknown-outcome 的 fail closed 封锁失效：
+// 这是调用方违约，不是受支持的恢复手段（R11 M-R11-1）。
 func (m *MemoryGateManager) ReleaseLocalNamespace(ns string) {
 	if mu, ok := m.lookupNSMutex(ns); ok {
 		mu.unlock()
@@ -277,7 +308,14 @@ var (
 //   - 同一 namespace 的并发 Run 在本地门禁层互斥（跨 TxRunner 实例、跨 *sql.DB 实例）；
 //   - unknown-outcome 分支刻意 hold 住的门禁在后续 Run 中继续阻塞同一 namespace（fail closed）。
 //
-// 该实例只增不减（每个出现过的 namespace 一条锁），与旧实现一致。
+// 生命周期：该实例的 namespace 锁表只增不减。注意这与"旧实现一致"的说法并不成立——
+// 旧默认路径每次 Run 新建临时管理器（Run 结束即可整体回收），改为单例后，
+// 每个出现过的 namespace 的锁对象真正常驻整个进程生命周期，内存增长随 namespace
+// 基数线性累积（基数上限/准入/指标属后续工作，见 w6a-b-report.md 剩余风险）。
+//
+// 误用风险（R11 M-R11-1）：ReleaseLocalBusiness/ReleaseLocalNamespace 不校验持有者，
+// 在本单例上手工"解锁"可能释放他人正在持有的门禁、并解除 unknown-outcome 的封锁，
+// 因此它不是恢复协议；需要可审计解封时应引入带 lease token 的对账 API。
 func DefaultGateManager() *MemoryGateManager {
 	defaultGateManagerOnce.Do(func() {
 		defaultGateManagerVal = NewMemoryGateManager()
@@ -344,6 +382,8 @@ func NewTxRunner(db *sql.DB) *TxRunner {
 // SetSleeper 设置用于单测模拟的休眠函数。
 // 注入实现仅用于观测退避时长；取消语义由返回后的 ctx 检查保证，
 // 生产路径始终走可取消的 sleepContext。
+// 注意：注入的 sleeper 自身不可被 ctx 中断，且本方法与 Run 之间无并发保护，
+// 只应在开始并发使用之前完成配置。
 func (r *TxRunner) SetSleeper(sleeper func(time.Duration)) {
 	if sleeper == nil {
 		return

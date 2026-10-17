@@ -39,6 +39,15 @@ func BuildLockSQL(meta TableMeta) string {
 //
 // tx 为 nil 时返回 ErrNilTx：本函数是导出执行入口，绝不允许把"只登记、未加锁"
 // 当作离线成功（R2 I9）。纯锁序校验请直接使用 LockContext / SortEntityKeys。
+//
+// 参数校验优先级（两个导出执行入口共用，R11 I-R11-1）：
+//
+//	① 锁序校验（IsSorted）→ ErrOutOfOrderLock
+//	② nil tx 校验 → ErrNilTx
+//
+// 即"乱序/重复候选 + nil tx"同时存在时先报 ErrOutOfOrderLock：调用方需要先修的是
+// 加锁全序，而不是句柄。LockAndVerify 直接委托本函数，因此两入口对同一输入给出
+// 同一错误分类；修改本顺序会同时改变两个入口的契约。
 func LockEntitiesInOrder(ctx context.Context, tx *sql.Tx, lockCtx *LockContext, keys []EntityKey) error {
 	if !IsSorted(keys) {
 		return fmt.Errorf("%w: candidate keys must be strictly sorted before locking", ErrOutOfOrderLock)
@@ -104,18 +113,27 @@ func VerifyCurrentStates(ctx context.Context, q QueryRower, keys []EntityKey, sn
 }
 
 // LockAndVerify 将排序加锁与当前态核验原子组合。
+//
 // tx 为 nil 时返回 ErrNilTx（R2 I9）：加锁与核验必须在真实外层事务内发生。
+//
+// 参数校验优先级与 LockEntitiesInOrder 完全一致（R11 I-R11-1）：
+//
+//	① snapshot == nil → 立即报错（该参数是本函数独有的）
+//	② 其余校验全部委托 LockEntitiesInOrder：先锁序校验（ErrOutOfOrderLock），
+//	  后 nil tx 校验（ErrNilTx）
+//
+// 因此本入口**不再重复** nil tx 守卫：组合入口若在排序校验之前判 nil tx，会让
+// "乱序候选 + nil tx"从 ErrOutOfOrderLock 变成 ErrNilTx，与底层入口分类不一致，
+// 也会掩盖调用方真正的锁序缺陷。委托错误以 "lock and verify: %w" 包装透出，
+// errors.Is 判定不变，且错误信息保留失败步骤（LockEntitiesInOrder）的可诊断性。
 func LockAndVerify(ctx context.Context, tx *sql.Tx, lockCtx *LockContext, snapshot *LocatorSnapshot, verifier CurrentVerifier) ([]*EntityState, error) {
 	if snapshot == nil {
 		return nil, errors.New("lockorder: nil snapshot")
 	}
-	if tx == nil {
-		return nil, fmt.Errorf("%w: LockAndVerify requires a non-nil *sql.Tx", ErrNilTx)
-	}
 
-	// 1. 严格全序加锁
+	// 1. 严格全序加锁（锁序校验优先于 nil tx 校验，见 LockEntitiesInOrder 文档）
 	if err := LockEntitiesInOrder(ctx, tx, lockCtx, snapshot.CandidateKeys); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lock and verify: %w", err)
 	}
 
 	// 2. 持锁下立即进行 current read 核验
