@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sort"
@@ -32,13 +33,82 @@ var (
 	ErrNilTx = errors.New("lockorder: nil transaction handle")
 )
 
-// mysqlErrorNumberExtractor 兼容从不同 mysql driver 错误中提取状态码
-type mysqlErrorNumberExtractor interface {
-	error
-	// 部分驱动或自定义包装包含此接口
+// ---------------------------------------------------------------------------
+// 错误分类（R2 I6：结构化编号判定；R2 I7：提交结局不确定性判定）
+// ---------------------------------------------------------------------------
+
+// retryableMySQLNumbers 服务端明确可重试的错误编号：
+// 1062 ER_DUP_ENTRY、1205 ER_LOCK_WAIT_TIMEOUT、1213 ER_LOCK_DEADLOCK。
+var retryableMySQLNumbers = map[uint16]struct{}{
+	1062: {},
+	1205: {},
+	1213: {},
 }
 
-// IsRetryableConflict 判断错误是否为死锁、超时、唯一键冲突或成员漂移等可重试冲突
+// unknownOutcomeMySQLNumbers 驱动/客户端侧"连接已不可信"的错误编号：
+// 2006 CR_SERVER_GONE_ERROR、2013 CR_SERVER_LOST。
+var unknownOutcomeMySQLNumbers = map[uint16]struct{}{
+	2006: {},
+	2013: {},
+}
+
+// sqlErrorNumber 以**结构化**方式提取 MySQL/TiDB 错误编号。
+//
+// 优先级：
+//  1. *mysql.MySQLError —— 原生 go-sql-driver 的真实形态（Number 是**字段**，不是方法），
+//     服务端返回的每一个错误、以及驱动侧 2006/2013 都是该类型；
+//  2. 实现 Number()/Code() 方法的包装类型或测试替身（规范提取接口）。
+//
+// ok=false 表示错误链上没有任何结构化编号。调用方**不得**因此改用文本猜测：
+// 业务错误消息里出现 "1213"、"deadlock" 之类的字样不构成冲突证据（R2 I6）。
+func sqlErrorNumber(err error) (uint16, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number, true
+	}
+	type number16 interface{ Number() uint16 }
+	type number32 interface{ Number() int32 }
+	type numberInt interface{ Number() int }
+	type code16 interface{ Code() uint16 }
+	type codeInt interface{ Code() int }
+
+	var n16 number16
+	if errors.As(err, &n16) {
+		return n16.Number(), true
+	}
+	var n32 number32
+	if errors.As(err, &n32) {
+		return uint16(n32.Number()), true
+	}
+	var nInt numberInt
+	if errors.As(err, &nInt) {
+		return uint16(nInt.Number()), true
+	}
+	var c16 code16
+	if errors.As(err, &c16) {
+		return c16.Code(), true
+	}
+	var cInt codeInt
+	if errors.As(err, &cInt) {
+		return uint16(cInt.Code()), true
+	}
+	return 0, false
+}
+
+// IsRetryableConflict 判断错误是否为死锁、锁超时、唯一键冲突、成员漂移等可重试冲突。
+//
+// 判定顺序（R2 I6：完全结构化，绝不做错误文本匹配）：
+//  1. 本包自身的结构化哨兵（漂移类 + 准入背压）→ 可重试；
+//  2. context.Canceled / DeadlineExceeded → 不可重试（取消不是冲突）；
+//  3. 能提取到结构化错误编号 → **只按编号**决定，命中 1062/1205/1213 才可重试；
+//  4. 无结构化编号 → 不可重试。
+//
+// 第 3 步的"只按编号"是关键：一旦拿到编号就不再回退到文本，
+// 避免 `errors.New("task 1213 violates policy")` 这类业务错误被误判为死锁，
+// 也避免真实 1064 语法错误因消息里含 "1213" 而被无限重试。
 func IsRetryableConflict(err error) bool {
 	if err == nil {
 		return false
@@ -54,70 +124,40 @@ func IsRetryableConflict(err error) bool {
 		return true
 	}
 
+	// 连接池准入背压（R2 I2）：容量暂时不足，退避后重试是正确响应。
+	if errors.Is(err, ErrAdmissionTimeout) {
+		return true
+	}
+
 	// 排除主动取消或超时的上下文错误
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
-	// 错误编号探测（1062, 1213, 1205）
-	type numberer interface {
-		Number() uint16
-	}
-	var numGetter numberer
-	if errors.As(err, &numGetter) {
-		switch numGetter.Number() {
-		case 1062, 1213, 1205:
-			return true
-		}
+	if num, ok := sqlErrorNumber(err); ok {
+		_, retryable := retryableMySQLNumbers[num]
+		return retryable
 	}
 
-	// 结构体直接字段反射匹配测试 mock 与原生驱动
-	type numField struct {
-		Number uint16
-	}
-	var nf interface{ Error() string }
-	if errors.As(err, &nf) {
-		type hasNum interface {
-			Number() uint16
-		}
-		// 检查常规包含 Number uint16 导出的结构
-		type errNum interface {
-			Number() uint16
-		}
-		var en errNum
-		if errors.As(err, &en) {
-			switch en.Number() {
-			case 1062, 1213, 1205:
-				return true
-			}
-		}
-	}
-
-	// 备选字符串特征匹配（兜底非结构化包装）
-	msg := err.Error()
-	if containsSubstr(msg, "1213") || containsSubstr(msg, "Deadlock") ||
-		containsSubstr(msg, "1205") || containsSubstr(msg, "Lock wait timeout") ||
-		containsSubstr(msg, "1062") || containsSubstr(msg, "Duplicate entry") {
-		return true
-	}
-
+	// 无结构化编号：不猜文本，一律不可重试（R2 I6）
 	return false
 }
 
-func containsSubstr(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || (len(s) > len(substr) && stringSearch(s, substr)))
-}
-
-func stringSearch(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// isOutcomeUnknown 识别连接重置、broken pipe、connection lost 等网络/驱动断连类错误，或特定标记
+// isOutcomeUnknown 判定错误是否意味着"操作结局无法确定"（既不能认定已提交，
+// 也不能认定已回滚），因此必须保持门禁封锁（fail closed）。
+//
+// 覆盖范围（R2 I7）：
+//   - 本包 ErrOutcomeUnknown 标记；
+//   - 驱动协议失步：mysql.ErrPktSync / mysql.ErrPktSyncMul
+//     （go-sql-driver v1.9.3 packets.go readPacket 在响应 sequence 异常时返回；
+//     COMMIT 已写出但响应不可信时，服务端可能已经提交）；
+//   - 连接失效：driver.ErrBadConn、mysql.ErrInvalidConn、mysql.ErrMalformPkt；
+//   - 传输层截断：io.ErrUnexpectedEOF、io.EOF（响应包读到一半断流）；
+//   - 驱动侧 2006/2013（server gone / lost connection）；
+//   - *net.OpError 及连接类文本特征。
+//
+// 注意文本兜底只出现在**保守方向**：命中即判 unknown（宁可多封锁、绝不自动重放），
+// 它不参与"已安全回滚"的结论（R2 I7 最小建议）。
 func isOutcomeUnknown(err error) bool {
 	if err == nil {
 		return false
@@ -125,23 +165,17 @@ func isOutcomeUnknown(err error) bool {
 	if errors.Is(err, ErrOutcomeUnknown) {
 		return true
 	}
-	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) {
+	if errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, mysql.ErrInvalidConn) ||
+		errors.Is(err, mysql.ErrMalformPkt) ||
+		errors.Is(err, mysql.ErrPktSync) ||
+		errors.Is(err, mysql.ErrPktSyncMul) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) {
 		return true
 	}
-	var myErr *mysql.MySQLError
-	if errors.As(err, &myErr) {
-		switch myErr.Number {
-		case 2006, 2013: // CR_SERVER_GONE_ERROR, CR_SERVER_LOST
-			return true
-		}
-	}
-	type hasNumMethod interface {
-		Number() uint16
-	}
-	var hnm hasNumMethod
-	if errors.As(err, &hnm) {
-		switch hnm.Number() {
-		case 2006, 2013:
+	if num, ok := sqlErrorNumber(err); ok {
+		if _, unknown := unknownOutcomeMySQLNumbers[num]; unknown {
 			return true
 		}
 	}
@@ -150,16 +184,46 @@ func isOutcomeUnknown(err error) bool {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "connection lost") ||
-		strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "server has gone away") ||
-		strings.Contains(msg, "unexpected eof") ||
-		strings.Contains(msg, "bad connection") {
-		return true
+	for _, marker := range []string{
+		"broken pipe",
+		"connection reset",
+		"connection lost",
+		"connection refused",
+		"server has gone away",
+		"unexpected eof",
+		"bad connection",
+		"invalid connection",
+		"commands out of sync",
+		"out of sync",
+		"malformed packet",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
 	}
 	return false
+}
+
+// commitProvablyNotAttempted 判定 tx.Commit() 返回的错误是否**可证明**提交请求
+// 从未送达服务端。只有下列两种情况允许按"未提交"处理（R2 I7：其余一律 unknown）：
+//
+//  1. sql.ErrTxDone：stdlib 在 tx.done 的 CAS 上失败（database/sql sql.go Tx.Commit），
+//     本次调用根本没有执行 driver 的 Commit；
+//  2. context.Canceled / context.DeadlineExceeded：stdlib Tx.Commit 在 CAS 与
+//     driver.Commit **之前**先 select tx.ctx.Done()，而 go-sql-driver v1.9.3 的
+//     Commit 自身不监听 ctx、也不注册 watcher（transaction.go），
+//     因此 ctx 类错误只可能来自发送前的那次检查。
+//
+// 其他任何提交错误（协议失步、连接中断、服务端错误、未知驱动错误）都无法证明未提交，
+// 必须由调用方按 unknown-outcome 处理：保持门禁封锁，绝不自动重放。
+func commitProvablyNotAttempted(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sql.ErrTxDone) {
+		return true
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +405,14 @@ type TxRunnerOptions struct {
 	// 以获得跨 Run、跨 TxRunner 的本地互斥与 unknown-outcome fail closed（R2 C1）。
 	// 仅测试或确需隔离门禁域时才注入自定义实现。
 	GateManager GateManager
+
+	// Admission 连接池准入信号量（R2 I2）。为 nil 时使用进程级共享单例
+	// DefaultRunnerAdmission()（默认 16 个许可 = 池容量/2）。
+	//
+	// 作用：限制同时处于"已持外层事务连接、可能再取 fresh locator 第二条连接"模式的
+	// Run 数量，避免 32 个并发 Run 在 maxOpenConns=32 的共享池上形成 hold-and-wait。
+	// 注入 NewAdmissionControl(0, 0) 可显式关闭限流（仅测试用途）。
+	Admission *AdmissionControl
 }
 
 // TxPayloadFunc 在全序与门禁保护下的核心事务执行逻辑
@@ -439,7 +511,10 @@ const (
 // 顺序约束保持不变：本地门禁（business → namespace 升序）先于 DB 行锁
 // （business_relations → namespace 升序），释放严格逆序。
 //
-// ctx 契约：门禁等待与退避休眠都可被 ctx 取消；payload 自身也必须尊重 ctx。
+// ctx 契约：准入等待、门禁等待与退避休眠都可被 ctx 取消；payload 自身也必须尊重 ctx。
+//
+// 资源顺序：连接池准入许可（R2 I2）→ 本地门禁 → 外层事务连接 → DB Gate → 实体锁；
+// 释放严格逆序（unknown-outcome 例外：本地门禁按设计继续持有）。
 func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayloadFunc) error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("%w: TxRunner.Run requires a non-nil *sql.DB (offline success path removed)", ErrNilDatabase)
@@ -454,6 +529,12 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 	gm := opts.GateManager
 	if gm == nil {
 		gm = DefaultGateManager()
+	}
+
+	// R2 I2：连接池准入。nil → 进程级共享单例，跨 TxRunner 才有全局限流意义。
+	admission := opts.Admission
+	if admission == nil {
+		admission = DefaultRunnerAdmission()
 	}
 
 	sleepFn := r.sleepFn
@@ -483,7 +564,17 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 			return err
 		}
 
+		// R2 I2：先取得连接池准入许可，再进入"持外层连接 + 可能再取 locator 连接"的模式。
+		// 等待许可期间本方不持有任何连接或门禁，因此不构成 hold-and-wait；
+		// 等待可被 ctx 取消且有上限（默认 5s），context.Background() 也绝不会永久死等。
+		// 许可在每次尝试结束时归还（退避休眠期间不占用容量）。
+		releaseAdmission, err := admission.Acquire(ctx)
+		if err != nil {
+			return fmt.Errorf("runner admission: %w", err)
+		}
+
 		err, outcome := r.runAttempt(ctx, gm, opts, sortedNamespaces, payload)
+		releaseAdmission()
 		switch outcome {
 		case outcomeHeld:
 			// unknown outcome：门禁刻意保持持有，交由上层人工/对账介入
@@ -505,6 +596,11 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 //   - panic 路径：同样清理后以原 panic 值重新 panic（保留调用方的 recover 语义与
 //     堆栈信息；把 panic 降级成 error 会让上层误判为业务错误并可能被重试逻辑吞掉）
 //   - 已提交成功 / unknown-outcome hold：不清理门禁（前者已释放，后者按设计继续封锁）
+//
+// 提交结局判定（R2 I7）：Commit 返回错误时，只有 commitProvablyNotAttempted 能证明
+// "提交请求未送达"的错误（sql.ErrTxDone / 发送前的 ctx 结束）才按普通失败处理；
+// 其余一律 unknown-outcome —— 包括 mysql.ErrPktSync 这类协议失步，
+// 以及任何无法归类的驱动错误（保守默认，绝不靠有限白名单反推"已回滚"）。
 func (r *TxRunner) runAttempt(
 	ctx context.Context,
 	gm GateManager,
@@ -515,11 +611,12 @@ func (r *TxRunner) runAttempt(
 	lockCtx := NewLockContext()
 
 	var (
-		tx           *sql.Tx
-		heldBusiness bool
-		heldNS       []string
-		committed    bool
-		holdGates    bool
+		tx              *sql.Tx
+		heldBusiness    bool
+		heldNS          []string
+		committed       bool
+		holdGates       bool
+		commitAttempted bool
 	)
 
 	// 逆序释放本地门禁闭包：namespace 倒序，business 最后；重复调用安全
@@ -537,8 +634,15 @@ func (r *TxRunner) runAttempt(
 
 	rollbackTx := func() {
 		if tx != nil {
-			_ = tx.Rollback()
+			rbErr := tx.Rollback()
 			tx = nil
+			// R2 I7：一旦 Commit 已被尝试，stdlib 在调用 driver Commit 前就把 tx.done 置位，
+			// 此处的 Rollback 只可能返回 sql.ErrTxDone。它**不是**"服务端已撤销"的证据，
+			// 结局判定完全由 commitErr 的分类决定；这里只留痕，绝不据此改变门禁决策。
+			if commitAttempted && errors.Is(rbErr, sql.ErrTxDone) {
+				log.Printf("[lockorder] rollback after commit attempt returned sql.ErrTxDone; " +
+					"treated as NOT evidence of rollback")
+			}
 		}
 	}
 
@@ -601,20 +705,34 @@ func (r *TxRunner) runAttempt(
 	payloadErr := payload(ctx, tx, lockCtx)
 	if payloadErr == nil {
 		// 5. 提交事务
+		commitAttempted = true
 		commitErr := tx.Commit()
-		if commitErr == nil {
+		switch {
+		case commitErr == nil:
 			// 成功提交：逆序释放本地门禁，返回成功
 			committed = true
 			tx = nil
 			releaseLocalGates()
 			return nil, outcomeDone
-		}
-		if isOutcomeUnknown(commitErr) {
+
+		case commitProvablyNotAttempted(commitErr):
+			// 可证明提交请求未送达服务端（ErrTxDone / 发送前的 ctx 结束）：
+			// 按普通失败处理，回滚外层事务并逆序释放门禁。
+			payloadErr = commitErr
+
+		case isOutcomeUnknown(commitErr):
 			holdGates = true
 			log.Printf("[lockorder] tx commit outcome unknown: %v; holding local gates", commitErr)
-			return fmt.Errorf("%w: %v", ErrOutcomeUnknown, commitErr), outcomeHeld
+			return fmt.Errorf("%w: %w", ErrOutcomeUnknown, commitErr), outcomeHeld
+
+		default:
+			// R2 I7：其余任何提交错误都**无法证明**未提交（服务端可能已经提交），
+			// 一律按 unknown-outcome 处理：保持门禁封锁（DefaultGateManager 进程级
+			// fail closed），绝不自动重放、绝不用 Rollback 的 ErrTxDone 反推"已撤销"。
+			holdGates = true
+			log.Printf("[lockorder] tx commit failed with non-provable error, outcome unknown: %v; holding local gates", commitErr)
+			return fmt.Errorf("%w: commit error not provably pre-send: %w", ErrOutcomeUnknown, commitErr), outcomeHeld
 		}
-		payloadErr = commitErr
 	}
 
 	// 执行失败或提交失败：整体回滚外层事务，逆序释放全部门禁（由 defer 统一执行）
