@@ -101,16 +101,29 @@ func sqlErrorNumber(err error) (uint16, bool) {
 // IsRetryableConflict 判断错误是否为死锁、锁超时、唯一键冲突、成员漂移等可重试冲突。
 //
 // 判定顺序（R2 I6：完全结构化，绝不做错误文本匹配）：
+//  0. **ErrOutcomeUnknown → 一律不可重试（R18 I-2 短路，优先级最高）**；
 //  1. 本包自身的结构化哨兵（漂移类 + 准入背压）→ 可重试；
 //  2. context.Canceled / DeadlineExceeded → 不可重试（取消不是冲突）；
 //  3. 能提取到结构化错误编号 → **只按编号**决定，命中 1062/1205/1213 才可重试；
 //  4. 无结构化编号 → 不可重试。
+//
+// 第 0 步是 I7 fail-closed 语义的**唯一权威入口**（R18 I-2）：unknown-outcome 的错误用
+// `fmt.Errorf("%w: %w", ErrOutcomeUnknown, commitErr)` 双包装，内层 commitErr 完全可能
+// 恰好是 1213/1205/1062（TiDB 在提交阶段返回死锁/锁超时并非不可能）。若不在这里短路，
+// 第 3 步会取到内层编号并返回 true，等于把"结局未知、门禁已封锁"的事务交给上层重放，
+// 直接违反 I7 的"绝不自动重放"，可造成重复提交。结局未知时**任何**重放都不安全。
 //
 // 第 3 步的"只按编号"是关键：一旦拿到编号就不再回退到文本，
 // 避免 `errors.New("task 1213 violates policy")` 这类业务错误被误判为死锁，
 // 也避免真实 1064 语法错误因消息里含 "1213" 而被无限重试。
 func IsRetryableConflict(err error) bool {
 	if err == nil {
+		return false
+	}
+
+	// 0. R18 I-2：提交结局未知 → 永不重试（必须早于编号判定，否则内层 1213/1205/1062
+	//    会经 %w 链被取到编号而误判为可重试）。
+	if errors.Is(err, ErrOutcomeUnknown) {
 		return false
 	}
 
@@ -411,6 +424,8 @@ type TxRunnerOptions struct {
 	//
 	// 作用：限制同时处于"已持外层事务连接、可能再取 fresh locator 第二条连接"模式的
 	// Run 数量，避免 32 个并发 Run 在 maxOpenConns=32 的共享池上形成 hold-and-wait。
+	// 获取点在**本地门禁之后、BeginTx 之前**（R18 I-1）：卡在门禁上的请求不占许可，
+	// 单个 namespace 的 unknown-outcome 永久封锁不会经许可耗尽扩散成全局拒绝服务。
 	// 注入 NewAdmissionControl(0, 0) 可显式关闭限流（仅测试用途）。
 	Admission *AdmissionControl
 }
@@ -513,8 +528,18 @@ const (
 //
 // ctx 契约：准入等待、门禁等待与退避休眠都可被 ctx 取消；payload 自身也必须尊重 ctx。
 //
-// 资源顺序：连接池准入许可（R2 I2）→ 本地门禁 → 外层事务连接 → DB Gate → 实体锁；
-// 释放严格逆序（unknown-outcome 例外：本地门禁按设计继续持有）。
+// 资源顺序（R18 I-1 调整后）：本地门禁（business → namespace 升序）→ 连接池准入许可
+// （R2 I2）→ 外层事务连接 → DB Gate → 实体锁；释放严格逆序
+// （unknown-outcome 例外：本地门禁按设计继续持有）。
+//
+// 为什么准入许可必须在本地门禁**之后**取得（R18 I-1）：门禁等待只受 ctx 约束，
+// context.Background() 下是**无界**等待，而 unknown-outcome 会按设计永久持有门禁。
+// 若先取许可再等门禁，16 个卡在门禁上的 Background 请求就会把全局准入占满，
+// 让完全无关的 namespace 也开始收到 ErrAdmissionTimeout —— 单个 namespace 的
+// fail closed 会经许可耗尽扩散成全局拒绝服务。调整后许可只覆盖"可能持连接"的窗口：
+// 卡在门禁上的请求一个许可都不占（见 TestTxRunner_BlockedOnGateConsumesNoAdmissionPermit）。
+// 顺序反转不重新引入 hold-and-wait：许可等待有上限（默认 5s）且必然归还，
+// 门禁等待方不持许可，因此不存在"持许可等门禁"的环路。
 func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayloadFunc) error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("%w: TxRunner.Run requires a non-nil *sql.DB (offline success path removed)", ErrNilDatabase)
@@ -564,17 +589,11 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 			return err
 		}
 
-		// R2 I2：先取得连接池准入许可，再进入"持外层连接 + 可能再取 locator 连接"的模式。
-		// 等待许可期间本方不持有任何连接或门禁，因此不构成 hold-and-wait；
-		// 等待可被 ctx 取消且有上限（默认 5s），context.Background() 也绝不会永久死等。
-		// 许可在每次尝试结束时归还（退避休眠期间不占用容量）。
-		releaseAdmission, err := admission.Acquire(ctx)
-		if err != nil {
-			return fmt.Errorf("runner admission: %w", err)
-		}
-
-		err, outcome := r.runAttempt(ctx, gm, opts, sortedNamespaces, payload)
-		releaseAdmission()
+		// R2 I2 + R18 I-1：准入许可的获取点已后移到 runAttempt 内
+		// **本地门禁之后、BeginTx 之前**（见 Run 的文档与 runAttempt 的注释）。
+		// 许可的归还由 runAttempt 最外层的 defer 负责：正常返回、错误返回、
+		// payload panic 的栈展开、以及 payload 内 runtime.Goexit 都 100% 归还（R18 C-1）。
+		err, outcome := r.runAttempt(ctx, gm, admission, opts, sortedNamespaces, payload)
 		switch outcome {
 		case outcomeHeld:
 			// unknown outcome：门禁刻意保持持有，交由上层人工/对账介入
@@ -590,12 +609,23 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 	return fmt.Errorf("%w: attempts exhausted (last error: %v)", ErrRetryExhausted, lastErr)
 }
 
-// runAttempt 执行单次尝试。所有资源（外层事务、本地门禁、锁上下文）都在本函数内
-// 通过统一的 per-attempt defer 清理（R2 I1）：
-//   - 正常错误路径：Rollback → 逆序释放本地门禁 → lockCtx.Reset()
+// runAttempt 执行单次尝试。所有资源（外层事务、本地门禁、准入许可、锁上下文）都在本函数内
+// 通过统一的 defer 清理（R2 I1 + R18 C-1）：
+//   - 正常错误路径：Rollback → 逆序释放本地门禁 → lockCtx.Reset() → 归还准入许可
 //   - panic 路径：同样清理后以原 panic 值重新 panic（保留调用方的 recover 语义与
 //     堆栈信息；把 panic 降级成 error 会让上层误判为业务错误并可能被重试逻辑吞掉）
-//   - 已提交成功 / unknown-outcome hold：不清理门禁（前者已释放，后者按设计继续封锁）
+//   - 已提交成功 / unknown-outcome hold：不清理门禁（前者已释放，后者按设计继续封锁），
+//     但**准入许可照样归还**
+//
+// 准入许可的生命周期（R18 C-1 / I-1，务必先读）：
+//   - 取得点：本地门禁全部到手之后、BeginTx 之前（I-1：不在无界门禁等待前占许可）；
+//   - 归还点：本函数**最外层**的 defer（注册最早 → 执行最晚）。因此归还严格发生在
+//     "回滚完成、连接已归还池、门禁已释放"之后，许可的占用窗口不会比连接窗口短一拍；
+//   - 该 defer 用闭包变量 releaseAdmission 判定是否已持有许可，注册点早于取得点，
+//     所以 payload panic 的栈展开、以及 payload 内 runtime.Goexit（如误用 t.Fatal）
+//     都必然经过它 —— 绝不允许改回"runAttempt 返回后再 releaseAdmission()"这种普通语句：
+//     普通语句会被栈展开跳过，每次 panic 泄漏 1 个进程级许可，16 次即整个 lockorder
+//     被自身准入机制永久拒绝服务（R18 C-1 的原始故障形态）。
 //
 // 提交结局判定（R2 I7）：Commit 返回错误时，只有 commitProvablyNotAttempted 能证明
 // "提交请求未送达"的错误（sql.ErrTxDone / 发送前的 ctx 结束）才按普通失败处理；
@@ -604,6 +634,7 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 func (r *TxRunner) runAttempt(
 	ctx context.Context,
 	gm GateManager,
+	admission *AdmissionControl,
 	opts TxRunnerOptions,
 	namespaces []string,
 	payload TxPayloadFunc,
@@ -617,7 +648,21 @@ func (r *TxRunner) runAttempt(
 		committed       bool
 		holdGates       bool
 		commitAttempted bool
+		// releaseAdmission 非 nil 表示本次尝试已持有连接池准入许可。
+		// 只允许由下面第一个 defer 读取并归还（R18 C-1）。
+		releaseAdmission func()
 	)
+
+	// defer #1（注册最早 → 执行最晚）：无条件归还准入许可。
+	// 放在最外层注册的两个目的：
+	//  1. 即使 cleanup()/门禁释放自身再次 panic，本 defer 仍会在同一帧的展开中执行；
+	//  2. 归还点晚于 cleanup（回滚 + 连接归还 + 门禁释放），许可窗口覆盖完整的持连接窗口。
+	defer func() {
+		if releaseAdmission != nil {
+			releaseAdmission()
+			releaseAdmission = nil
+		}
+	}()
 
 	// 逆序释放本地门禁闭包：namespace 倒序，business 最后；重复调用安全
 	releaseLocalGates := func() {
@@ -686,14 +731,26 @@ func (r *TxRunner) runAttempt(
 		}
 	}
 
-	// 2. 开始外层数据事务（Run 已保证 r.db 非 nil）
+	// 2. 连接池准入许可（R2 I2）——**必须在本地门禁之后、BeginTx 之前**（R18 I-1）。
+	//
+	// 等待许可期间本方不持有任何连接，因此不构成 hold-and-wait；等待可被 ctx 取消且有上限
+	// （默认 5s），context.Background() 也绝不会永久死等。
+	// 许可覆盖"外层事务连接 + payload 内 fresh locator 第二条连接"的整个窗口，
+	// 归还由本函数最外层的 defer #1 负责（R18 C-1：panic/Goexit 也必然归还）。
 	var err error
+	releaseAdmission, err = admission.Acquire(ctx)
+	if err != nil {
+		// 未持有许可：releaseAdmission 保持 nil，defer #1 是无操作。
+		return fmt.Errorf("runner admission: %w", err), outcomeDone
+	}
+
+	// 3. 开始外层数据事务（Run 已保证 r.db 非 nil）
 	tx, err = r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin outer data tx: %w", err), outcomeDone
 	}
 
-	// 3. 在外层数据事务内获取 DB Gate 锁
+	// 4. 在外层数据事务内获取 DB Gate 锁
 	if err := acquireDBGates(ctx, tx, lockCtx, opts, namespaces); err != nil {
 		if IsRetryableConflict(err) {
 			return err, outcomeRetry
@@ -701,10 +758,10 @@ func (r *TxRunner) runAttempt(
 		return err, outcomeDone
 	}
 
-	// 4. 执行业务载荷（包含 fresh locator 与实体加锁重验）
+	// 5. 执行业务载荷（包含 fresh locator 与实体加锁重验）
 	payloadErr := payload(ctx, tx, lockCtx)
 	if payloadErr == nil {
-		// 5. 提交事务
+		// 6. 提交事务
 		commitAttempted = true
 		commitErr := tx.Commit()
 		switch {

@@ -365,16 +365,17 @@ func newFreshLocatorFor(
 // probeFreshLocatorCapability 用生产 DSN（不启用任何 noop 函数）实测被测 fresh locator
 // 在目标 TiDB 上是否可用；返回 true 表示可以直接使用被测实现。
 //
-// 实测事实（TiDB v8.5.8 Community，tidb_enable_noop_functions=OFF）：
+// 历史事实（TiDB v8.5.8 Community，tidb_enable_noop_functions=OFF，w6d-report.md 第二节）：
 //
 //	BeginTx(&sql.TxOptions{ReadOnly: true}) → Error 1235 (42000):
 //	function READ ONLY has only noop implementation in tidb now,
 //	use tidb_enable_noop_functions to enable these functions
 //
-// 即 lockorder.ExecuteFreshLocator 在该真实环境下**必然失败**，属生产侧缺陷
-// （本用例不改数据库设置、也不改被测代码，只把它如实暴露出来）。
-// 命中该已知缺陷时退回 newFallbackFreshLocator，使零死锁验证仍能真实执行；
-// 其他错误一律直接失败，绝不静默降级。
+// W6c-b 已在被测侧修复：ExecuteFreshLocator 命中 1235 时自动降级为普通独立事务，
+// 因此在真实 TiDB 上本探测应当**直接返回 true**（走被测实现）。
+// 若这里仍然观测到 1235，说明 locator.go 的 READ ONLY 兼容性降级失效（回归），
+// 用例打印醒目告警后退回测试侧等价定位器继续跑，绝不静默降级；
+// 其他任何错误一律直接失败。
 func probeFreshLocatorCapability(
 	t *testing.T,
 	ctx context.Context,
@@ -387,18 +388,17 @@ func probeFreshLocatorCapability(
 	probe := newPackageFreshLocator(db, meta, names, new(int64))
 	_, err := probe(ctx)
 	if err == nil {
-		t.Logf("fresh locator：被测 lockorder.ExecuteFreshLocator 在目标 TiDB 上可用（READ ONLY 事务被接受）")
+		t.Logf("fresh locator：被测 lockorder.ExecuteFreshLocator 在目标 TiDB 上可用" +
+			"（READ ONLY 被接受，或已按 TiDB noop 语义自动降级为普通独立事务）")
 		return true
 	}
 
 	if n, ok := mysqlErrNum(err); ok && n == mysqlNumUnsupportedFeature {
-		t.Logf("⚠️ 真实环境缺陷（生产侧待修，非本用例可修范围）：lockorder.ExecuteFreshLocator "+
-			"在目标 TiDB 上不可用 → %v\n"+
-			"    原因：TiDB 把 START TRANSACTION READ ONLY 归为 noop 函数，tidb_enable_noop_functions=OFF "+
-			"时直接拒绝，P04b 的只读定位事务在真实 TiDB 上从未可用。\n"+
-			"    处置：本用例退回等价定位器（同池独立事务 + 纯读 + 显式提交 + 排序去重；TiDB 自述 "+
-			"READ ONLY 为 noop，快照新鲜度与不加锁性质等价），零死锁/零重试验证照常真实执行；"+
-			"该缺陷已写入 w6d-report.md 等待生产侧修复。", err)
+		t.Errorf("⚠️ 生产侧回归：lockorder.ExecuteFreshLocator 仍被 TiDB 的 READ ONLY noop "+
+			"缺陷（Error 1235）阻断 → %v\n"+
+			"    W6c-b 起 locator.go 必须在命中 1235 时自动降级为普通独立事务；"+
+			"本用例退回测试侧等价定位器（同池独立事务 + 纯读 + 显式提交 + 排序去重）继续验证，"+
+			"但该缺陷必须修回被测实现。", err)
 		return false
 	}
 

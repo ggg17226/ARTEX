@@ -20,6 +20,30 @@ type mockDriver struct {
 	execFn       func(query string, args []driver.Value) (driver.Result, error)
 	queryFn      func(query string, args []driver.Value) (driver.Rows, error)
 	commitFn     func() error
+
+	// beginTxFn 可选钩子：拦截/观察驱动侧 BeginTx 的**事务选项**。
+	// 用于复现"服务端拒绝 READ ONLY 事务声明"（真实 TiDB 的 Error 1235 noop）这类
+	// 只有真实服务端才会暴露的兼容性缺陷：离线 mock 若丢弃 TxOptions，
+	// 该缺陷永远不会被发现（w6d-report.md 第二节的根因之一）。
+	beginTxFn func(opts driver.TxOptions) error
+	// beginAttempts 记录每次驱动侧 BeginTx 收到的选项，供断言"是否声明了 READ ONLY"。
+	beginAttempts []driver.TxOptions
+}
+
+func (d *mockDriver) resetBeginHook() {
+	d.mu.Lock()
+	d.beginTxFn = nil
+	d.beginAttempts = nil
+	d.mu.Unlock()
+}
+
+// recordedBeginAttempts 返回驱动侧 BeginTx 选项的副本。
+func (d *mockDriver) recordedBeginAttempts() []driver.TxOptions {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]driver.TxOptions, len(d.beginAttempts))
+	copy(out, d.beginAttempts)
+	return out
 }
 
 var (
@@ -54,7 +78,16 @@ func (c *mockConn) Begin() (driver.Tx, error) {
 func (c *mockConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	c.driver.mu.Lock()
 	c.driver.txStarted++
+	c.driver.beginAttempts = append(c.driver.beginAttempts, opts)
+	fn := c.driver.beginTxFn
 	c.driver.mu.Unlock()
+
+	if fn != nil {
+		if err := fn(opts); err != nil {
+			// 模拟服务端在 BEGIN 阶段就拒绝：事务未开启，连接状态完好
+			return nil, err
+		}
+	}
 	return &mockDriverTx{conn: c}, nil
 }
 
