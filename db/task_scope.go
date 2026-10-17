@@ -12,11 +12,15 @@ import (
 // per-task authorization edge. Rows come either from insertAssets (source='auto',
 // conservative, one per explicitly-inserted asset) or from the add_task_scope tool
 // (source='agent', for company / domain / network / ICP / keyword scope).
+//
+// P03（R10）：id / task_id / company_id 是 BIGINT，对外带引号 string（company_id
+// 为 nil 时仍按 omitempty 省略）。仅 SQL 扫描 / 内部构造填充，不是请求体解码目标，
+// 也没有整包 Marshal 后回读的路径（归档走 map 行快照，不经本结构体 tag）。
 type TaskScope struct {
-	ID        int64  `json:"id"`
-	TaskID    int64  `json:"task_id"`
+	ID        int64  `json:"id,string"`
+	TaskID    int64  `json:"task_id,string"`
 	Kind      string `json:"kind"` // company|root_domain|subdomain|ip|cidr|icp|keyword
-	CompanyID *int64 `json:"company_id,omitempty"`
+	CompanyID *int64 `json:"company_id,string,omitempty"`
 	// CompanyName is resolved for kind=company so callers can label a scope row
 	// without a second lookup. Empty when the row is not a company reference.
 	CompanyName string `json:"company_name,omitempty"`
@@ -364,14 +368,17 @@ FROM target t GROUP BY t.type ORDER BY t.type`, taskID, expID)
 // with no asset row of its own is the synthetic "r:<domain>". Out-of-scope
 // connector nodes (roots pulled in only to link subdomains, and the companies
 // above them) carry InScope=false and are rendered gray.
+//
+// P03（R11）：asset_id / company_id 是 BIGINT，对外带引号 string；0 仍按 omitempty
+// 省略（company / 合成根节点没有 asset_id）。port / status_code 不是 ID，保持 number。
 type CoverageGraphNode struct {
 	Key         string `json:"key"`
 	Kind        string `json:"kind"` // company|root_domain|subdomain|ip|service|app|endpoint
 	Label       string `json:"label"`
 	Tested      bool   `json:"tested"`
 	InScope     bool   `json:"in_scope"`
-	AssetID     int64  `json:"asset_id,omitempty"` // 0 for company / synthetic root
-	CompanyID   int64  `json:"company_id,omitempty"`
+	AssetID     int64  `json:"asset_id,string,omitempty"` // 0 for company / synthetic root
+	CompanyID   int64  `json:"company_id,string,omitempty"`
 	Domain      string `json:"domain,omitempty"`
 	RootDomain  string `json:"root_domain,omitempty"`
 	IP          string `json:"ip,omitempty"`

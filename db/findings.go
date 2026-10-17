@@ -280,8 +280,11 @@ func (d *DB) ListFindingsPage(f FindingFilter, page, pageSize int) ([]*DBFinding
 // FindingGroup is one task-level bucket in the global findings view. TaskID is
 // nil for both findings that never had a task and findings retained after task
 // deletion; those records intentionally share one "unassigned/deleted" bucket.
+//
+// P03（R13）:task_id 是 BIGINT,对外带引号 string;nil(未分配/任务已删)仍是 null,
+// 无 omitempty 语义不变。count/critical… 是计数,保持 number。
 type FindingGroup struct {
-	TaskID          *int64    `json:"task_id"`
+	TaskID          *int64    `json:"task_id,string"`
 	TaskName        string    `json:"task_name"` // 可选任务名称;空=未命名
 	TaskDescription string    `json:"task_description"`
 	TaskStatus      string    `json:"task_status"`
@@ -538,8 +541,15 @@ type FindingStats struct {
 // least one finding, with its description and finding count. Description is empty when
 // the task has since been deleted (finding rows persist), so the frontend falls back to
 // the id.
+//
+// P03（R14）:id 是 BIGINT,对外带引号 string;count 是计数,保持 number。
+// 持久化回读核查:FindingStats 会作为归档 aggregate_stats 的 finding_stats 段被
+// json.Unmarshal 回读(task_archive_aggregate_stats.go),但该段由 SQL
+// jsonb_build_object 生成,只有 total/pending/critical/high/medium/low/vulnclasses
+// 七个键(db/task_archives.go 的 "finding_stats" 段,历史版本同样),从不含 tasks,
+// 因此给 tasks[].id 加 ,string 不会破坏归档统计的反序列化。
 type FindingTaskOption struct {
-	ID          int64  `json:"id"`
+	ID          int64  `json:"id,string"`
 	Name        string `json:"name"` // 可选任务名称;空=未命名
 	Description string `json:"description"`
 	Count       int    `json:"count"`

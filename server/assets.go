@@ -316,6 +316,40 @@ const (
 	maxAssetPageSize     = 200
 )
 
+// assetWire 是 GET /api/assets 的输出结构（P03 R08）：整体沿用 db.Asset（其
+// id / company_id / task_source_node_id 已带 ,string），只用外层同名字段把
+// task_ids 覆盖成 []string。
+//
+// db.Asset.TaskIDs 必须保持 []int64 —— 该字段由 assets.task_ids 列的
+// json.Unmarshal（数字数组）回读，且 json:",string" 对切片无效（Marshal 直接报错），
+// 所以只能在 server 输出侧转换。外层同名字段按 encoding/json 的浅层优先规则屏蔽
+// 嵌入字段，与 W4b-1 的 saveMCPRequest 同一模式。
+type assetWire struct {
+	db.Asset
+	TaskIDs []string `json:"task_ids"`
+}
+
+// assetWires 把一批资产转成 wire 形状（nil 元素跳过，输出顺序不变）。
+func assetWires(in []*db.Asset) []assetWire {
+	out := make([]assetWire, 0, len(in))
+	for _, a := range in {
+		if a == nil {
+			continue
+		}
+		out = append(out, assetWire{Asset: *a, TaskIDs: taskIDStrings(a.TaskIDs)})
+	}
+	return out
+}
+
+// taskIDStrings 是保留 nil 语义的 []int64 → []string：db 侧为 nil 时 wire 仍是
+// null，是空切片时仍是 []（idStrings 会把 nil 变成 []，这里不能沿用）。
+func taskIDStrings(in []int64) []string {
+	if in == nil {
+		return nil
+	}
+	return idStrings(in)
+}
+
 func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	as := s.assetStore()
 	if as == nil {
@@ -385,7 +419,7 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"count":  len(assets),
 		"total":  total,
-		"assets": assets,
+		"assets": assetWires(assets), // P03 R08：task_ids 覆盖成 []string
 	})
 }
 

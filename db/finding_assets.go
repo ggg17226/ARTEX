@@ -27,13 +27,16 @@ const findingAssetTreeMaxNodes = 3000
 
 // FindingAssetNode 是资产树的一个节点。Key 与覆盖图同构:资产行是 "a:<id>"、
 // 企业是 "c:<id>"、没有资产行的根域名是合成的 "r:<domain>"、未关联桶是 "__none__"。
+//
+// P03（R12）:asset_id / company_id 是 BIGINT,对外带引号 string;0 仍按 omitempty
+// 省略(合成根域名 / 未关联桶)。self/total/critical… 是计数,保持 number。
 type FindingAssetNode struct {
 	Key       string `json:"key"`
 	Parent    string `json:"parent,omitempty"`
 	Kind      string `json:"kind"` // company|root_domain|subdomain|ip|service|app|endpoint|none
 	Label     string `json:"label"`
-	AssetID   int64  `json:"asset_id,omitempty"`
-	CompanyID int64  `json:"company_id,omitempty"`
+	AssetID   int64  `json:"asset_id,string,omitempty"`
+	CompanyID int64  `json:"company_id,string,omitempty"`
 	// Self 是直接挂在该资产上的发现数;Total 含全部子孙且按 finding 去重
 	// (一个发现挂多个资产时,只在共同祖先上计一次)。
 	Self        int       `json:"self"`

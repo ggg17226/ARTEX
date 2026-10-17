@@ -42,15 +42,19 @@ type TaskAssetScopeMutation struct {
 }
 
 // IntentAsset describes an asset explicitly anchored to a worker intent.
+//
+// P03（R09）：intent_id / asset_id / source_node_id / source_task_id 是 BIGINT，
+// 对外带引号 string（nil 指针仍是 null / omitempty）。仅 SQL 扫描填充，不是请求体
+// 解码目标，也没有整包 Marshal 后回读的路径。
 type IntentAsset struct {
-	IntentID      int64  `json:"intent_id"`
-	AssetID       int64  `json:"asset_id"`
+	IntentID      int64  `json:"intent_id,string"`
+	AssetID       int64  `json:"asset_id,string"`
 	Type          string `json:"type"`
 	Label         string `json:"label"`
 	Source        string `json:"source"`
 	SourceSummary string `json:"source_summary"`
-	SourceNodeID  *int64 `json:"source_node_id,omitempty"`
-	SourceTaskID  int64  `json:"source_task_id"`
+	SourceNodeID  *int64 `json:"source_node_id,string,omitempty"`
+	SourceTaskID  int64  `json:"source_task_id,string"`
 	Inherited     bool   `json:"inherited"`
 }
 

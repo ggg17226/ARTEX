@@ -15,8 +15,11 @@ import (
 // =====================================================================
 
 // Company is a row in the companies table.
+//
+// P03（R06）：ID 是 BIGINT 主键，对外一律带引号 string（>2^53 不失真）。该结构体只
+// 由 SQL 扫描填充，不是请求体解码目标，也没有整包 json.Marshal 后回读的路径。
 type Company struct {
-	ID        int64   `json:"id"`
+	ID        int64   `json:"id,string"`
 	Name      string  `json:"name"`
 	NKey      string  `json:"nkey"`
 	Logo      *string `json:"logo,omitempty"`
@@ -32,9 +35,11 @@ type CompanyWithScope struct {
 }
 
 // ScopeRule is one company_scope row.
+//
+// P03（R07）：ID / CompanyID 是 BIGINT，对外 string；仅 SQL 扫描填充，无解码/回读路径。
 type ScopeRule struct {
-	ID        int64  `json:"id"`
-	CompanyID int64  `json:"company_id"`
+	ID        int64  `json:"id,string"`
+	CompanyID int64  `json:"company_id,string"`
 	Kind      string `json:"kind"`
 	Domain    string `json:"domain,omitempty"`
 	Net       string `json:"net,omitempty"`

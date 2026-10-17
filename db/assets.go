@@ -16,10 +16,15 @@ import (
 // =====================================================================
 
 // Asset is a row in the assets table.
+//
+// P03（R08）：ID / CompanyID / TaskSourceNodeID 是 BIGINT，对外带引号 string。
+// TaskIDs 保持 []int64 且**不得**加 json:",string"：该字段由 assets.task_ids 列
+// json.Unmarshal 回读（存的是数字数组），给切片加 ,string 会让 Marshal 直接报错。
+// HTTP 输出侧由 server 的 assetWire 用外层同名字段把 task_ids 覆盖成 []string。
 type Asset struct {
-	ID         int64   `json:"id"`
+	ID         int64   `json:"id,string"`
 	Type       string  `json:"type"`
-	CompanyID  *int64  `json:"company_id,omitempty"`
+	CompanyID  *int64  `json:"company_id,string,omitempty"`
 	TaskIDs    []int64 `json:"task_ids"`
 	Domain     string  `json:"domain,omitempty"`
 	RootDomain string  `json:"root_domain,omitempty"`
@@ -57,7 +62,7 @@ type Asset struct {
 	LastSeen          string         `json:"last_seen"`
 	TaskSource        string         `json:"task_source,omitempty"`
 	TaskSourceSummary string         `json:"task_source_summary,omitempty"`
-	TaskSourceNodeID  *int64         `json:"task_source_node_id,omitempty"`
+	TaskSourceNodeID  *int64         `json:"task_source_node_id,string,omitempty"`
 }
 
 // AuthItem is one entry in the auth array.
