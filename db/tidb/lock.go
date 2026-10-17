@@ -41,6 +41,9 @@ var ErrAcquireUncertain = errors.New("acquire outcome uncertain after cancellati
 // 故对无 deadline 的调用施加总等待上限。上限经派生的有效 ctx 覆盖入口探测、
 // 连接池等待、单条 SQL（含服务端行锁等待）与退避 sleep；唯一可超出上限的
 // 尾项是 UPDATE 被取消后的补偿复核（独立预算 acquireReconcileBudget，默认 2s）。
+// 只有该上限**确实到期**（有效 ctx 报 DeadlineExceeded 且调用方 ctx 未到期）才会
+// 返回本 sentinel；权限拒绝、连接失败、SQL 语法等普通错误保留原始原因
+// （`acquire maintenance: %w`），不会被改写成竞争超限，调用方可 errors.Is/As 归因。
 var ErrMaintenanceContended = errors.New("maintenance lock contended beyond max wait")
 
 // MaintenanceTableDDL 是 P01 自有的基础设施 DDL（幂等；TiDB DDL 自动提交）。
@@ -115,8 +118,10 @@ VALUES ('main', NULL, 0, 0, NOW(3)),
 //     reconcileCanceledAcquire。
 //   - 有界退避：调用方 ctx 没有 deadline 时，入口派生一个截止为 now+maxAcquireWait
 //     的内部有效 ctx，入口探测、连接池等待、单条 SQL（含服务端行锁等待）与退避
-//     sleep 全部使用有效 ctx；有效 ctx 到期而调用方 ctx 未到期 → 返回
-//     ErrMaintenanceContended，避免 context.Background() 永久挂起。有效 ctx 到期
+//     sleep 全部使用有效 ctx；**内部上限真的到期**（有效 ctx 报 DeadlineExceeded
+//     且调用方 ctx 仍健康）且错误由该到期造成 → 返回 ErrMaintenanceContended，
+//     避免 context.Background() 永久挂起。普通查询/连接错误不受该映射影响，
+//     一律以 `%w` 原样保留真实原因，不会被改写成竞争超限。有效 ctx 到期
 //     发生在抢锁 UPDATE 上时同样先做补偿复核（晚到写风险与取消路径一致），
 //     故总时长最多再超出补偿预算 acquireReconcileBudget。
 func AcquireMaintenance(ctx context.Context, db *sql.DB, opID string) error {
@@ -136,8 +141,15 @@ func AcquireMaintenance(ctx context.Context, db *sql.DB, opID string) error {
 		effCtx, cancel = context.WithDeadline(ctx, time.Now().Add(maxAcquireWait))
 		defer cancel()
 	}
-	// capExpired 报告有效 ctx 的到期是否由内部上限触发（调用方 ctx 仍健康）。
-	capExpired := func() bool { return capped && ctx.Err() == nil }
+	// capExpired 报告**内部上限是否真的到期**：capped 且调用方 ctx 仍健康，
+	// 且有效 ctx 的错误确实是 DeadlineExceeded。三者缺一不可——只判
+	// `capped && ctx.Err()==nil` 的话，该谓词从派生 ctx 创建起就恒为 true，
+	// 于是入口/循环内探测遇到的任何普通查询错误（权限、连接、SQL 语法…）都会
+	// 在健康的无 deadline ctx 下被误报成 ErrMaintenanceContended，真实原因丢失
+	// （R12 复审 N1）。普通错误一律原样包装返回，绝不改写成竞争超限。
+	capExpired := func() bool {
+		return capped && ctx.Err() == nil && errors.Is(effCtx.Err(), context.DeadlineExceeded)
+	}
 	// capTimeout 是上限到期的返回错误；消息保留上限时长便于调用方定位。
 	capTimeout := func() error {
 		return fmt.Errorf("%w: waited %s for maintenance lock", ErrMaintenanceContended, maxAcquireWait)
@@ -151,9 +163,16 @@ SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err 
 		if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
 			return ErrMaintenanceRowMissing
 		}
-		if capExpired() {
-			return capTimeout()
+		// 只有「错误本身由 ctx 到期造成」才可能映射 ErrMaintenanceContended：
+		// 内部上限打断入口探测 → Contended；调用方 ctx 取消 → 原样返回 ctx 错误。
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if capExpired() {
+				return capTimeout()
+			}
+			return err
 		}
+		// 普通查询错误（权限拒绝、连接失败、SQL 语法…）：真实原因原样保留，
+		// 绝不改写成竞争超限（R12 复审 N1）。
 		return fmt.Errorf("acquire maintenance: %w", err)
 	}
 	attempt := 0
@@ -211,6 +230,7 @@ SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err 
 			if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
 				return ErrMaintenanceRowMissing
 			}
+			// 普通查询错误（权限/连接/SQL…）原样保留真实原因，不改写为 Contended（N1）。
 			return fmt.Errorf("acquire maintenance: %w", err)
 		}
 		// 被占：退避后重试。递增退避 100ms→250ms→500ms→1s（封顶，见 lockBackoff），

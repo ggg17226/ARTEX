@@ -707,3 +707,135 @@ func TestAcquireMaintenance_NoDeadlineCapCanceledUpdateReconciles(t *testing.T) 
 		t.Errorf("release UPDATE calls = %d, want 1", n)
 	}
 }
+
+// —— Round 2 修复回归（R12 复审 N1：普通查询错误不得被误报为 cap 到期）——————
+
+// N1：调用方 ctx 健康且**没有 deadline**（capped=true，内部上限远未到期）时，
+// 入口 SELECT 返回普通错误（权限拒绝/连接失败/SQL 语法…）→ 必须原样保留真实
+// 原因（errors.Is 可判），**绝不得**包装成 ErrMaintenanceContended，也不得进入
+// 退避循环补发 UPDATE。回归兜底：若 capExpired 退回「capped && ctx.Err()==nil」
+// 这种恒真谓词，本用例立刻失败（错误会变成 Contended 且丢失 probeErr）。
+func TestAcquireMaintenance_InitialProbeQueryErrorPreserved(t *testing.T) {
+	const opID = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	probeErr := errors.New("fake: Error 1142 (42000): SELECT command denied to user 'artex' for table 'maintenance'")
+	withMaxAcquireWait(t, 5*time.Second) // 远未到期：任何 Contended 都是误报
+
+	db, fc := newLockFakeDB(t,
+		func(_ context.Context, query string) (driver.Result, error) {
+			if strings.Contains(query, qAcquireUpdate) {
+				t.Error("入口探测失败后不得再发抢锁 UPDATE")
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			if strings.Contains(query, qProbeSelect) {
+				return nil, probeErr // 普通权限错误，非 ctx 到期、非缺行/缺表
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	start := time.Now()
+	err := AcquireMaintenance(context.Background(), db, opID)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("入口探测失败必须返回错误")
+	}
+	if !errors.Is(err, probeErr) {
+		t.Errorf("真实查询错误必须保留在错误链上，got %v", err)
+	}
+	if errors.Is(err, ErrMaintenanceContended) {
+		t.Errorf("普通查询错误不得改写成 ErrMaintenanceContended（N1），got %v", err)
+	}
+	if errors.Is(err, ErrMaintenanceRowMissing) {
+		t.Errorf("非缺行/缺表错误不得改写成 ErrMaintenanceRowMissing，got %v", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("普通错误必须立即返回，took %v", elapsed)
+	}
+	if n := fc.count(qAcquireUpdate); n != 0 {
+		t.Errorf("acquire UPDATE calls = %d, want 0", n)
+	}
+}
+
+// N1 的另一半：入口 SELECT 一直阻塞到**内部上限真的到期** → 这才是
+// ErrMaintenanceContended 的正当场景；且到期后不得再补发抢锁 UPDATE。
+func TestAcquireMaintenance_InitialProbeBlockedByCapContended(t *testing.T) {
+	withMaxAcquireWait(t, 200*time.Millisecond)
+
+	db, fc := newLockFakeDB(t,
+		func(_ context.Context, query string) (driver.Result, error) {
+			if strings.Contains(query, qAcquireUpdate) {
+				t.Error("cap 到期后不得补发抢锁 UPDATE")
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(ctx context.Context, query string) (driver.Rows, error) {
+			if strings.Contains(query, qProbeSelect) {
+				<-ctx.Done() // 入口探测阻塞到内部上限到期（等池同理）
+				return nil, ctx.Err()
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	start := time.Now()
+	err := AcquireMaintenance(context.Background(), db, "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrMaintenanceContended) {
+		t.Fatalf("err = %v, want ErrMaintenanceContended（cap 真的到期）", err)
+	}
+	if !strings.Contains(err.Error(), "200ms") {
+		t.Errorf("err = %v, want message to mention the wait budget", err)
+	}
+	if elapsed < 200*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("waited %v, want ≈maxAcquireWait 200ms", elapsed)
+	}
+	if n := fc.count(qAcquireUpdate); n != 0 {
+		t.Errorf("acquire UPDATE calls = %d, want 0", n)
+	}
+}
+
+// N1（循环内探测）：UPDATE 恒 0 行后，循环内探测返回普通错误 → 同样必须原样
+// 保留真实原因，不得改写成 Contended，也不得继续退避空转到上限。
+func TestAcquireMaintenance_InLoopProbeQueryErrorPreserved(t *testing.T) {
+	const opID = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+	probeErr := errors.New("fake: lost connection to maintenance probe")
+	withMaxAcquireWait(t, 5*time.Second)
+	probeCalls := 0
+
+	db, fc := newLockFakeDB(t,
+		func(_ context.Context, query string) (driver.Result, error) {
+			if strings.Contains(query, qAcquireUpdate) {
+				return driver.RowsAffected(0), nil // 0 行 → 进入循环内探测
+			}
+			return driver.ResultNoRows, nil
+		},
+		func(_ context.Context, query string) (driver.Rows, error) {
+			if strings.Contains(query, qProbeSelect) {
+				probeCalls++
+				if probeCalls == 1 {
+					return probeRows(), nil // 入口探测成功 → 才会走到循环内探测
+				}
+				return nil, probeErr // 循环内探测：普通错误（非 ctx、非缺行/缺表）
+			}
+			return &lockFakeRows{cols: []string{"x"}}, nil
+		})
+
+	start := time.Now()
+	err := AcquireMaintenance(context.Background(), db, opID)
+	elapsed := time.Since(start)
+	if !errors.Is(err, probeErr) {
+		t.Errorf("真实探测错误必须保留在错误链上，got %v", err)
+	}
+	if errors.Is(err, ErrMaintenanceContended) {
+		t.Errorf("普通探测错误不得改写成 ErrMaintenanceContended（N1），got %v", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("普通错误必须立即返回（不退避空转），took %v", elapsed)
+	}
+	if n := fc.count(qAcquireUpdate); n != 1 {
+		t.Errorf("acquire UPDATE calls = %d, want 1", n)
+	}
+	if probeCalls != 2 {
+		t.Errorf("probe SELECT calls = %d, want 2（入口 1 次 + 循环内 1 次）", probeCalls)
+	}
+}

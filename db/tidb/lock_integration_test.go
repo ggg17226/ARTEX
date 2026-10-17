@@ -50,13 +50,16 @@ SELECT HEX(op_id) FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&v
 // （服务端晚到写可能在取消之后才落库），故给最多 2s 的轮询窗口（单次 SELECT
 // 另有 5s 独立上限，窗口是尽力值而非硬时限）。
 //
-// 调用时机必须在被断言的取消抢锁**返回之后**（errB 已到手）：补偿是 Acquire
-// 返回前同步执行的，errB 先返回才能保证本窗口轮询覆盖「晚到写落库→补偿清空」
-// 的完整过程。轮询同时记录是否观察到非 NULL owner：
-//   - 观察到 owner 出现→最终清空：直接证明晚到写落库且被清掉；
-//   - 始终未观察到：owner 的出现窗口可能短于 50ms 轮询间隔，此时以调用方对
-//     errB 的 "canceled after acquiring, released" 断言作为补偿已执行的证据，
-//     本 helper 只兜底「不早于 errB 返回的最终 NULL」。
+// 调用时机必须在被断言的取消抢锁**返回之后**（errB 已到手）。但要注意补偿是
+// Acquire 返回前**同步**执行的：晚到写落库 → 复查看到 own owner → 条件释放清空，
+// 整段都早于 errB 返回，因此本窗口的轮询**覆盖不到**「落库→清空」这个过程；
+// sawOwner=false 是正常结果，也不能反过来证明补偿做过什么（R12 复审 N2 校准，
+// 原注释误称本窗口覆盖完整过程）。两条证据彼此独立：
+//   - 补偿确实执行（观察到 own owner 并进入条件释放）：由调用方对 errB 的
+//     "canceled after acquiring, released" 错误文本断言证明；
+//   - 补偿完成后的状态：由本 helper 断言「errB 返回之后 owner 为 NULL」。
+//
+// 窗口内若真观察到非 NULL owner，只说明另有晚到写正在被清（额外信息，不作断言）。
 func requireNoMaintenanceOwnerSoon(t *testing.T, db *sql.DB) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -75,7 +78,9 @@ func requireNoMaintenanceOwnerSoon(t *testing.T, db *sql.DB) {
 	if last != "" {
 		t.Fatalf("maintenance op_id still %s after 2s, want NULL (canceled competitor left an owner)", last)
 	}
-	t.Logf("owner poll window done: non-NULL observed during window = %v (late write seen by poller)", sawOwner)
+	t.Logf("owner poll window done (starts after errB returned): non-NULL observed during window = %v "+
+		"(compensation runs synchronously before errB, so this window only verifies the final NULL; "+
+		"the reconcile branch itself is proven by errB's error text)", sawOwner)
 }
 
 func TestAcquireReleaseMaintenance_Real(t *testing.T) {
@@ -197,8 +202,9 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 	// 核心断言（此时 errB 已返回、补偿已同步执行完）：被 300ms 取消的竞争者 B
-	// 不得留下 owner（最多 2s 内必须收敛为 NULL；补偿执行本身由上面 errB 的
-	// "released" 断言证明）。
+	// 不得留下 owner（最多 2s 内必须收敛为 NULL）。分工：补偿确实走过「看到 own
+	// owner → 条件释放」分支由上面 errB 的 "released" 错误文本证明；本 helper 只
+	// 验证补偿完成之后的状态是 NULL，不覆盖也不声称覆盖落库→清空的过程。
 	requireNoMaintenanceOwnerSoon(t, db)
 
 	// tx 提交后行锁释放，可再获取（有界 ctx，禁止再用 Background 裸抢）
