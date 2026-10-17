@@ -26,6 +26,19 @@ var ErrMaintenanceLocked = errors.New("maintenance lock is held by another op")
 // Fail closed：阻止非 hex 字符串到达 SQL 端 UNHEX 后隐式得到 NULL 写入。
 var ErrInvalidOpID = errors.New("invalid opID")
 
+// ErrAcquireUncertain 表示抢锁 UPDATE 被 ctx 取消后，**无法确认**服务端究竟
+// 是否已写入 owner：go-sql-driver v1.9.3 的取消只关闭 socket、不发 KILL QUERY，
+// 服务端 UPDATE 仍会在行锁释放后照常提交，故「客户端返回 ctx 错误」既不能证明
+// 未持有、也不能证明已持有。补偿复核查询本身失败/预算耗尽时返回本 sentinel，
+// 调用方应重试或按 opID 显式清理（ReleaseMaintenance 幂等，可安全重放）。
+var ErrAcquireUncertain = errors.New("acquire outcome uncertain after cancellation")
+
+// ErrMaintenanceContended 表示抢锁在内部上限 maxAcquireWait 内始终未成功。
+// 仅在调用方 ctx **没有 deadline** 时返回：退避序列 1s 封顶只约束单次等待、
+// 没有总次数上限，`context.Background()` 抢锁会永久挂起（R0 实测 60s+ 卡死），
+// 故对无 deadline 的调用施加总等待上限。
+var ErrMaintenanceContended = errors.New("maintenance lock contended beyond max wait")
+
 // MaintenanceTableDDL 是 P01 自有的基础设施 DDL（幂等；TiDB DDL 自动提交）。
 // 红线：无 FOREIGN KEY、无 CHECK；物理主键单列 BIGINT UNSIGNED + AUTO_ID_CACHE=1。
 // 结构逐字对齐 P02 `db/schema` 目录（列名/类型/索引名/表选项与 P02 编译输出一致；
@@ -53,6 +66,20 @@ var lockBackoff = [...]time.Duration{
 	time.Second,
 }
 
+// maxAcquireWait 是**调用方 ctx 没有 deadline** 时抢锁的总等待上限：退避序列
+// 1s 封顶只约束单次 sleep，没有总次数上限，Background 调用会永久挂起。
+// 有 deadline 的 ctx 不受影响（仍以 ctx 到期为准）。包级变量而非常量是为了让
+// 离线测试能把上限调小，禁止生产路径外的真等 30s。
+var maxAcquireWait = 30 * time.Second
+
+// acquireReconcileBudget / acquireReconcilePoll 是取消后补偿（reconcileCanceledAcquire）
+// 的独立 ctx 预算与轮询间隔：预算内一旦确认 owner 立即返回，不做满时长等待。
+// 同样为包级变量，便于离线测试注入短预算。
+var (
+	acquireReconcileBudget = 2 * time.Second
+	acquireReconcilePoll   = 50 * time.Millisecond
+)
+
 // EnsureLockInfrastructure 在 autocommit 上下文执行幂等 DDL 与单例行 seed。
 // TiDB DDL 自动提交，不进事务；重复执行安全（IF NOT EXISTS + INSERT IGNORE）。
 func EnsureLockInfrastructure(ctx context.Context, db *sql.DB) error {
@@ -73,6 +100,14 @@ VALUES ('main', NULL, 0, 0, NOW(3)),
 // 竞争时按 lockBackoff 退避重试直至 ctx 截止（ctx 错误原样返回，KindCancelled）。
 // opID 必须为 16 字节 UUID（32 位 hex 或带连字符 36 位字符串），代表维护窗口 owner；
 // 每次成功抢占 `revision` 单调递增，作为 fencing 依据（对齐 P02 目录结构）。
+//
+// 两处与「取消 / 无 deadline」相关的必要语义（R0 诊断，真实 TiDB 实测）：
+//   - 取消后补偿：抢锁 UPDATE 返回 context.Canceled / DeadlineExceeded 时，服务端
+//     语句可能并未被终止（驱动只关 socket、不发 KILL QUERY），行锁一释放就照常
+//     提交并把 owner 写成自己。此时用独立 ctx 复核并条件释放，见
+//     reconcileCanceledAcquire。
+//   - 有界退避：调用方 ctx 没有 deadline 时，内部最多等 maxAcquireWait，超限返回
+//     ErrMaintenanceContended，避免 context.Background() 永久挂起。
 func AcquireMaintenance(ctx context.Context, db *sql.DB, opID string) error {
 	op, err := normalizeOpID(opID)
 	if err != nil {
@@ -89,6 +124,14 @@ SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err 
 		}
 		return fmt.Errorf("acquire maintenance: %w", err)
 	}
+	// 有界退避：ctx 无 deadline 时施加 maxAcquireWait 总上限（ctx 有 deadline 时
+	// 行为完全不变，仍以 ctx 到期为准）。
+	capped := false
+	var capDeadline time.Time
+	if _, ok := ctx.Deadline(); !ok {
+		capped = true
+		capDeadline = time.Now().Add(maxAcquireWait)
+	}
 	attempt := 0
 	for {
 		res, err := db.ExecContext(ctx, `
@@ -97,7 +140,9 @@ SET op_id = UNHEX(?), revision = revision + 1, updated_at = NOW(3)
 WHERE singleton_key = 'maintenance' AND op_id IS NULL`, op)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
+				// 客户端取消 ≠ 服务端取消：复核本次是否其实已落 owner，
+				// 若是则条件释放，避免残留 owner 让后续抢锁者无限退避。
+				return reconcileCanceledAcquire(db, op, ctx, err)
 			}
 			if isTableMissing(err) {
 				return ErrMaintenanceRowMissing
@@ -128,7 +173,17 @@ SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err 
 		if idx >= len(lockBackoff) {
 			idx = len(lockBackoff) - 1
 		}
-		timer := time.NewTimer(lockBackoff[idx])
+		wait := lockBackoff[idx]
+		if capped {
+			remaining := time.Until(capDeadline)
+			if remaining <= 0 {
+				return fmt.Errorf("%w: waited %s for maintenance lock", ErrMaintenanceContended, maxAcquireWait)
+			}
+			if wait > remaining {
+				wait = remaining
+			}
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -136,6 +191,82 @@ SELECT 1 FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&one); err 
 		case <-timer.C:
 			attempt++
 		}
+	}
+}
+
+// reconcileCanceledAcquire 在抢锁 UPDATE 因 ctx 取消/超时失败后复核真实结果。
+//
+// 背景（R0 诊断 + 真实 TiDB 实测）：go-sql-driver v1.9.3 的 ctx 取消只关闭
+// socket、不发 KILL QUERY，服务端 UPDATE 会一直排在 maintenance 单例行的行锁队列里，
+// 行锁一释放就照常提交并把 op_id 写成本次 opID——客户端已经返回 ctx 错误，
+// owner 却被永久占用，后续抢锁者（尤其 context.Background()）无限退避挂起。
+//
+// 因此用**独立** ctx（不能复用已取消的 ctx）复核，预算 acquireReconcileBudget：
+//   - op_id == 本次 opID → 条件 UPDATE 清空（只清自己，绝不动他人 owner），返回
+//     "acquire maintenance: canceled after acquiring, released: %w"（链含 ctx 错误）；
+//   - op_id 属于他人 → 本次 UPDATE 的 `WHERE op_id IS NULL` 不可能再命中，立即返回
+//     原 ctx 错误；
+//   - op_id 为空 → 晚到写可能仍排在行锁队列里，按 acquireReconcilePoll 短轮询到
+//     预算耗尽；始终没观察到自己的 owner 则返回原 ctx 错误（未持有）；
+//   - 复核查询本身失败（无法确认）→ 包 ErrAcquireUncertain，调用方需重试或清理。
+func reconcileCanceledAcquire(db *sql.DB, op string, ctx context.Context, cause error) error {
+	causeErr := ctx.Err()
+	if causeErr == nil {
+		causeErr = cause
+	}
+	rctx, cancel := context.WithTimeout(context.Background(), acquireReconcileBudget)
+	defer cancel()
+	for {
+		var cur sql.Null[string]
+		err := db.QueryRowContext(rctx, `
+SELECT op_id FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&cur)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) || isTableMissing(err) {
+				return causeErr // 单例行不存在，谈不上持有
+			}
+			if rctx.Err() != nil {
+				break // 复核预算耗尽且此前未观察到 owner → 按未持有处理
+			}
+			return fmt.Errorf("%w: cancel outcome uncertain: %w", ErrAcquireUncertain, causeErr)
+		}
+		if cur.Valid {
+			if !strings.EqualFold(hex.EncodeToString([]byte(cur.V)), op) {
+				return causeErr // 明确属于他人
+			}
+			// 本次取消的 UPDATE 其实已落 owner：条件释放（只清自己）。
+			if _, err := db.ExecContext(rctx, `
+UPDATE maintenance
+SET op_id = NULL, updated_at = NOW(3)
+WHERE singleton_key = 'maintenance' AND op_id = UNHEX(?)`, op); err != nil {
+				return fmt.Errorf("%w: canceled after acquiring, release failed: %w", ErrAcquireUncertain, causeErr)
+			}
+			return fmt.Errorf("acquire maintenance: canceled after acquiring, released: %w", causeErr)
+		}
+		// op_id 为空：晚到写可能仍在行锁队列里，短轮询到预算耗尽。
+		if !sleepCtx(rctx, acquireReconcilePoll) {
+			break
+		}
+	}
+	return causeErr
+}
+
+// sleepCtx 睡 d 后返回 true；ctx 提前结束（含预算耗尽）则立即返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

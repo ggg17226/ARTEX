@@ -4,11 +4,62 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Autumn-27/artex/db/tidb"
 )
+
+// resetMaintenanceOwner 立即清空 maintenance 单例行的 op_id，并注册同名 cleanup。
+// 残留 owner 会让后续抢锁退避到超时（R0 挂起根因），故每个 maintenance 用例
+// 进出各清一次，用例之间互不污染。
+func resetMaintenanceOwner(t *testing.T, db *sql.DB) {
+	t.Helper()
+	clear := func(why string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := db.ExecContext(ctx, "UPDATE maintenance SET op_id=NULL WHERE singleton_key='maintenance'"); err != nil {
+			if why == "start" {
+				t.Fatalf("reset maintenance op_id: %v", err)
+			}
+			t.Logf("cleanup reset maintenance op_id: %v", err)
+		}
+	}
+	clear("start")
+	t.Cleanup(func() { clear("cleanup") })
+}
+
+// maintenanceOwner 返回 maintenance.op_id 的大写 hex；NULL 返回 ""。
+func maintenanceOwner(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var v sql.NullString
+	if err := db.QueryRowContext(ctx, `
+SELECT HEX(op_id) FROM maintenance WHERE singleton_key = 'maintenance'`).Scan(&v); err != nil {
+		t.Fatalf("read maintenance op_id: %v", err)
+	}
+	if !v.Valid {
+		return ""
+	}
+	return strings.ToUpper(v.String)
+}
+
+// requireNoMaintenanceOwnerSoon 断言 op_id 最终为 NULL：取消补偿是异步收敛的
+// （服务端晚到写可能在取消之后才落库），故给最多 2s 的轮询窗口。
+func requireNoMaintenanceOwnerSoon(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last := maintenanceOwner(t, db)
+	for last != "" && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		last = maintenanceOwner(t, db)
+	}
+	if last != "" {
+		t.Fatalf("maintenance op_id still %s after 2s, want NULL (canceled competitor left an owner)", last)
+	}
+}
 
 func TestAcquireReleaseMaintenance_Real(t *testing.T) {
 	dsn := requireTiDB(t)
@@ -21,8 +72,13 @@ func TestAcquireReleaseMaintenance_Real(t *testing.T) {
 	if err := tidb.EnsureLockInfrastructure(ctx, db); err != nil {
 		t.Fatalf("EnsureLockInfrastructure: %v", err)
 	}
+	resetMaintenanceOwner(t, db)
+	// 抢锁一律用有界 ctx：无 deadline 的调用虽有 maxAcquireWait 兜底，但测试
+	// 不应依赖 30s 上限来暴露挂起。
+	ctxTO, cancelTO := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelTO()
 	const opIDA = "0123456789abcdef0123456789abcdef"
-	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
+	if err := tidb.AcquireMaintenance(ctxTO, db, opIDA); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	t.Cleanup(func() {
@@ -74,9 +130,7 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 	if err := tidb.EnsureLockInfrastructure(ctx, db); err != nil {
 		t.Fatalf("EnsureLockInfrastructure: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "UPDATE maintenance SET op_id=NULL WHERE singleton_key='maintenance'"); err != nil {
-		t.Fatalf("reset op_id: %v", err)
-	}
+	resetMaintenanceOwner(t, db)
 	// 长 tx 内 coordinate 后，竞争方获取必须被行锁阻塞
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -86,17 +140,44 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 	if err := tidb.CoordinateMaintenance(ctx, db, tx); err != nil {
 		t.Fatalf("CoordinateMaintenance: %v", err)
 	}
+	// 协调事务在 500ms 提交，竞争者 B 在 300ms 取消：B 的服务端 UPDATE 仍排在
+	// maintenance 行的行锁队列里（驱动取消只关 socket、不发 KILL QUERY），事务一
+	// 提交就照常把 op_id 写成 B——R0 实测残留的正是这个 opID。把提交点安排在 B
+	// 的取消补偿窗口内，用来断言补偿必须把这份晚到残留清掉。
+	commitDone := make(chan error, 1)
+	time.AfterFunc(500*time.Millisecond, func() { commitDone <- tx.Commit() })
+
+	const opIDB = "b1b2b3b4b5b6b7b8b9b0c1c2c3c4c5c6"
 	ctxB, cancelB := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancelB()
-	if err := tidb.AcquireMaintenance(ctxB, db, "b1b2b3b4b5b6b7b8b9b0c1c2c3c4c5c6"); err == nil {
+	start := time.Now()
+	errB := tidb.AcquireMaintenance(ctxB, db, opIDB)
+	if errB == nil {
 		t.Fatal("acquire should be blocked by coordinating tx")
 	}
-	if err := tx.Commit(); err != nil {
+	if !errors.Is(errB, context.DeadlineExceeded) {
+		t.Fatalf("blocked acquire err = %v, want ctx deadline", errB)
+	}
+	if errors.Is(errB, tidb.ErrAcquireUncertain) {
+		t.Errorf("canceled acquire reported uncertain outcome: %v", errB)
+	}
+	// 补偿在独立预算内收敛，调用不得无限期挂起
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Errorf("canceled acquire took %v, want well under the reconcile budget", elapsed)
+	}
+	t.Logf("canceled competitor B returned after %v: %v", time.Since(start).Round(time.Millisecond), errB)
+
+	if err := <-commitDone; err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	// tx 提交后行锁释放，可再获取
+	// 核心断言：被 300ms 取消的竞争者 B 不得留下 owner（最多 2s 内必须收敛为 NULL）
+	requireNoMaintenanceOwnerSoon(t, db)
+
+	// tx 提交后行锁释放，可再获取（有界 ctx，禁止再用 Background 裸抢）
 	const opIDAft = "c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6"
-	if err := tidb.AcquireMaintenance(ctx, db, opIDAft); err != nil {
+	ctxAft, cancelAft := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelAft()
+	if err := tidb.AcquireMaintenance(ctxAft, db, opIDAft); err != nil {
 		t.Fatalf("acquire after commit: %v", err)
 	}
 	t.Cleanup(func() {
@@ -202,6 +283,7 @@ func TestMaintenanceRowMissing_FailClosed_Real(t *testing.T) {
 	if err := tidb.EnsureLockInfrastructure(ctx, db); err != nil {
 		t.Fatalf("EnsureLockInfrastructure: %v", err)
 	}
+	resetMaintenanceOwner(t, db)
 	if _, err := db.ExecContext(ctx, `
 DELETE FROM maintenance WHERE singleton_key = 'maintenance'`); err != nil {
 		t.Fatalf("delete singleton row: %v", err)
@@ -259,11 +341,11 @@ func TestAcquireMaintenance_RowDeletedDuringBackoff_Real(t *testing.T) {
 	if err := tidb.EnsureLockInfrastructure(ctx, db); err != nil {
 		t.Fatalf("EnsureLockInfrastructure: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "UPDATE maintenance SET op_id=NULL WHERE singleton_key='maintenance'"); err != nil {
-		t.Fatalf("reset op_id: %v", err)
-	}
+	resetMaintenanceOwner(t, db)
 	const opIDA = "d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6"
-	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
+	ctxA, cancelA := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelA()
+	if err := tidb.AcquireMaintenance(ctxA, db, opIDA); err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
 	t.Cleanup(func() {
@@ -329,8 +411,11 @@ func TestCoordinateMaintenance_LockedByOpID_Real(t *testing.T) {
 	if err := tidb.EnsureLockInfrastructure(ctx, db); err != nil {
 		t.Fatalf("EnsureLockInfrastructure: %v", err)
 	}
+	resetMaintenanceOwner(t, db)
 	const opIDA = "000000000000000000000000000000a1"
-	if err := tidb.AcquireMaintenance(ctx, db, opIDA); err != nil {
+	ctxA, cancelA := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelA()
+	if err := tidb.AcquireMaintenance(ctxA, db, opIDA); err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
 	t.Cleanup(func() {
