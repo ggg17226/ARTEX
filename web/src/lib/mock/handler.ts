@@ -2478,7 +2478,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/judge" && m === "GET")
     return {
       enabled: false,
-      profile_id: 0,
+      profile_id: "0",
       prompt: "",
       timeout_seconds: 15,
       fail_action: "allow",
