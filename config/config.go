@@ -12,7 +12,9 @@
 // database.port → ARTEX_DATABASE_PORT，skill_dir → ARTEX_SKILL_DIR …
 // 环境变量优先于配置文件同名字段。
 //
-// 最高优先级：ARTEX_TIDB_DSN（整体覆盖，非空即直接采用）。
+// 最高优先级：ARTEX_TIDB_DSN（整体覆盖，非空即直接采用其取值）。它只决定
+// 「DSN 的值来自哪里」，不豁免第 1 条：显式指定的配置文件依旧必须存在且可
+// 解析，否则 fail-closed 报错。
 //
 // PostgreSQL（postgres:// 协议与 ARTEX_PG_DSN）已彻底废除：任何来源出现
 // postgres:// / postgresql:// 一律显式报错，严禁静默连错库。所有 DSN 无论
@@ -23,8 +25,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/db/tidb"
@@ -40,6 +46,12 @@ const (
 	EnvSkillDir = "ARTEX_SKILL_DIR"
 	// EnvDatabaseDSN 是 database.dsn 的环境变量映射（Viper 前缀 + 键替换生成）。
 	EnvDatabaseDSN = "ARTEX_DATABASE_DSN"
+
+	// envDatabasePort 是 database.port 的环境变量映射名，仅用于错误提示。
+	envDatabasePort = "ARTEX_DATABASE_PORT"
+
+	// portKey 是端口在 Viper 里的键名。
+	portKey = "database.port"
 
 	// envPrefix 是 Viper 的环境变量前缀；database.dsn → ARTEX_DATABASE_DSN。
 	envPrefix = "ARTEX"
@@ -174,18 +186,84 @@ func loadViper() (v *viper.Viper, path string, err error) {
 }
 
 // readConfig 从 Viper 实例里取出显式键位。环境变量（ARTEX_ 前缀）优先于文件。
-func readConfig(v *viper.Viper) Config {
+//
+// 端口是唯一非字符串字段，必须走 readPort 的严格解析：任何「显式提供但非法」
+// 的值（非数字、小数、bool、超范围）都直接报错，绝不静默当成未配置。
+func readConfig(v *viper.Viper) (Config, error) {
 	var c Config
 	c.Database.DSN = strings.TrimSpace(v.GetString("database.dsn"))
 	c.Database.Host = strings.TrimSpace(v.GetString("database.host"))
-	c.Database.Port = v.GetInt("database.port")
+	port, err := readPort(v)
+	if err != nil {
+		return Config{}, err
+	}
+	c.Database.Port = port
 	c.Database.User = strings.TrimSpace(v.GetString("database.user"))
 	// 密码保留原始字符：绝不 TrimSpace（Spec §3.1.1 第 3 条）。
 	c.Database.Password = v.GetString("database.password")
 	c.Database.DBName = strings.TrimSpace(v.GetString("database.dbname"))
 	c.Database.SSLMode = strings.TrimSpace(v.GetString("database.sslmode"))
 	c.SkillDir = strings.TrimSpace(v.GetString("skill_dir"))
-	return c
+	return c, nil
+}
+
+// readPort 严格读取 database.port，区分「未设置」与「显式提供但非法」：
+//   - 未设置（配置文件无该键且环境变量不存在/为空）→ 返回 0，由 buildDSN
+//     回退默认端口 4000；
+//   - 显式提供但不是 1..65535 的整数 → 返回错误。
+//
+// 严禁改用 v.GetInt / cast.ToInt：它们在转换失败时静默返回 0，运维把
+// ARTEX_DATABASE_PORT 误写成 "not-a-port" 就会被当成「未配置」而悄悄连到
+// 默认端口 4000（审查 R4）。环境变量始终是字符串，YAML 可能是 int/float64/
+// 字符串，因此这里按原始类型逐项判定，其余类型（bool/map/slice/nil 指针等）
+// 一律拒绝。
+func readPort(v *viper.Viper) (int, error) {
+	raw := v.Get(portKey)
+	if raw == nil {
+		return 0, nil // 未设置：允许（纯环境变量或纯默认端口启动）
+	}
+	switch t := raw.(type) {
+	case int:
+		return checkPort(int64(t), raw)
+	case int64:
+		return checkPort(t, raw)
+	case uint64:
+		if t > math.MaxInt64 {
+			return 0, portError(raw)
+		}
+		return checkPort(int64(t), raw)
+	case float64:
+		// 先在 float 域做范围检查，避免溢出到 int64 的未定义行为。
+		if math.IsNaN(t) || t < 1 || t > math.MaxInt64 {
+			return 0, portError(raw)
+		}
+		if t != math.Trunc(t) {
+			return 0, portError(raw)
+		}
+		return checkPort(int64(t), raw)
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		if err != nil {
+			return 0, portError(raw)
+		}
+		return checkPort(n, raw)
+	default:
+		return 0, portError(raw)
+	}
+}
+
+// checkPort 校验端口范围（1..65535），越界即报错，绝不回退默认端口。
+func checkPort(n int64, raw interface{}) (int, error) {
+	if n < 1 || n > 65535 {
+		return 0, portError(raw)
+	}
+	return int(n), nil
+}
+
+// portError 统一端口错误文案：只回显值与键名，指明正确写法。
+func portError(raw interface{}) error {
+	return fmt.Errorf("非法 %s=%v：端口必须是 1..65535 的整数（也可在配置文件中写 database.port）。"+
+		"拒绝静默回退默认端口 %d，请先修正配置", portKey, raw, defaultTiDBPort)
 }
 
 // Load 读取配置文件与环境变量（后者优先），返回运行时配置。
@@ -197,7 +275,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return readConfig(v), nil
+	return readConfig(v)
 }
 
 // TiDBDSN 解析 TiDB 连接串（go-sql-driver 语法）并报告来源（供启动日志）。
@@ -207,21 +285,33 @@ func Load() (Config, error) {
 //  2. database.dsn（环境变量 ARTEX_DATABASE_DSN 或配置文件 database.dsn）；
 //  3. database.host / port / user / password / dbname 散列字段组装（默认端口 4000）。
 //
+// 最高优先级只决定「DSN 的取值来自哪里」，不豁免配置载体的有效性：无论
+// ARTEX_TIDB_DSN 是否设置，都先完成配置文件寻址与解析（ARTEX_CONFIG 显式指定
+// 时必须存在且可解析）以及字段类型校验（非法端口等），任一失败一律
+// fail-closed 报错，严禁用高优先级 DSN 掩盖损坏配置（审查 R1）。
+//
 // 所有分支统一交给 tidb.NormalizeDSN：强制补齐 charset=utf8mb4、parseTime=true、
 // loc=UTC、time_zone='%2B00%3A00'，并拒绝缺 user / 缺库名 / 强制参数冲突。
 // 检测到 postgres:// / postgresql:// 一律显式报错。没有任何来源时报错，
 // 不提供内置默认连接（严禁静默连到错误的库）。
 func TiDBDSN() (dsn, source string, err error) {
-	// 1. 最高优先级：显式整体覆盖。
-	if raw := strings.TrimSpace(os.Getenv(EnvTiDBDSN)); raw != "" {
-		return normalizeDSN(raw, "环境变量 "+EnvTiDBDSN)
-	}
-
+	// 0. 先加载并校验配置载体：ARTEX_CONFIG 显式指定却不存在的文件、损坏的
+	//    YAML、非法端口等，都必须在这里 fail-closed，先于任何优先级判定。
 	v, path, err := loadViper()
 	if err != nil {
 		return "", "", err
 	}
-	d := readConfig(v).Database
+	d, err := readConfig(v)
+	if err != nil {
+		return "", "", err
+	}
+
+	// 1. 最高优先级：显式整体覆盖（只覆盖取值，不豁免上面已完成的载体校验）。
+	if raw := strings.TrimSpace(os.Getenv(EnvTiDBDSN)); raw != "" {
+		return normalizeDSN(raw, "环境变量 "+EnvTiDBDSN)
+	}
+
+	db := d.Database
 	// baseLabel 描述本次生效的配置载体：命中配置文件则指向文件，否则是纯环境变量启动。
 	baseLabel := "环境变量 ARTEX_DATABASE_*"
 	if path != "" {
@@ -229,26 +319,26 @@ func TiDBDSN() (dsn, source string, err error) {
 	}
 
 	// PostgreSQL 残留参数：显式拒绝而不是静默忽略用户意图。
-	if d.SSLMode != "" {
+	if db.SSLMode != "" {
 		return "", "", fmt.Errorf("已废除 PostgreSQL 连接参数 sslmode（来源：%s）。TiDB 请在 database.dsn 中按需指定 tls 参数", describeSource(baseLabel, "database.sslmode"))
 	}
 
 	// 2. 整体连接串（环境变量映射优先于配置文件同名字段）。
-	if d.DSN != "" {
+	if db.DSN != "" {
 		label := baseLabel
 		if strings.TrimSpace(os.Getenv(EnvDatabaseDSN)) != "" {
 			label = "环境变量 " + EnvDatabaseDSN
 		}
-		return normalizeDSN(d.DSN, describeSource(label, "database.dsn"))
+		return normalizeDSN(db.DSN, describeSource(label, "database.dsn"))
 	}
 
 	// 3. 散列字段组装。
-	if d.Host != "" || d.User != "" || d.DBName != "" || d.Port != 0 {
+	if db.Host != "" || db.User != "" || db.DBName != "" || db.Port != 0 {
 		label := baseLabel
 		if path != "" && anyDatabaseEnvSet() {
 			label = baseLabel + " + 环境变量 ARTEX_DATABASE_*"
 		}
-		raw, err := d.buildDSN()
+		raw, err := db.buildDSN()
 		if err != nil {
 			return "", "", fmt.Errorf("组装 TiDB 连接串失败（来源：%s）：%w", describeSource(label, "database 字段"), err)
 		}
@@ -295,7 +385,7 @@ func normalizeDSN(raw, source string) (string, string, error) {
 	normalized, err := tidb.NormalizeDSN(raw)
 	if err != nil {
 		return "", "", fmt.Errorf("无效 TiDB 连接串（来源：%s）。"+
-			"请使用 go-sql-driver 语法 user:password@tcp(host:%d)/dbname（散列字段含 / ? 等保留字符时请改用完整 database.dsn 或 %s）：%w",
+			"请使用 go-sql-driver 语法 user:password@tcp(host:%d)/dbname（库名含 / ? 或 user 含 : 等无法散列组装的字符时，请改用完整 database.dsn 或 %s）：%w",
 			source, defaultTiDBPort, EnvTiDBDSN, err)
 	}
 	return normalized, source, nil
@@ -308,33 +398,103 @@ func isPostgresDSN(dsn string) bool {
 }
 
 // buildDSN 用散列字段组装 go-sql-driver DSN（host 默认 127.0.0.1，端口默认 4000）。
-// 用户名/口令/库名里出现 DSN 语法的保留字符时直接报错——这类凭据请改用完整
-// database.dsn，绝不做会被二次解码的“聪明”转义。
+//
+// 字段边界严格对齐 go-sql-driver v1.9.3 的 parseDSN：
+//   - 先取整串最后一个 '/' 作为库名起点，库名段再取第一个 '?' 作为参数起点，
+//     库名段最后经 url.PathUnescape 解码；
+//   - 再在该 '/' 之前取最后一个 '@' 切分凭据段，凭据段取第一个 ':' 分成
+//     user / password，凭据不做任何百分号解码。
+//
+// 由此推出本函数唯一的两条字符限制（其余字符都由驱动原样保留）：
+//   - database.dbname 不能含 '/' 或 '?'：那会直接跨越库名/参数边界，把后面的
+//     文本读成驱动选项（例如 "artex_dev?multiStatements=true"）。这类库名也无法
+//     在 tidb.formatDSN 的 PathEscape 序列化里保留，因此显式拒绝而不是静默连到
+//     另一个库或意外开启驱动选项（审查 R2）；其他特殊字符（空格、%、# 等）由
+//     url.PathEscape 与驱动的 PathUnescape 成对往返，无需禁止；
+//   - database.user 不能含 ':'：驱动按凭据段第一个 ':' 切分，会把 user 截断并
+//     把剩余部分读成密码。
+//
+// database.password 不做任何字符禁令也不 TrimSpace：驱动的字段切分保证
+// '/', '?', '@', ':', 空格等字符都能原样往返（审查 R5）。地址段用
+// net.JoinHostPort 组装，IPv6 字面量自动补方括号（审查 R3）。
 func (d Database) buildDSN() (string, error) {
-	host := d.Host
-	if host == "" {
-		host = defaultTiDBHost
-	}
 	port := d.Port
 	if port == 0 {
-		port = defaultTiDBPort
+		port = defaultTiDBPort // 只有「未设置」才会走到这里：非法端口已在 readPort 报错
 	}
 	if port < 1 || port > 65535 {
 		return "", fmt.Errorf("非法端口 %d（应为 1..65535）", d.Port)
 	}
-	if d.DBName == "" {
+	hostPort, err := joinHostPort(d.Host, port)
+	if err != nil {
+		return "", err
+	}
+	dbName, err := encodeDBName(d.DBName)
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(d.User, ":") {
+		return "", errors.New("database.user 不能包含 ':'（DSN 用它切分 user/password），请改用完整 database.dsn")
+	}
+	if d.User == "" {
+		return "", errors.New("缺少 database.user：TiDB 连接串必须是 user:password@tcp(host:port)/dbname 语法")
+	}
+	var sb strings.Builder
+	sb.WriteString(d.User)
+	if d.Password != "" {
+		sb.WriteByte(':')
+		sb.WriteString(d.Password)
+	}
+	sb.WriteString("@tcp(")
+	sb.WriteString(hostPort)
+	sb.WriteString(")/")
+	sb.WriteString(dbName)
+	return sb.String(), nil
+}
+
+// joinHostPort 按 net.JoinHostPort 规则组装地址段的 host:port：IPv6 字面量
+// （含已写成 "[::1]" 的形式）统一补方括号，避免 "::1" 被驱动读成
+// "[::1:4000]:3306" 这类连接目标与端口双双被改写的结果（审查 R3）。
+// 含 '/'、'?'、'@'、'('、')'、空白的 host 会跨越 DSN 字段边界，直接拒绝；
+// 含 ':' 但整体不是合法 IPv6 字面量（例如把端口误写进 host）同样拒绝，
+// 绝不静默改写运维声明的连接目标。
+func joinHostPort(rawHost string, port int) (string, error) {
+	host := rawHost
+	if host == "" {
+		host = defaultTiDBHost
+	}
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1] // 允许 [::1] / [fe80::1%eth0] 这类已带括号的写法
+	}
+	if host == "" || strings.ContainsAny(host, " \t\n\r/?@()") {
+		return "", fmt.Errorf("非法 database.host %q：不能为空，也不能包含 / ? @ ( ) 或空白字符", rawHost)
+	}
+	if strings.Contains(host, ":") {
+		literal := host
+		if i := strings.IndexByte(literal, '%'); i > 0 {
+			literal = literal[:i] // 去掉 IPv6 zone id 再判定字面量
+		}
+		// 合法 IPv6 字面量至少含两个 ':'（"::1" 即两个），因此
+		// "127.0.0.1:4000" 这种「host 里塞端口」的写法会被拒绝。
+		if net.ParseIP(literal) == nil || strings.Count(literal, ":") < 2 {
+			return "", fmt.Errorf("非法 database.host %q：含 ':' 但不是合法 IPv6 地址；端口请用 database.port 或 %s", rawHost, envDatabasePort)
+		}
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+// encodeDBName 校验并编码逻辑库名，使其安全落入 DSN 的库名段。驱动对该段做
+// url.PathUnescape，因此这里成对使用 url.PathEscape（%、空格、# 等均可原样
+// 往返）。含 '/' 或 '?' 的库名会跨越字段边界、无法保留，必须显式拒绝，
+// 严禁静默连到另一个库或意外启用驱动参数（审查 R2）。
+func encodeDBName(name string) (string, error) {
+	if name == "" {
 		return "", errors.New("缺少 database.dbname：ARTEX 只连接管理员预建库，不创建数据库")
 	}
-	if strings.ContainsAny(d.User, "/?@ \t\n") {
-		return "", errors.New("database.user 不能包含 / ? @ 或空白字符，请改用完整 database.dsn")
+	if strings.ContainsAny(name, "/?") {
+		return "", fmt.Errorf("非法 database.dbname %q：'/' 与 '?' 是 DSN 的库名/参数边界字符，无法安全组装，请改用完整 database.dsn", name)
 	}
-	if strings.ContainsAny(d.Password, "/?") {
-		return "", errors.New("database.password 不能包含 / ? 保留字符，请改用完整 database.dsn")
-	}
-	if d.Password == "" {
-		return fmt.Sprintf("%s@tcp(%s:%d)/%s", d.User, host, port, d.DBName), nil
-	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", d.User, d.Password, host, port, d.DBName), nil
+	return url.PathEscape(name), nil
 }
 
 // SkillDir returns the skill root directory with precedence:
