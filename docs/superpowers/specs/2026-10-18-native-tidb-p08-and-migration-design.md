@@ -1,6 +1,6 @@
 # ARTEX 原生 TiDB 8.5 架构迁移与生产部署技术规格说明书 (P08 & Native TiDB Migration Spec)
 
-> 日期：2026-10-18（第 3 版，吸纳 R27 报告与 R28 复审预备意见）  
+> 日期：2026-10-18（第 3 版修订稿，吸纳 R27/R28 报告全部意见）  
 > 状态：APPROVED  
 > 目标：彻底切断 PostgreSQL 依赖，全仓接入原生 TiDB 8.5，升级配置机制为 Viper+YAML，完成全部 43 个业务文件的方言转换与级联闭包删除接线。
 
@@ -32,8 +32,6 @@
 | **阶段 2** | **核心业务主干：资产、任务与级联闭包** | 9. `db/assets.go`<br>10. `db/asset_dsl.go`<br>11. `db/companies.go`<br>12. `db/company_scope.go`<br>13. `db/tasks.go`<br>14. `db/task_assets.go`<br>15. `db/task_assets_context.go`<br>16. `db/task_scope.go`<br>17. `db/task_context.go`<br>18. `db/task_categories.go`<br>19. `db/task_templates.go`<br>20. `db/task_intercept.go` | **M05, M09, M10, M14, M19, M26, M27**：资产 8 分支 Canonical Identity 字节仲裁（调用 `VerifyHashArbitration`）与 ODKU；企业及范围表 hash 转换；任务状态机与 `tasks.go` 废除表锁；接线 `cascade_executor.go` 与 `assets.task_ids`/`task_asset_links` 双写同步；建立父锁与漂移回滚协议；分类与模板基于 `nkey_hash` 的 TiDB 化。 |
 | **阶段 3** | **探索图谱、意图推进与漏洞管理** | 21. `db/exploration.go`<br>22. `db/exploration_sources.go`<br>23. `db/findings.go`<br>24. `db/finding_assets.go`<br>25. `db/finding_retests.go`<br>26. `db/finding_traffic.go`<br>27. `db/finding_traffic_archive.go`<br>28. `db/commands.go`<br>29. `db/tools.go`<br>30. `db/llm_usage.go`<br>31. `db/llmhealth.go`<br>32. `db/logs.go`<br>33. `db/nkey.go`<br>34. `db/digest.go`<br>35. `db/intent_admission.go`<br>36. `db/tool_usage.go` | **M03, M04, M12, M13, M15, M16, M20, M21, M28**：消除 95 处 exploration SQL 中的 `$1`、`RETURNING` 与 `DISTINCT ON`（改窗口函数）；移除启动期旧 DDL（`EnsureLLMRecordsTable`/`EnsureLLMUsageTable`）；`FindingStats` 聚合 `COUNT FILTER` 改写；流量关联表 `finding_traffic` 方言改造；UPDATE/DELETE 锁后回查替代 RETURNING。 |
 | **阶段 4** | **辅助模块、会话、触发器、归档与收尾** | 37. `db/conversation.go`<br>38. `db/triggers.go`<br>39. `db/chat_mentions.go`<br>40. `db/notification.go`<br>41. `db/notification_delivery.go`<br>42. `db/task_archives.go`<br>43. `db/task_archives_restore.go`<br>44. `db/task_archive_aggregate_stats.go`<br>45. `db/skill_usage.go`<br>46. `db/side_questions.go`<br>47. `db/constraints.go` | **M06, M17, M18, M22–M25, M29–M37**：会话与触发器方言 TiDB 化；通知系统改用 CAS 租约状态机替代 `SKIP LOCKED`（对齐 `notification_deliveries` 与 `next_attempt_at` 真实字段）；归档快照建立白名单彻底排除 `row_id`；彻底从 `go.mod` 移除 `pgx` 依赖。 |
-
-*注：上表完全包含 R4 审计指出的 43 个非测试业务文件（部分文件含子模块扩展项，共 47 行全景覆盖），无一遗漏。*
 
 ---
 
@@ -202,7 +200,8 @@ node --test src/lib/activity-merge.test.mjs src/lib/chat-mentions.test.mjs  # �
 
 ### 4.3 真实 TiDB 集成与业务回归门禁（`artex_dev`）
 ```bash
-ARTEX_TIDB_DSN="artex:2fq_n1lVpdVBj1vmo@tcp(192.168.27.79:6000)/artex_dev?..." go test -v ./... -count=1
+# 环境变量注入目标数据库 DSN，参数中的密码必须使用自身环境凭据
+ARTEX_TIDB_DSN="artex:PASSWORD@tcp(192.168.27.79:6000)/artex_dev?charset=utf8mb4&parseTime=true&loc=UTC&time_zone='%2B00%3A00'" go test -v ./... -count=1
 ```
 - **业务测试真实验收**：各阶段迁移完成后，对应的业务测试在 `ARTEX_TIDB_DSN` 开启时必须**真实执行且 PASS**（禁止将业务 CRUD 测试永久 skip 伪造通过）；
 - **全链路场景**：覆盖系统启动、Viper 配置解析、资产 8 分支写入与 hash 仲裁、任务推进、死锁免疫防线、级联闭包删除与归档恢复；
@@ -210,6 +209,7 @@ ARTEX_TIDB_DSN="artex:2fq_n1lVpdVBj1vmo@tcp(192.168.27.79:6000)/artex_dev?..." g
 
 ### 4.4 独立 Schema 冒烟门禁（`artex` 独占空库）
 ```bash
-ARTEX_TEST_TIDB_DSN="artex:2fq_n1lVpdVBj1vmo@tcp(192.168.27.79:6000)/artex?..." go test -v ./db/schema/ -run 'TestSmokeRealTiDBDDL|TestVerify_RealTiDB_Structure' -count=1
+# 环境变量注入空库 DSN
+ARTEX_TEST_TIDB_DSN="artex:PASSWORD@tcp(192.168.27.79:6000)/artex?charset=utf8mb4&parseTime=true&loc=UTC&time_zone='%2B00%3A00'" go test -v ./db/schema/ -run 'TestSmokeRealTiDBDDL|TestVerify_RealTiDB_Structure' -count=1
 ```
 - 验证从零建 65 表成功；测试结束后 `artex` 库的 BASE TABLE 数量必须准确回到 **0**。
