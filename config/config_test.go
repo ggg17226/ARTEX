@@ -49,6 +49,34 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+func TestTiDBDSN_FullDSN_IgnoresUnusedInvalidPort(t *testing.T) {
+	isolateEnv(t)
+	// YAML 格式合法，但包含非数字非法 port；因为提供了 ARTEX_TIDB_DSN，不应被未使用的非法 port 阻断
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configFile, []byte("database:\n  port: not-a-port\n"), 0o600); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	t.Setenv(EnvConfigFile, configFile)
+
+	rawWant := "artex:PASSWORD@tcp(127.0.0.1:4000)/artex_dev"
+	t.Setenv(EnvTiDBDSN, rawWant)
+
+	got, src, err := TiDBDSN()
+	if err != nil {
+		t.Fatalf("expected successful DSN retrieval despite unused invalid port, got: %v", err)
+	}
+	want, err := tidb.NormalizeDSN(rawWant)
+	if err != nil {
+		t.Fatalf("NormalizeDSN failed: %v", err)
+	}
+	if got != want {
+		t.Fatalf("expected %s, got %s", want, got)
+	}
+	if !strings.Contains(src, EnvTiDBDSN) {
+		t.Fatalf("expected env source, got: %s", src)
+	}
+}
+
 func TestTiDBDSN_EnvPrecedence(t *testing.T) {
 	rawWant := "artex:PASSWORD@tcp(127.0.0.1:4000)/artex_dev?charset=utf8mb4&parseTime=true&loc=UTC&time_zone='%2B00%3A00'"
 	wantNormalized, err := tidb.NormalizeDSN(rawWant)

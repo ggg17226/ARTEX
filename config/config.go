@@ -296,23 +296,41 @@ func Load() (Config, error) {
 // 不提供内置默认连接（严禁静默连到错误的库）。
 func TiDBDSN() (dsn, source string, err error) {
 	// 0. 先加载并校验配置载体：ARTEX_CONFIG 显式指定却不存在的文件、损坏的
-	//    YAML、非法端口等，都必须在这里 fail-closed，先于任何优先级判定。
+	//    YAML 语法等，都必须在这里 fail-closed，先于任何优先级判定。
 	v, path, err := loadViper()
 	if err != nil {
 		return "", "", err
 	}
-	d, err := readConfig(v)
-	if err != nil {
-		return "", "", err
-	}
 
-	// 1. 最高优先级：显式整体覆盖（只覆盖取值，不豁免上面已完成的载体校验）。
+	// 1. 最高优先级：显式整体覆盖（只覆盖取值，不豁免上面已完成的文件载体存在性与 YAML 语法校验）。
+	// 当存在完整的整体连接串时，未选中的散列字段（如 port）不参与解析，避免无关字段错误阻断顶层 DSN。
 	if raw := strings.TrimSpace(os.Getenv(EnvTiDBDSN)); raw != "" {
 		return normalizeDSN(raw, "环境变量 "+EnvTiDBDSN)
 	}
 
+	// 2. 检查整体连接串 database.dsn（环境变量映射优先于配置文件同名字段）。
+	// 若存在整体 database.dsn，同样无需解析散列字段。
+	rawDatabaseDSN := strings.TrimSpace(v.GetString("database.dsn"))
+	if rawDatabaseDSN != "" {
+		label := "配置文件 " + path
+		if strings.TrimSpace(os.Getenv(EnvDatabaseDSN)) != "" {
+			label = "环境变量 " + EnvDatabaseDSN
+		} else if path == "" {
+			label = "环境变量 ARTEX_DATABASE_*"
+		}
+		// 仍然检查 sslmode，避免残留参数
+		if strings.TrimSpace(v.GetString("database.sslmode")) != "" {
+			return "", "", fmt.Errorf("已废除 PostgreSQL 连接参数 sslmode（来源：%s）。TiDB 请在 database.dsn 中按需指定 tls 参数", describeSource(label, "database.sslmode"))
+		}
+		return normalizeDSN(rawDatabaseDSN, describeSource(label, "database.dsn"))
+	}
+
+	// 3. 回落到散列字段组装，此时严格校验散列配置（含 readPort 类型与范围校验）。
+	d, err := readConfig(v)
+	if err != nil {
+		return "", "", err
+	}
 	db := d.Database
-	// baseLabel 描述本次生效的配置载体：命中配置文件则指向文件，否则是纯环境变量启动。
 	baseLabel := "环境变量 ARTEX_DATABASE_*"
 	if path != "" {
 		baseLabel = "配置文件 " + path
@@ -323,16 +341,7 @@ func TiDBDSN() (dsn, source string, err error) {
 		return "", "", fmt.Errorf("已废除 PostgreSQL 连接参数 sslmode（来源：%s）。TiDB 请在 database.dsn 中按需指定 tls 参数", describeSource(baseLabel, "database.sslmode"))
 	}
 
-	// 2. 整体连接串（环境变量映射优先于配置文件同名字段）。
-	if db.DSN != "" {
-		label := baseLabel
-		if strings.TrimSpace(os.Getenv(EnvDatabaseDSN)) != "" {
-			label = "环境变量 " + EnvDatabaseDSN
-		}
-		return normalizeDSN(db.DSN, describeSource(label, "database.dsn"))
-	}
-
-	// 3. 散列字段组装。
+	// 散列字段组装。
 	if db.Host != "" || db.User != "" || db.DBName != "" || db.Port != 0 {
 		label := baseLabel
 		if path != "" && anyDatabaseEnvSet() {
