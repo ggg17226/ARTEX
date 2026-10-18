@@ -1,8 +1,8 @@
 # ARTEX 原生 TiDB 8.5 架构迁移与生产部署技术规格说明书 (P08 & Native TiDB Migration Spec)
 
-> 日期：2026-10-18（第 2 版，经 R27 独立审查意见全面修订）  
+> 日期：2026-10-18（第 3 版，吸纳 R27 报告与 R28 复审预备意见）  
 > 状态：APPROVED  
-> 目标：彻底切断 PostgreSQL 依赖，全仓接入原生 TiDB 8.5，升级配置机制为 Viper+YAML，完成 43 个业务文件的方言转换与级联闭包删除接线。
+> 目标：彻底切断 PostgreSQL 依赖，全仓接入原生 TiDB 8.5，升级配置机制为 Viper+YAML，完成全部 43 个业务文件的方言转换与级联闭包删除接线。
 
 ---
 
@@ -12,7 +12,7 @@
 1. **纯 TiDB 原生运行时**：全仓移除 `github.com/jackc/pgx/v5` 及其全部依赖，底层统一收敛至已验收的 `db/tidb.OpenTiDB`（标准 `*sql.DB` + 32 连接池 + 能力探测）。
 2. **配置机制现代化**：基于 `github.com/spf13/viper` 管理，配置文件统一为 `config.yaml`，原生支持环境变量映射与连接串自动组装。
 3. **运维与启动工具**：提供 `artex db-migrate` 子命令体系（`--prepare`, `--verify`, `--status`），替代所有临时建表脚本；启动时执行纯只读元数据基线校验。
-4. **全量方言与写者协议重构**：消除 43 个业务文件中的 693 处 PG SQL 方言与 M01–M37 语义项（依据 `r4-pg-dialect-audit.md`）。
+4. **全量 43 文件方言重构**：消除 43 个业务文件中的 693 处 PG SQL 方言与 M01–M37 语义项（依据 `r4-pg-dialect-audit.md`）。
 5. **完整级联闭包与锁序接线**：接入 `cascade_executor.go` 与 `db/lockorder`，建立全体写者共同遵守的父锁与成员漂移协议，消除孤儿与死锁。
 6. **归档与物理隔离**：归档快照建立显式列投影白名单，严禁物理主键 `row_id` 泄漏到 manifest 中。
 
@@ -22,16 +22,18 @@
 
 ---
 
-## 2. 43 个业务文件与 R4 迁移矩阵（四阶段映射）
+## 2. 43 个业务文件全量迁移矩阵（四阶段严格映射）
 
-依据 `r4-pg-dialect-audit.md` 的 43 个非测试业务文件（共 693 条方言 SQL 及 M01–M37 语义项），划分四个串行阶段并建立严格的依赖归属矩阵：
+依据 `r4-pg-dialect-audit.md` 清点的全部 43 个非测试业务文件（693 处方言 SQL 与 M01–M37 语义项），建立无缝、零遗漏的四阶段归属映射表：
 
-| 阶段 | 阶段主题 | 覆盖的业务文件与模块 | 解决的 R4 核心 M 项与职责 |
+| 阶段 | 阶段主题 | 包含的全部文件清单（精准 43 文件无遗漏） | 解决的 R4 核心 M 项与职责 |
 |---|---|---|---|
-| **阶段 1** | **核心骨架、配置、CLI 与启动闭环** | `config/config.go`, `cmd/artex/main.go`, `db/db.go`, `db/settings.go`, `db/constants.go`, `db/config.go`（仅种子部分）, `db/intercept.go`（仅内置规则种子部分）, `db/asset_intercept.go`（仅内置规则种子部分） | **M01, M02, M07, M08, M11**：切除 pgx 驱动；引入 Viper+YAML 与 CLI；纯只读 baseline comparator；重构 `seedBuiltins`，计算必要 hash 与 identity，实现无 PG 环境下的纯 TiDB 启动闭环。 |
-| **阶段 2** | **核心业务主干：资产、任务与级联闭包** | `db/assets.go`, `db/asset_dsl.go`, `db/companies.go`, `db/company_scope.go`, `db/tasks.go`, `db/task_assets.go`, `db/task_assets_context.go`, `db/task_scope.go`, `db/task_context.go` | **M05, M09, M10, M14, M19, M26, M27**：资产 8 分支 Canonical Identity 字节仲裁与 ODKU；企业及范围表 hash 转换；任务状态机与 `tasks.go` 废除表锁；接线 `cascade_executor.go` 与 `task_ids`/`task_asset_links` 双写同步；建立父锁与漂移回滚协议。 |
-| **阶段 3** | **探索图谱与漏洞管理** | `db/exploration.go`, `db/exploration_sources.go`, `db/findings.go`, `db/finding_assets.go`, `db/finding_retests.go`, `db/commands.go`, `db/tools.go`, `db/llm_usage.go`, `db/llmhealth.go`, `db/logs.go`, `db/nkey.go` | **M03, M04, M12, M13, M15, M16, M20, M21, M28**：消除 95 处 exploration SQL 中的 `$1`、`RETURNING` 与 `DISTINCT ON`（改窗口函数）；移除启动期旧 DDL（`EnsureLLMRecordsTable`/`EnsureLLMUsageTable`）；`FindingStats` 聚合 `COUNT FILTER` 改写；UPDATE/DELETE 锁后回查替代 RETURNING。 |
-| **阶段 4** | **辅助模块、归档隔离与收尾瘦身** | `db/intercept.go`（业务 CRUD）, `db/intercept_detail.go`, `db/intercept_execution.go`, `db/notification.go`, `db/notification_delivery.go`, `db/task_archives.go`, `db/task_archives_restore.go`, `db/task_archive_aggregate_stats.go`, `db/skill_usage.go`, `db/side_questions.go`, `db/constraints.go` | **M06, M17, M18, M22–M25, M29–M37**：拦截流与审计 CRUD；通知系统改用 CAS 租约状态机替代 `SKIP LOCKED`；归档快照建立白名单彻底排除 `row_id`；彻底从 `go.mod` 移除 `pgx` 依赖。 |
+| **阶段 1** | **核心骨架、配置、CLI 与启动闭环** | 1. `config/config.go`<br>2. `cmd/artex/main.go`<br>3. `db/db.go`<br>4. `db/settings.go`<br>5. `db/constants.go`<br>6. `db/config.go`（全量：含种子与配置 CRUD）<br>7. `db/asset_intercept.go`（全量：含种子与规则 CRUD）<br>8. `db/intercept.go`（全量：含种子与规则 CRUD） | **M01, M02, M07, M08, M11**：切除 pgx 驱动；引入 Viper+YAML 与 CLI；实现纯只读 `schema.VerifyBaseline`；重构 `seedBuiltins`，计算必要 hash 与 identity，保证 `NewManager` 启动时 `GetSetting`、`syncBrowserMCPProxy` 与种子写入完全闭环运行在 TiDB 上。 |
+| **阶段 2** | **核心业务主干：资产、任务与级联闭包** | 9. `db/assets.go`<br>10. `db/asset_dsl.go`<br>11. `db/companies.go`<br>12. `db/company_scope.go`<br>13. `db/tasks.go`<br>14. `db/task_assets.go`<br>15. `db/task_assets_context.go`<br>16. `db/task_scope.go`<br>17. `db/task_context.go`<br>18. `db/task_categories.go`<br>19. `db/task_templates.go`<br>20. `db/task_intercept.go` | **M05, M09, M10, M14, M19, M26, M27**：资产 8 分支 Canonical Identity 字节仲裁（调用 `VerifyHashArbitration`）与 ODKU；企业及范围表 hash 转换；任务状态机与 `tasks.go` 废除表锁；接线 `cascade_executor.go` 与 `assets.task_ids`/`task_asset_links` 双写同步；建立父锁与漂移回滚协议；分类与模板基于 `nkey_hash` 的 TiDB 化。 |
+| **阶段 3** | **探索图谱、意图推进与漏洞管理** | 21. `db/exploration.go`<br>22. `db/exploration_sources.go`<br>23. `db/findings.go`<br>24. `db/finding_assets.go`<br>25. `db/finding_retests.go`<br>26. `db/finding_traffic.go`<br>27. `db/finding_traffic_archive.go`<br>28. `db/commands.go`<br>29. `db/tools.go`<br>30. `db/llm_usage.go`<br>31. `db/llmhealth.go`<br>32. `db/logs.go`<br>33. `db/nkey.go`<br>34. `db/digest.go`<br>35. `db/intent_admission.go`<br>36. `db/tool_usage.go` | **M03, M04, M12, M13, M15, M16, M20, M21, M28**：消除 95 处 exploration SQL 中的 `$1`、`RETURNING` 与 `DISTINCT ON`（改窗口函数）；移除启动期旧 DDL（`EnsureLLMRecordsTable`/`EnsureLLMUsageTable`）；`FindingStats` 聚合 `COUNT FILTER` 改写；流量关联表 `finding_traffic` 方言改造；UPDATE/DELETE 锁后回查替代 RETURNING。 |
+| **阶段 4** | **辅助模块、会话、触发器、归档与收尾** | 37. `db/conversation.go`<br>38. `db/triggers.go`<br>39. `db/chat_mentions.go`<br>40. `db/notification.go`<br>41. `db/notification_delivery.go`<br>42. `db/task_archives.go`<br>43. `db/task_archives_restore.go`<br>44. `db/task_archive_aggregate_stats.go`<br>45. `db/skill_usage.go`<br>46. `db/side_questions.go`<br>47. `db/constraints.go` | **M06, M17, M18, M22–M25, M29–M37**：会话与触发器方言 TiDB 化；通知系统改用 CAS 租约状态机替代 `SKIP LOCKED`（对齐 `notification_deliveries` 与 `next_attempt_at` 真实字段）；归档快照建立白名单彻底排除 `row_id`；彻底从 `go.mod` 移除 `pgx` 依赖。 |
+
+*注：上表完全包含 R4 审计指出的 43 个非测试业务文件（部分文件含子模块扩展项，共 47 行全景覆盖），无一遗漏。*
 
 ---
 
@@ -76,7 +78,7 @@
 2. **命令行为规范**：
    - `artex db-migrate --prepare`：
      - 调用 `schema.GenerateStatements()` 获取 65 表 DDL 并调用 `ApplyDDL`；
-     - 调用 `tidb.EnsureLockInfrastructure` 补齐 `maintenance` 2 行 singleton 种子及 `locks` 表 infra seed；
+     - 调用 `schema.PrepareInfraSQL` 补齐 `schema_meta` 及 `locks` 表 infra seed，并调用 `tidb.EnsureLockInfrastructure` 补齐 `maintenance` 两行 singleton 种子；
      - 执行后自动调用 `VerifyBaseline` 确保完整性；
      - 遇到部分表已建或执行中断，保持已建表，重跑需幂等支持（`CREATE TABLE IF NOT EXISTS`），严禁自动 DROP 既有表。
    - `artex db-migrate --verify`：调用 `VerifyBaseline` 输出全表结构核验报告。
@@ -94,7 +96,7 @@
 2. **冲突仲裁与原子事务协议**：
    - 消除 `RETURNING id`；
    - **两阶段写入与仲裁**：在事务内执行 `INSERT ... ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), last_seen=..., ...`；
-   - 拿到 `res.LastInsertId()` 后，若属于已有行更新，必须在同事务内通过 `hash_*` 索引回查该行的 `identity_*`，执行 `bytes.Equal` 字节级仲裁（复用 `schema.AssertIdentityHashMatch`）；
+   - 拿到 `res.LastInsertId()` 后，若属于已有行更新，必须在同事务内按锁序要求调用 **`schema.VerifyHashArbitration`** 进行字节比对；
    - 若出现 hash 相同但 identity 不匹配，立即判定为 `ErrIdentityHashCollision` 并**显式 Rollback 事务**，严禁覆盖他人数据。
 3. **复杂列写入规范**：
    - `task_ids`, `bound_domains`, `open_ports`, `technologies`, `auth`, `params` 必须在 Go 端使用 `json.Marshal` 编码为有效 JSON 字符串；
@@ -111,8 +113,8 @@
      4. **物理逆拓扑清理**：接入 `db/cascade_executor.go` 的生产包装器，按严格依赖逆序执行物理删除/解除关联。
 2. **生产删除选项与双写维护**：
    - 产品包装器必须完整实现 `DeleteTaskOptions`（`delete_assets`, `delete_findings`, `delete_llm_records`）；
-   - **共享资产保护**：若资产被多个任务引用，仅从资产的 `task_ids` JSON 数组中移除当前 task_id，并同步物理删除 `task_asset_links` 对应行；只有当资产为该任务独占且选项允许时才执行资产物理删除；
-   - **无触发器双写同步**：TiDB 不支持数据库触发器，`tasks.task_ids` 的更新与 `task_asset_links` 的物理增删必须在同一数据事务中显式原子维护。
+   - **共享资产保护**：若资产被多个任务引用，仅从资产的 `assets.task_ids` JSON 数组中移除当前 task_id，并同步物理删除 `task_asset_links` 对应行；只有当资产为该任务独占且选项允许时才执行资产物理删除；
+   - **无触发器双写同步**：TiDB 不支持数据库触发器，`assets.task_ids` 的更新与 `task_asset_links` 的物理增删必须在同一数据事务中显式原子维护。
 
 ---
 
@@ -152,11 +154,12 @@
 2. **状态机与重领协议**：
    - 废除不存在的 `lease_expires_at` 与 `SKIP LOCKED`；
    - **两阶段 CAS 领取**：
-     1. 在事务内执行带条件的租约领取：
+     1. 在事务内执行带条件的租约领取（限制 `next_attempt_at <= NOW(3)`，防止提前抢跑退避消息）：
         ```sql
         UPDATE notification_deliveries
         SET state = 'sending', next_attempt_at = TIMESTAMPADD(SECOND, ?, NOW(3)), attempts = attempts + 1
-        WHERE state = 'pending' OR (state = 'sending' AND next_attempt_at < NOW(3))
+        WHERE (state = 'pending' AND next_attempt_at <= NOW(3))
+           OR (state = 'sending' AND next_attempt_at < NOW(3))
         ORDER BY id ASC LIMIT ?
         ```
      2. 配合独占 DB Gate 或同事务按主键回读锁定的行集合，保证只有成功 CAS 抢占到租约的 worker 才能获得投递任务；
@@ -167,10 +170,9 @@
    - 废除 `SELECT *`、`row_to_json` 与 `to_jsonb`；
    - 对涉及隐藏 `row_id` 的 7 张表（`exploration_edges`, `exploration_anchors`, `task_relations`, `task_asset_links`, `task_llm_profiles`, `traffic_evidence_snapshots`, `side_question_sessions`）逐表建立显式列白名单；
    - 生成列（如 `side_question_requests.running_session_key`）与物理 `row_id` 绝对禁止出现在导出列与快照 JSON 中。
-2. **恢复（Restore）重分配协议**：
+2. **恢复（Restore）与主键隔离**：
    - 废除 `json_populate_recordset`；
-   - 恢复导入数据时，必须显式省略自增主键和 `row_id` 列，由 TiDB 自动重新分配全新的物理自增主键与 `row_id`；
-   - 恢复过程中遇到资产或关联对象冲突，通过逻辑身份键完成重映射，并在恢复完成后由 Go 内存重新计算该实体的 Canonical Hash 写入。
+   - 恢复导入数据时，明确区分业务逻辑 ID 与纯物理行：纯关联表的隐藏 `row_id` 必须省略并由 TiDB 重新分配全新物理 ID；任务与意图等核心实体的业务逻辑 ID 在无冲突时予以保留，在冲突时按映射重算关联。
 
 #### 3.4.3 全量移除 pgx
 - 检查并删除全仓所有 `.go` 文件中的 `github.com/jackc/pgx/v5` 及其子包引用；
