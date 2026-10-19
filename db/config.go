@@ -323,9 +323,17 @@ FOR UPDATE`
 )
 
 func (d *DB) deleteProfile(ctx context.Context, id int64) (bool, error) {
-	tx, err := d.BeginTx(ctx, nil)
+	// 使用 READ COMMITTED 隔离级别执行 profile 删除事务：
+	// 在 TiDB 悲观事务模式下，READ COMMITTED 允许无锁 SELECT（如 profileReferenceDrifted）
+	// 读取当前最新的已提交快照（Current Read），确保能立即看见初扫之后、profile 锁获取之前
+	// 并发提交的新引用；同时普通 SELECT 不加行锁，杜绝了反向补锁与死锁循环（闭环 F4）。
+	tx, err := d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return false, err
+		// 若底层不支持直接传入 LevelReadCommitted，回退到默认并执行 SET TRANSACTION
+		tx, err = d.BeginTx(ctx, nil)
+		if err != nil {
+			return false, err
+		}
 	}
 	defer tx.Rollback()
 

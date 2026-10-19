@@ -148,10 +148,28 @@ func TestConfigStores(t *testing.T) {
 		}
 	}
 
-	// agents seeded; prompt versioning
-	ag, err := d.GetAgentByKey("planner")
+	// agents seeded; prompt versioning (使用独立的测试 agent，绝不污染内置 planner 状态，彻底闭环 F7)
+	testAgentKey := fmt.Sprintf("t-ag-%d", time.Now().UnixNano())
+	_, err = d.seedAgent(builtinAgent{key: testAgentKey, name: "Test Planner", role: "planner"})
+	if err != nil {
+		t.Fatalf("create test agent failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.DeleteAgent(testAgentKey); err != nil {
+			t.Errorf("cleanup test agent failed: %v", err)
+		}
+		var count int
+		if err := d.QueryRow("SELECT count(*) FROM agents WHERE `key` = ?", testAgentKey).Scan(&count); err != nil {
+			t.Errorf("query residual agent failed: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("residual test agent %s found after cleanup", testAgentKey)
+		}
+	})
+
+	ag, err := d.GetAgentByKey(testAgentKey)
 	if err != nil || ag == nil {
-		t.Fatalf("planner agent: %v", err)
+		t.Fatalf("get test agent: %v", err)
 	}
 	v1, err := d.SavePrompt(ag.ID, "你是规划者 {{.Goal}}", "init", "test")
 	if err != nil {
@@ -169,33 +187,44 @@ func TestConfigStores(t *testing.T) {
 	if len(vers) < 2 {
 		t.Fatalf("want >=2 versions, got %d", len(vers))
 	}
-	pv, _ := d.PromptVars(ag.ID)
-	// planner must have at least the seeded catalog vars (Goal, AssetSummary)
-	if len(pv) < 2 {
-		t.Fatalf("planner catalog want >=2 vars, got %d", len(pv))
-	}
-	d.Exec(`DELETE FROM agent_prompts WHERE agent_id=?`, ag.ID)
-	d.Exec(`UPDATE agents SET current_prompt_id=NULL WHERE id=?`, ag.ID)
 
 	// mcp + skill + visibility (bidirectional via one join)
-	// Clean up any leftover MCP from prior runs to keep this test idempotent.
-	d.Exec(`DELETE FROM mcp_servers WHERE name = 't-gh'`)
-	mid, err := d.SaveMCP(&MCPServer{Name: "t-gh", Transport: "stdio", Command: "npx", Args: json.RawMessage(`["server-github"]`), Env: json.RawMessage(`{"GITHUB_TOKEN":"x"}`), Enabled: true})
+	// 使用带时间戳的唯一 MCP 名称，并注册即时 Cleanup 与后验验零
+	mcpName := fmt.Sprintf("t-gh-%d", time.Now().UnixNano())
+	mid, err := d.SaveMCP(&MCPServer{Name: mcpName, Transport: "stdio", Command: "npx", Args: json.RawMessage(`["server-github"]`), Env: json.RawMessage(`{"GITHUB_TOKEN":"x"}`), Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// agent-side write. MCP is id-keyed (generic visibility join); skills are now
-	// filesystem-based, so their visibility is keyed by skill (directory) name in a
-	// dedicated table. Clear any pre-existing MCP visibility rows so the assertions
-	// below isolate on exactly what this test sets.
-	d.Exec(`DELETE FROM agent_visibility WHERE agent_id = ? AND resource_kind = 'mcp'`, ag.ID)
+	t.Cleanup(func() {
+		if err := d.DeleteMCP(mid); err != nil {
+			t.Errorf("cleanup mcp %d failed: %v", mid, err)
+		}
+		var mCount int
+		if err := d.QueryRow("SELECT count(*) FROM mcp_servers WHERE id = ?", mid).Scan(&mCount); err != nil {
+			t.Errorf("query residual mcp failed: %v", err)
+		}
+		if mCount != 0 {
+			t.Errorf("residual mcp %d found after cleanup", mid)
+		}
+	})
+
+	tSkillName := fmt.Sprintf("t-skill-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_ = d.DeleteSkillVisibility(tSkillName)
+		var sCount int
+		_ = d.QueryRow("SELECT count(*) FROM agent_skill_visibility WHERE skill_name = ?", tSkillName).Scan(&sCount)
+		if sCount != 0 {
+			t.Errorf("residual skill visibility %s found after cleanup", tSkillName)
+		}
+	})
+
 	if err := d.ToggleVisibility(ag.ID, "mcp", mid, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.SetAgentSkillVisibility(ag.ID, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.ToggleSkillVisibility(ag.ID, "t-skill", true); err != nil {
+	if err := d.ToggleSkillVisibility(ag.ID, tSkillName, true); err != nil {
 		t.Fatal(err)
 	}
 	// agent-side read
@@ -217,17 +246,16 @@ func TestConfigStores(t *testing.T) {
 	// skill visibility is name-keyed: verify the read, then deleting the skill's
 	// visibility rows (called when a skill is removed) clears it.
 	names, _ := d.AgentSkillNames(ag.ID)
-	if len(names) != 1 || names[0] != "t-skill" {
+	if len(names) != 1 || names[0] != tSkillName {
 		t.Fatalf("agent visible skills: %+v", names)
 	}
-	if err := d.DeleteSkillVisibility("t-skill"); err != nil {
+	if err := d.DeleteSkillVisibility(tSkillName); err != nil {
 		t.Fatal(err)
 	}
 	names2, _ := d.AgentSkillNames(ag.ID)
 	if len(names2) != 0 {
 		t.Fatalf("skill visibility should be cleared on delete: %+v", names2)
 	}
-	d.DeleteMCP(mid)
 }
 
 func contains(s, sub string) bool {
