@@ -345,10 +345,20 @@ func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
 				t.Fatalf("base fields mismatch: cid=%v kind=%v raw=%v reason=%v", args[0], args[1], args[5], args[6])
 			}
 
-			// 2, 3, 4: 载荷列
-			valDomain, okD := args[2].(*string)
-			valNet, okN := args[3].(*string)
-			valVal, okV := args[4].(*string)
+			// 2, 3, 4: 载荷列。必须严格检查类型断言，若参数为非 nil 的非 *string 类型必须直接判错
+			checkStringPtrArg := func(idx int, name string) *string {
+				if args[idx] == nil {
+					return nil
+				}
+				s, ok := args[idx].(*string)
+				if !ok {
+					t.Fatalf("arg[%d] (%s) is not *string: %T (%v)", idx, name, args[idx], args[idx])
+				}
+				return s
+			}
+			valDomain := checkStringPtrArg(2, "domain")
+			valNet := checkStringPtrArg(3, "net")
+			valVal := checkStringPtrArg(4, "value")
 
 			// 7..12: identity/hash 列。必须严格检查类型断言，若参数为非 nil 的非 []byte 类型必须直接判错
 			checkBytesArg := func(idx int, name string) []byte {
@@ -371,7 +381,7 @@ func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
 
 			switch tc.valueCol {
 			case "domain":
-				if !okD || valDomain == nil || *valDomain != branch.Value {
+				if valDomain == nil || *valDomain != branch.Value {
 					t.Fatalf("domain payload inactive or mismatch: %v", valDomain)
 				}
 				if !bytes.Equal(identDomain, branch.Identity) || !bytes.Equal(hashDomain, branch.Hash) {
@@ -382,7 +392,7 @@ func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
 					t.Fatalf("unactivated net/val columns must be strictly nil: net=%v val=%v identNet=%v identVal=%v", valNet, valVal, identNet, identVal)
 				}
 			case "net":
-				if !okN || valNet == nil || *valNet != branch.Value {
+				if valNet == nil || *valNet != branch.Value {
 					t.Fatalf("net payload inactive or mismatch: %v", valNet)
 				}
 				if !bytes.Equal(identNet, branch.Identity) || !bytes.Equal(hashNet, branch.Hash) {
@@ -393,7 +403,7 @@ func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
 					t.Fatalf("unactivated domain/val columns must be strictly nil: domain=%v val=%v identDomain=%v identVal=%v", valDomain, valVal, identDomain, identVal)
 				}
 			case "value":
-				if !okV || valVal == nil || *valVal != branch.Value {
+				if valVal == nil || *valVal != branch.Value {
 					t.Fatalf("value payload inactive or mismatch: %v", valVal)
 				}
 				if !bytes.Equal(identVal, branch.Identity) || !bytes.Equal(hashVal, branch.Hash) {
