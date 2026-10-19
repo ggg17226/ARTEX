@@ -46,7 +46,15 @@ func printBanner(addr string) {
 // of the update protocol — the supervising start script reads it to decide
 // whether to relaunch us (see selfupdate.ExitRestart) — so the body has to live
 // in a function that can *return* rather than os.Exit past its own defers.
+//
+// 运维子命令（artex db-migrate）必须在 run() 之前分派：它是短生命周期的一次性
+// 命令，在此之前一旦落入主流程就会顺带开启日志捕获、自更新换装自检、打开存储、
+// 绑定 HTTP 与代理端口，既污染退出码语义也可能误改环境（Spec §1.1 第 3 条）。
+// handled=true 时命令已终结，直接以它自己的退出码结束进程。
 func main() {
+	if code, handled := dispatchMigrate(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	os.Exit(run())
 }
 
@@ -87,7 +95,7 @@ func run() int {
 	if _, e := os.Stat(cfgPath); e == nil {
 		log.Printf("[config] 配置文件: %s", cfgPath)
 	} else {
-		log.Printf("[config] 配置文件: %s (不存在 — 将仅尝试环境变量 ARTEX_PG_DSN)", cfgPath)
+		log.Printf("[config] 配置文件: %s (不存在 — 将仅尝试环境变量 ARTEX_TIDB_DSN)", cfgPath)
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
