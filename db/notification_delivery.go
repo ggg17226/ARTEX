@@ -11,14 +11,29 @@ import (
 
 // 本文件是投递任务的领取与状态流转。
 //
-// 领取用「租约」而非长事务：把行置为 sending 并把 next_attempt_at 推到未来作为
-// 租约到期时间，提交事务后再去做网络投递。这样投递期间不持有数据库锁——
-// 网络请求可能耗时数秒（客户端超时 15 秒），占着行锁不放会拖垮同库的其它写操作。
+// 领取用「两阶段 CAS 租约」而不是「长事务 + SKIP LOCKED」：
 //
-// 代价是进程若在投递途中崩溃，行会停在 sending。这是**可自愈**的：租约到期后
-// next_attempt_at 落入过去，下一轮领取会把同一行重新捞起来（见领取条件里的
-// state IN ('pending','sending')）。重试计数在领取时就已 +1，所以崩溃不会造成
-// 无限重试——MaxNotifyAttempts 次机会用完后落入 failed 等人工处理。
+//	阶段 1：事务内有界锁定候选行（SELECT … FOR UPDATE），只读 id/channel_id/attempts；
+//	阶段 2：把状态机原子推进为 sending，并把 Go 侧算好的绝对截止时间 assignedDeadline
+//	        写进 next_attempt_at —— 这一列同时是「下次可领取时间」与「租约到期时间」。
+//	读取完整行后立刻提交，网络投递发生在**提交之后**：投递期间不持有数据库锁
+//	（渠道 HTTP 客户端超时 15 秒，占着行锁不放会拖垮同库的其它写操作）。
+//
+// 为什么不用 SKIP LOCKED：它只保证「不撞车」，不保证「谁在什么时候拥有这一行」。
+// 租约把后者变成可验证的事实——next_attempt_at 就是这次领取的**代次令牌**，
+// 于是所有回填都必须带着它（见下面的 Fencing 契约）。
+//
+// 崩溃自愈是**可预期**的：进程若在投递途中挂掉，行会停在 sending；租约到期后
+// next_attempt_at 落入过去，下一轮领取会把同一行重新捞起来（阶段 1 的第二支谓词）。
+// 重试计数在领取时就已 +1，所以崩溃不会造成无限重试——MaxNotifyAttempts 次机会
+// 用完后落入 failed 等人工处理。
+//
+// **代次 Fencing 回填契约（闭环 F05）**：MarkDeliveriesSent / RescheduleDeliveries /
+// DeferDeliveries / FailDeliveries 四个回填必须携带领取时拿到的那份租约截止时间，
+// 且 UPDATE 的 WHERE 必须含 `state = 'sending' AND next_attempt_at = ?`。
+// 若本行租约已超时被下一个 worker 抢走，它的 next_attempt_at 已被换成**新的**
+// 截止时间，旧 worker 的迟到 ACK 匹配行数为 0 —— 迟到 ACK 被丢弃，新租约分毫不动。
+// 回填返回的影响行数就是这件事的可观测出口：0 行意味着「我已经不是这次投递的主人」。
 
 // MaxNotifyAttempts 是一条投递的最大尝试次数（含首次）。
 // 定义在这里而非投递引擎里：它是状态机自身的策略，引擎只是执行者。
@@ -57,6 +72,11 @@ type NotificationDelivery struct {
 	ChannelName string `json:"channel_name"`
 	ChannelKind string `json:"channel_kind"`
 }
+
+// LeaseToken 返回本次领取分配到的租约截止时间，即四类回填的代次 fencing 令牌。
+// 它的值就是 NextAttemptAt——阶段 2 写进 next_attempt_at 的那个时刻。单独起名字
+// 是为了让投递引擎里的传递路径可读，并与「下次可领取时间」这个字段语义区分开。
+func (dl *NotificationDelivery) LeaseToken() time.Time { return dl.NextAttemptAt }
 
 const notificationDeliveryCols = `d.id, d.event_id, d.channel_id, d.state, d.attempts, d.next_attempt_at,
        d.last_error, d.batch_id, d.created_at, d.sent_at`
@@ -103,11 +123,45 @@ func scanNotificationDelivery(sc interface{ Scan(...any) error }) (*Notification
 	return &dl, nil
 }
 
-// claimQuery 描述一次领取：先按 sel 选出候选并加锁，再把它们置为 sending 并
-// 延长租约。sel 里的 lease 位置由调用方用 $n 占位并自行传参。
-type claimQuery struct {
-	sql  string
-	args []any
+// 投递状态机的三条核心语句。表名与列名严格对齐真实 Catalog（M33）：
+// 真实表是 notification_deliveries，租约与调度时间列是 next_attempt_at，
+// 不存在 PG 时代的 scheduled_at。
+const (
+	// claimCandidateQuery 是阶段 1：单表、有界、按 id 升序的候选锁定。
+	// 两支谓词的差别是刻意的：
+	//   - pending 用 `<=`：到点即可领；
+	//   - sending 用 `<`：只捞**严格已过期**的租约（崩溃自愈），不抢仍在租约里的行。
+	// NOW(3) 与 DATETIME(3) 同精度，比较两侧不会引入亚毫秒偏差。
+	claimCandidateQuery = `SELECT id, channel_id, attempts FROM notification_deliveries
+WHERE channel_id = ?
+  AND ((state = '` + NotifyStatePending + `' AND next_attempt_at <= NOW(3)) OR (state = '` + NotifyStateSending + `' AND next_attempt_at < NOW(3)))
+ORDER BY id ASC
+LIMIT ?
+FOR UPDATE`
+
+	// claimAssignQuery 是阶段 2：候选原子置 sending、递增尝试次数，并写入本次分配的
+	// 租约截止时间（第 1 个实参；%s 展开成 id 的 `?` 列表）。
+	// 该截止时间随后被四类回填当代次令牌逐位比对，所以它必须由 Go 侧算好且已对齐
+	// 到毫秒，见 deliveryClockAt。
+	claimAssignQuery = `UPDATE notification_deliveries
+SET state = '` + NotifyStateSending + `', next_attempt_at = ?, attempts = attempts + 1
+WHERE id IN (%s)`
+
+	// deliveryLeaseFence 是四类回填共用的代次 fencing 谓词：状态必须仍是 sending，
+	// 且租约截止时间必须与令牌逐位相等。
+	deliveryLeaseFence = "state = '" + NotifyStateSending + `' AND next_attempt_at = ?`
+)
+
+// deliveryClockAt 把「相对时长」换算成可直接写进 DATETIME(3) 列的绝对 UTC 时刻。
+//
+// 两处刻意的处理：
+//   - **UTC**：连接池强制会话时区 +00:00（见 db/tidb），Go 侧同样按 UTC 传，
+//     两侧不会因时区差把租约算成八小时后或八小时前；
+//   - **截到毫秒**：next_attempt_at 是 DATETIME(3)，落库会舍掉亚毫秒。租约截止时间
+//     同时是回填的 fencing 令牌，令牌必须在「写入」与「比较」两侧逐位相等；
+//     若把带纳秒噪声的原值留在内存里当令牌，正确持有者也会被自己的舍入噪声判成过期。
+func deliveryClockAt(d time.Duration) time.Time {
+	return time.Now().UTC().Add(d).Truncate(time.Millisecond)
 }
 
 // ClaimRealtimeDeliveries 领取某渠道一批到期的实时投递，最多 limit 条。
@@ -117,24 +171,13 @@ type claimQuery struct {
 // 重试次数。若反过来先领后弃，被限流挡下的行已经被计过一次 attempts，
 // 3 次预算会被纯粹的等待耗光，最后落进 failed。
 //
-// 条件含「租约已过期的 sending」——那是崩溃自愈的落点。lease 必须显著大于单次
-// 投递的最坏耗时（渠道 HTTP 客户端超时 15 秒），否则同一行会被两个 dispatcher
-// 同时投递。同时挡掉已停用渠道：停用操作已把存量投递标记为 skipped，
-// 这里再拦一道，避免停用与领取并发时的漏网。
+// 返回的每条投递的 NextAttemptAt 就是本次分配的租约截止时间；投递引擎回填状态时
+// 必须把它原样带回来（那四胞胎参数的由来），否则自己的回填会被 fencing 判成迟到。
 func (d *DB) ClaimRealtimeDeliveries(ctx context.Context, channelID int64, limit int, lease time.Duration) ([]*NotificationDelivery, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	return d.claimDeliveries(ctx, lease, claimQuery{
-		sql: `SELECT dd.id FROM notification_deliveries dd
-JOIN notification_channels c ON c.id = dd.channel_id
-WHERE dd.channel_id = $1 AND dd.state IN ($2,$3) AND dd.next_attempt_at <= now()
-  AND c.enabled AND c.mode = $4
-ORDER BY dd.next_attempt_at, dd.id
-FOR UPDATE OF dd SKIP LOCKED
-LIMIT $5`,
-		args: []any{channelID, NotifyStatePending, NotifyStateSending, NotifyModeRealtime, limit},
-	}, nil)
+	return d.claimDeliveries(ctx, channelID, limit, lease, NotifyModeRealtime, nil)
 }
 
 // DigestBatchDue 报告该渠道是否已攒够一个到期批次：存在待发投递，且**最老的那条**
@@ -150,11 +193,13 @@ func (d *DB) DigestBatchDue(ctx context.Context, channelID int64, minAge time.Du
 	var due bool
 	err := d.QueryRowContext(ctx, `SELECT EXISTS (
   SELECT 1 FROM notification_deliveries d
-  JOIN notification_channels c ON c.id = d.channel_id
-  WHERE d.channel_id = $1 AND d.state IN ($2,$3) AND c.enabled
+  WHERE d.channel_id = ? AND d.state IN ('`+NotifyStatePending+`','`+NotifyStateSending+`')
   GROUP BY d.channel_id
-  HAVING min(d.created_at) <= now() - make_interval(secs => $4)
-)`, channelID, NotifyStatePending, NotifyStateSending, int64(minAge.Seconds())).Scan(&due)
+  HAVING TIMESTAMPDIFF(SECOND, MIN(d.created_at), NOW(3)) >= ?
+)`, channelID, int64(minAge.Seconds())).Scan(&due)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
 	return due, err
 }
 
@@ -183,53 +228,71 @@ func (d *DB) ClaimDigestBatch(ctx context.Context, channelID int64, limit int, l
 	if limit > MaxDigestBatchSize {
 		limit = MaxDigestBatchSize
 	}
-	out, err := d.claimDeliveries(ctx, lease, claimQuery{
-		sql: `SELECT dd.id FROM notification_deliveries dd
-JOIN notification_channels c ON c.id = dd.channel_id
-WHERE dd.channel_id = $1 AND dd.state IN ($2,$3) AND dd.next_attempt_at <= now() AND c.enabled
-ORDER BY dd.id
-FOR UPDATE OF dd SKIP LOCKED
-LIMIT $4`,
-		args: []any{channelID, NotifyStatePending, NotifyStateSending, limit},
-	}, func(tx *sql.Tx, ids []int64) error {
+	out, err := d.claimDeliveries(ctx, channelID, limit, lease, "", func(tx *sql.Tx, ids []int64) error {
 		batchID := ids[0]
 		for _, id := range ids {
 			if id < batchID {
 				batchID = id
 			}
 		}
-		ph, idArgs := placeholders(2, ids)
-		_, err := tx.ExecContext(ctx, `UPDATE notification_deliveries SET batch_id = COALESCE(batch_id, $1)
+		ph, idArgs := markList(ids)
+		_, err := tx.ExecContext(ctx, `UPDATE notification_deliveries SET batch_id = COALESCE(batch_id, ?)
 WHERE id IN (`+ph+`)`, append([]any{batchID}, idArgs...)...)
 		return err
 	})
 	return out, err
 }
 
-// claimDeliveries 执行「选取 + 置 sending 延长租约 + 读取完整行」，全在一个事务里。
-// postClaim 是可选的附加步骤（汇总批次用它写入 batch_id）。
-func (d *DB) claimDeliveries(ctx context.Context, lease time.Duration, cq claimQuery, postClaim func(*sql.Tx, []int64) error) ([]*NotificationDelivery, error) {
+// claimDeliveries 是两阶段 CAS 抢占的公共实现：
+//
+//	渠道闸门（启用 + 模式）→ 事务 → 阶段 1 有界候选锁定 → 阶段 2 原子置 sending
+//	并写下租约截止时间 → 可选的批次盖章 → 回读完整行 → 提交。
+//
+// mode 传空串表示「不限模式，只要渠道启用」（汇总领取）；realtime 领取必须精确
+// 匹配 realtime。渠道闸门刻意**放在事务外**：它只是一次存在性/配置读取，
+// 放进事务里会让阶段 1 的行锁多跨一次往返，白白延长锁持有时间。
+// 停用渠道与领取并发时，这道闸门就是「已停用渠道的存量投递一条都不会被发出去」
+// 的保证（停用操作本身已把存量置为 skipped，这里是第二道闸）。
+//
+// postClaim 是可选的附加步骤（汇总批次用它写 batch_id），仍在同一事务、
+// 同一批行锁之内。
+func (d *DB) claimDeliveries(
+	ctx context.Context,
+	channelID int64,
+	limit int,
+	lease time.Duration,
+	mode string,
+	postClaim func(*sql.Tx, []int64) error,
+) ([]*NotificationDelivery, error) {
+	claimable, err := d.deliveryChannelClaimable(ctx, channelID, mode)
+	if err != nil || !claimable {
+		return nil, err
+	}
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
 
-	ids, err := selectForClaim(ctx, tx, cq.sql, cq.args...)
+	ids, err := selectClaimCandidates(ctx, tx, channelID, limit)
 	if err != nil {
 		return nil, err
 	}
 	if len(ids) == 0 {
 		return nil, tx.Commit()
-	}
-	// 置 sending 并把 next_attempt_at 推到未来：这个未来时刻即租约到期时间，
-	// 「租约未到期」与「未到重试时间」因此共用同一个条件表达，不需要新增列。
-	ph, idArgs := placeholders(3, ids)
-	if _, err := tx.ExecContext(ctx, `UPDATE notification_deliveries
-SET state=$1, attempts=attempts+1, next_attempt_at=now()+make_interval(secs => $2)
-WHERE id IN (`+ph+`)`,
-		append([]any{NotifyStateSending, lease.Seconds()}, idArgs...)...); err != nil {
+	} // 阶段 2：assignedDeadline 即本次领取的代次，提交后随投递结果一起被带回。
+	assignedDeadline := deliveryClockAt(lease)
+	ph, idArgs := markList(ids)
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(claimAssignQuery, ph), append([]any{assignedDeadline}, idArgs...)...)
+	if err != nil {
 		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, err
+	} else if n != int64(len(ids)) {
+		// 行锁在手，候选行只可能已经被删掉（渠道级联删除）。这不是可以忽略的偏差：
+		// 少更新的那几行会被永久遗留在 sending，fail-closed 让下一轮从头重领。
+		return nil, fmt.Errorf("CAS 抢占投递：候选 %d 行，实际置 sending %d 行", len(ids), n)
 	}
 	if postClaim != nil {
 		if err := postClaim(tx, ids); err != nil {
@@ -243,17 +306,49 @@ WHERE id IN (`+ph+`)`,
 	return out, tx.Commit()
 }
 
-func selectForClaim(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]int64, error) {
-	rows, err := tx.QueryContext(ctx, query, args...)
+// deliveryChannelClaimable 报告该渠道现在能不能领投递：必须存在、启用，
+// 且（给定 mode 时）模式匹配。渠道不存在按「不可领」处理而不是报错——
+// 渠道被删掉与被停用对投递引擎是同一件事。
+func (d *DB) deliveryChannelClaimable(ctx context.Context, channelID int64, mode string) (bool, error) {
+	var (
+		enabled bool
+		current string
+	)
+	err := d.QueryRowContext(ctx, `SELECT enabled, mode FROM notification_channels WHERE id = ?`, channelID).
+		Scan(&enabled, &current)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return enabled && (mode == "" || current == mode), nil
+}
+
+// selectClaimCandidates 执行阶段 1，返回按 id 升序的候选主键。
+//
+// 三个阶段列都扫出来是刻意的：`SELECT id, channel_id, attempts` 是契约语句
+// （attempts 让排查「这条投递为什么被判失败」时不必回查），而 channel_id
+// 回读后立刻比对一次——阶段 2 会拿这批 id 直接改状态，捞到别的渠道的行
+// 是一次必须当场炸出来的事故，不是可以留到日志里的异常。
+func selectClaimCandidates(ctx context.Context, tx *sql.Tx, channelID int64, limit int) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, claimCandidateQuery, channelID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var ids []int64
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var (
+			id         int64
+			rowChannel int64
+			attempts   int
+		)
+		if err := rows.Scan(&id, &rowChannel, &attempts); err != nil {
 			return nil, err
+		}
+		if rowChannel != channelID {
+			return nil, fmt.Errorf("CAS 抢占候选行 %d 属于渠道 %d，与请求渠道 %d 不符", id, rowChannel, channelID)
 		}
 		ids = append(ids, id)
 	}
@@ -261,7 +356,7 @@ func selectForClaim(ctx context.Context, tx *sql.Tx, query string, args ...any) 
 }
 
 func loadDeliveriesTx(ctx context.Context, tx *sql.Tx, ids []int64) ([]*NotificationDelivery, error) {
-	ph, args := placeholders(1, ids)
+	ph, args := markList(ids)
 	rows, err := tx.QueryContext(ctx, joinedDeliveryQuery+` WHERE d.id IN (`+ph+`) ORDER BY d.id`, args...)
 	if err != nil {
 		return nil, err
@@ -278,34 +373,51 @@ func loadDeliveriesTx(ctx context.Context, tx *sql.Tx, ids []int64) ([]*Notifica
 	return out, rows.Err()
 }
 
-// MarkDeliveriesSent 把一批投递标记为已送达。
-func (d *DB) MarkDeliveriesSent(ctx context.Context, ids []int64) error {
-	ph, args := placeholders(2, ids)
-	if len(args) == 0 {
-		return nil
+// fencedDeliveryUpdate 是四类回填的唯一出口：任何推进投递状态机的写都必须带着
+// 自己的租约令牌（leaseDeadline）过这道 fence。
+//
+// 影响行数原样返回，因为「0 行」是**正常且有信息量**的结果：它说明本行已经被
+// 下一个 worker 领走，本次回填是一次迟到的 ACK，应当丢弃而不是把新租约覆盖掉。
+func (d *DB) fencedDeliveryUpdate(ctx context.Context, setClause string, setArgs []any, ids []int64, leaseDeadline time.Time) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
 	}
-	_, err := d.ExecContext(ctx, `UPDATE notification_deliveries
-SET state=$1, sent_at=now(), last_error='' WHERE id IN (`+ph+`)`, append([]any{NotifyStateSent}, args...)...)
-	return err
+	ph, idArgs := markList(ids)
+	query := "UPDATE notification_deliveries SET " + setClause + " WHERE " + deliveryLeaseFence + " AND id IN (" + ph + ")"
+	args := make([]any, 0, len(setArgs)+1+len(idArgs))
+	args = append(args, setArgs...)
+	args = append(args, leaseDeadline.UTC().Truncate(time.Millisecond))
+	args = append(args, idArgs...)
+	res, err := d.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
-// RescheduleDeliveries 把一批投递退回 pending 并推后重试时间。
+// MarkDeliveriesSent 把一批投递标记为已送达，返回真正被推进的行数。
+//
+// leaseDeadline 必须是这批投递**领取时拿到的那份**租约截止时间；带旧令牌调用
+// 只会得到 0 行（本行已归别人），不会覆盖新租约。
+func (d *DB) MarkDeliveriesSent(ctx context.Context, ids []int64, leaseDeadline time.Time) (int64, error) {
+	return d.fencedDeliveryUpdate(ctx,
+		"state = '"+NotifyStateSent+"', sent_at = NOW(3), last_error = ''",
+		nil, ids, leaseDeadline)
+}
+
+// RescheduleDeliveries 把一批投递退回 pending 并推后重试时间，返回真正被推进的行数。
 //
 // 退回 pending 而不是引入新的中间状态，是为了让「还剩几次机会」只由一个地方
 // 表达（MaxNotifyAttempts），避免状态机的分支随重试策略膨胀。
-func (d *DB) RescheduleDeliveries(ctx context.Context, ids []int64, delay time.Duration, errMsg string) error {
-	ph, args := placeholders(4, ids)
-	if len(args) == 0 {
-		return nil
-	}
-	_, err := d.ExecContext(ctx, `UPDATE notification_deliveries
-SET state=$1, next_attempt_at=now()+make_interval(secs => $2), last_error=$3
-WHERE id IN (`+ph+`)`,
-		append([]any{NotifyStatePending, delay.Seconds(), truncateNotifyError(errMsg)}, args...)...)
-	return err
+// attempts 保留领取时 +1 的那一次——重排就是失败重试。
+func (d *DB) RescheduleDeliveries(ctx context.Context, ids []int64, leaseDeadline time.Time, delay time.Duration, errMsg string) (int64, error) {
+	return d.fencedDeliveryUpdate(ctx,
+		"state = '"+NotifyStatePending+"', next_attempt_at = ?, last_error = ?",
+		[]any{deliveryClockAt(delay), truncateNotifyError(errMsg)}, ids, leaseDeadline)
 }
 
-// DeferDeliveries 把一批投递退回 pending、立即可再领，并**撤销领取时计的那一次尝试**。
+// DeferDeliveries 把一批投递退回 pending、立即可再领，并**撤销领取时计的那一次尝试**，
+// 返回真正被推进的行数。
 //
 // 用途只有一个：汇总消息按渠道长度上限分段发送时，没装进本条的条目要留到下一批。
 // 那不是失败，所以不该消耗重试预算——领取时 attempts 已经乐观地 +1 了，
@@ -314,37 +426,30 @@ WHERE id IN (`+ph+`)`,
 //
 // GREATEST(...,0) 兜住「有人手工重发把 attempts 清零后又走到这里」的情况，
 // 不让计数变成负数。
-func (d *DB) DeferDeliveries(ctx context.Context, ids []int64, reason string) error {
-	ph, args := placeholders(3, ids)
-	if len(args) == 0 {
-		return nil
-	}
-	_, err := d.ExecContext(ctx, `UPDATE notification_deliveries
-SET state=$1, attempts=GREATEST(attempts-1, 0), next_attempt_at=now(), last_error=$2
-WHERE id IN (`+ph+`)`,
-		append([]any{NotifyStatePending, truncateNotifyError(reason)}, args...)...)
-	return err
+func (d *DB) DeferDeliveries(ctx context.Context, ids []int64, leaseDeadline time.Time, reason string) (int64, error) {
+	return d.fencedDeliveryUpdate(ctx,
+		"state = '"+NotifyStatePending+"', attempts = GREATEST(attempts - 1, 0), next_attempt_at = ?, last_error = ?",
+		[]any{deliveryClockAt(0), truncateNotifyError(reason)}, ids, leaseDeadline)
 }
 
-// FailDeliveries 把一批投递标记为最终失败，等待人工在投递历史里重发。
-func (d *DB) FailDeliveries(ctx context.Context, ids []int64, errMsg string) error {
-	// 占位符从 $3 开始：$1 是 state、$2 是 last_error。
-	ph, args := placeholders(3, ids)
-	if len(args) == 0 {
-		return nil
-	}
-	_, err := d.ExecContext(ctx, `UPDATE notification_deliveries SET state=$1, last_error=$2 WHERE id IN (`+ph+`)`,
-		append([]any{NotifyStateFailed, truncateNotifyError(errMsg)}, args...)...)
-	return err
+// FailDeliveries 把一批投递标记为最终失败，等待人工在投递历史里重发，
+// 返回真正被推进的行数。
+func (d *DB) FailDeliveries(ctx context.Context, ids []int64, leaseDeadline time.Time, errMsg string) (int64, error) {
+	return d.fencedDeliveryUpdate(ctx,
+		"state = '"+NotifyStateFailed+"', last_error = ?",
+		[]any{truncateNotifyError(errMsg)}, ids, leaseDeadline)
 }
 
 // RetryNotificationDelivery 手动重发一条投递：重置为 pending、清零重试计数、
 // 立即到期。清计数是刻意的——人工点「重发」意味着前几次失败的原因已被处理，
 // 再拿旧计数限制它没有道理。
+//
+// 这条 UPDATE 刻意**不带**租约 fencing：它作用于终态（failed/skipped），发起者是
+// 拿着屏幕上的记录点按钮的人，不是某个持有租约的 worker。
 func (d *DB) RetryNotificationDelivery(ctx context.Context, id int64) error {
 	res, err := d.ExecContext(ctx, `UPDATE notification_deliveries
-SET state=$2, attempts=0, next_attempt_at=now(), last_error=''
-WHERE id=$1 AND state IN ($3,$4)`, id, NotifyStatePending, NotifyStateFailed, NotifyStateSkipped)
+SET state = ?, attempts = 0, next_attempt_at = NOW(3), last_error = ''
+WHERE id = ? AND state IN (?, ?)`, NotifyStatePending, id, NotifyStateFailed, NotifyStateSkipped)
 	if err != nil {
 		return err
 	}
@@ -366,15 +471,15 @@ func (f NotificationDeliveryFilter) where() (string, []any) {
 	var args []any
 	if f.ChannelID > 0 {
 		args = append(args, f.ChannelID)
-		conds = append(conds, fmt.Sprintf("d.channel_id=$%d", len(args)))
+		conds = append(conds, "d.channel_id = ?")
 	}
 	if f.State != "" {
 		args = append(args, f.State)
-		conds = append(conds, fmt.Sprintf("d.state=$%d", len(args)))
+		conds = append(conds, "d.state = ?")
 	}
 	if f.EventKind != "" {
 		args = append(args, f.EventKind)
-		conds = append(conds, fmt.Sprintf("e.kind=$%d", len(args)))
+		conds = append(conds, "e.kind = ?")
 	}
 	if len(conds) == 0 {
 		return "", nil
@@ -398,8 +503,7 @@ JOIN notification_events e ON e.id = d.event_id`+where, args...).Scan(&total); e
 		return nil, 0, err
 	}
 
-	q := fmt.Sprintf("%s%s ORDER BY d.id DESC LIMIT $%d OFFSET $%d",
-		joinedDeliveryQuery, where, len(args)+1, len(args)+2)
+	q := fmt.Sprintf("%s%s ORDER BY d.id DESC LIMIT ?, ?", joinedDeliveryQuery, where)
 	rows, err := d.QueryContext(ctx, q, append(args, pageSize, (page-1)*pageSize)...)
 	if err != nil {
 		return nil, 0, err
@@ -433,14 +537,14 @@ func truncateNotifyError(msg string) string {
 
 func isUTF8Start(b byte) bool { return b&0xC0 != 0x80 }
 
-// placeholders 生成从 start 开始的 $n 占位串及对应参数，供 IN (...) 使用。
-// 例如 start=3, ids=[7,8] → "$3,$4", [7,8]。
-func placeholders(start int, ids []int64) (string, []any) {
+// markList 生成 IN (...) 用的 `?` 占位串与实参表（TiDB/MySQL 只认 `?`）。
+// 例如 ids=[7,8] → "?, ?", [7,8]。
+func markList(ids []int64) (string, []any) {
 	ph := make([]string, 0, len(ids))
 	args := make([]any, 0, len(ids))
-	for i, id := range ids {
-		ph = append(ph, fmt.Sprintf("$%d", start+i))
+	for _, id := range ids {
+		ph = append(ph, "?")
 		args = append(args, id)
 	}
-	return strings.Join(ph, ","), args
+	return strings.Join(ph, ", "), args
 }

@@ -393,11 +393,11 @@ func TestDigestBatchDueAndStableBatchID(t *testing.T) {
 	for _, dl := range batch {
 		allIDs = append(allIDs, dl.ID)
 	}
-	if err := d.RescheduleDeliveries(ctx, allIDs, time.Second, "模拟失败"); err != nil {
-		t.Fatal(err)
+	if n, err := d.RescheduleDeliveries(ctx, allIDs, batch[0].NextAttemptAt, time.Second, "模拟失败"); err != nil || n != int64(len(allIDs)) {
+		t.Fatalf("整批重排应影响 %d 行，得到 n=%d err=%v", len(allIDs), n, err)
 	}
 	// 把租约推到过去，模拟退避时间已到。
-	if _, err := d.Exec(`UPDATE notification_deliveries SET next_attempt_at = now() - interval '1 minute' WHERE channel_id=$1`, ch.ID); err != nil {
+	if _, err := d.Exec(`UPDATE notification_deliveries SET next_attempt_at = DATE_SUB(NOW(3), INTERVAL 1 MINUTE) WHERE channel_id = ?`, ch.ID); err != nil {
 		t.Fatal(err)
 	}
 	reclaimed, err := d.ClaimDigestBatch(ctx, ch.ID, MaxDigestBatchSize, time.Minute)
@@ -425,22 +425,36 @@ func TestDeliveryStateTransitions(t *testing.T) {
 		t.Fatalf("领取失败: %v (%d)", err, len(got))
 	}
 	id := got[0].ID
+	leaseA := got[0].NextAttemptAt
 
-	if err := d.RescheduleDeliveries(ctx, []int64{id}, time.Second, "网络抖动"); err != nil {
-		t.Fatal(err)
+	if n, err := d.RescheduleDeliveries(ctx, []int64{id}, leaseA, time.Second, "网络抖动"); err != nil || n != 1 {
+		t.Fatalf("带当前租约令牌重排应影响 1 行，得到 n=%d err=%v", n, err)
 	}
 	var state, lastErr string
-	if err := d.QueryRow(`SELECT state, last_error FROM notification_deliveries WHERE id=$1`, id).Scan(&state, &lastErr); err != nil {
+	if err := d.QueryRow(`SELECT state, last_error FROM notification_deliveries WHERE id = ?`, id).Scan(&state, &lastErr); err != nil {
 		t.Fatal(err)
 	}
 	if state != NotifyStatePending || lastErr != "网络抖动" {
 		t.Fatalf("重排后应为 pending 并记录原因，得到 state=%s err=%q", state, lastErr)
 	}
 
-	if err := d.FailDeliveries(ctx, []int64{id}, "重试耗尽"); err != nil {
+	// 代次 Fencing：重排已让行离开 sending，旧令牌再回填必须 0 行。
+	if n, err := d.FailDeliveries(ctx, []int64{id}, leaseA, "过期令牌"); err != nil || n != 0 {
+		t.Fatalf("旧租约令牌判失败应影响 0 行，得到 n=%d err=%v", n, err)
+	}
+
+	// 继续推进状态机必须先重新领取，拿到**新**一代租约令牌：把退避时间推到已过。
+	if _, err := d.Exec(`UPDATE notification_deliveries SET next_attempt_at = DATE_SUB(NOW(3), INTERVAL 1 MINUTE) WHERE id = ?`, id); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.QueryRow(`SELECT state FROM notification_deliveries WHERE id=$1`, id).Scan(&state); err != nil {
+	claimed, err := d.ClaimRealtimeDeliveries(ctx, ch.ID, 10, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("退避到期后重领失败: %v (%d)", err, len(claimed))
+	}
+	if n, err := d.FailDeliveries(ctx, []int64{id}, claimed[0].NextAttemptAt, "重试耗尽"); err != nil || n != 1 {
+		t.Fatalf("新租约令牌判失败应影响 1 行，得到 n=%d err=%v", n, err)
+	}
+	if err := d.QueryRow(`SELECT state FROM notification_deliveries WHERE id = ?`, id).Scan(&state); err != nil {
 		t.Fatal(err)
 	}
 	if state != NotifyStateFailed {
@@ -453,7 +467,7 @@ func TestDeliveryStateTransitions(t *testing.T) {
 	}
 	var attempts int
 	var next time.Time
-	if err := d.QueryRow(`SELECT state, attempts, next_attempt_at FROM notification_deliveries WHERE id=$1`, id).Scan(&state, &attempts, &next); err != nil {
+	if err := d.QueryRow(`SELECT state, attempts, next_attempt_at FROM notification_deliveries WHERE id = ?`, id).Scan(&state, &attempts, &next); err != nil {
 		t.Fatal(err)
 	}
 	if state != NotifyStatePending || attempts != 0 {
@@ -463,9 +477,13 @@ func TestDeliveryStateTransitions(t *testing.T) {
 		t.Fatal("重发应立即可领")
 	}
 
-	// 已送达的投递不应能被重发。
-	if err := d.MarkDeliveriesSent(ctx, []int64{id}); err != nil {
-		t.Fatal(err)
+	// 已送达的投递不应能被重发：先领取拿新令牌，再前进为 sent。
+	sent, err := d.ClaimRealtimeDeliveries(ctx, ch.ID, 10, time.Minute)
+	if err != nil || len(sent) != 1 {
+		t.Fatalf("重发后领取失败: %v (%d)", err, len(sent))
+	}
+	if n, err := d.MarkDeliveriesSent(ctx, []int64{id}, sent[0].NextAttemptAt); err != nil || n != 1 {
+		t.Fatalf("标记已送达应影响 1 行，得到 n=%d err=%v", n, err)
 	}
 	if err := d.RetryNotificationDelivery(ctx, id); err == nil {
 		t.Fatal("已送达的投递不该允许重发")

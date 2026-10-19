@@ -192,14 +192,14 @@ func (n *Notifier) stepRealtime(ctx context.Context, ch *db.NotificationChannel,
 	}
 	channel, cfg, ok := n.adapt(ch)
 	if !ok {
-		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), fmt.Sprintf("渠道类型 %q 未注册", ch.Kind))
+		n.failLease(ctx, ch.Kind, deliveries, fmt.Sprintf("渠道类型 %q 未注册", ch.Kind))
 		return
 	}
 	for _, dl := range deliveries {
 		msg, err := n.renderSingle(ctx, dl, baseURL)
 		if err != nil {
 			// 渲染失败是本地数据问题，重试不会变好。
-			_ = n.pg.FailDeliveries(ctx, []int64{dl.ID}, err.Error())
+			n.failLease(ctx, ch.Kind, []*db.NotificationDelivery{dl}, err.Error())
 			continue
 		}
 		n.send(ctx, channel, cfg, msg, []*db.NotificationDelivery{dl})
@@ -227,22 +227,19 @@ func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, a
 	}
 	channel, cfg, ok := n.adapt(ch)
 	if !ok {
-		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), fmt.Sprintf("渠道类型 %q 未注册", ch.Kind))
+		n.failLease(ctx, ch.Kind, deliveries, fmt.Sprintf("渠道类型 %q 未注册", ch.Kind))
 		return
 	}
 	msg, included, err := n.renderBatch(ctx, deliveries, baseURL, int(window.Minutes()))
 	if err != nil {
-		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), err.Error())
+		n.failLease(ctx, ch.Kind, deliveries, err.Error())
 		return
 	}
 	// 快照坏掉、没能进消息的那些投递要显式判失败。不这么做的话它们会留在
 	// included 之外、既不进消息也不进失败列表——发送成功时它们的状态会被
 	// 之后的批量标记漏掉，永远停在 sending 直到租约过期被反复领取。
 	if skipped := excludeDeliveries(deliveries, included); len(skipped) > 0 {
-		reason := "事件快照无法解析，本条漏洞无法渲染成消息"
-		if fErr := n.pg.FailDeliveries(ctx, deliveryIDs(skipped), reason); fErr != nil {
-			log.Printf("[notify] 标记坏快照投递失败 channel=%s ids=%v: %v", ch.Kind, deliveryIDs(skipped), fErr)
-		}
+		n.failLease(ctx, ch.Kind, skipped, "事件快照无法解析，本条漏洞无法渲染成消息")
 		log.Printf("[notify] 跳过 %d 条快照无法解析的投递 channel=%d", len(skipped), ch.ID)
 	}
 	// 只把进了消息的那些交给 send：included[i] 与 msg.Items[i] 严格对应，
@@ -272,17 +269,13 @@ func (n *Notifier) send(ctx context.Context, channel notify.Channel, cfg map[str
 			delivered = len(deliveries)
 		}
 		sent, rest := deliveries[:delivered], deliveries[delivered:]
-		if err := n.pg.MarkDeliveriesSent(ctx, deliveryIDs(sent)); err != nil {
-			log.Printf("[notify] 标记已送达失败 channel=%s ids=%v: %v", channel.Kind(), deliveryIDs(sent), err)
-		}
+		n.markSentLease(ctx, channel.Kind(), sent)
 		if len(rest) > 0 {
 			// 本条消息已达渠道长度上限：剩下的立刻回队，由下一个 tick 续发。
 			// 用 DeferDeliveries 而非 RescheduleDeliveries —— 这不是失败，
 			// 不该消耗重试预算（领取时已经乐观 +1 了，那里会减回去）。
-			if err := n.pg.DeferDeliveries(ctx, deliveryIDs(rest),
-				fmt.Sprintf("本条消息已达渠道长度上限，仅送达前 %d 条，其余留待下一批", delivered)); err != nil {
-				log.Printf("[notify] 分段续发排队失败 channel=%s ids=%v: %v", channel.Kind(), deliveryIDs(rest), err)
-			}
+			n.deferLease(ctx, channel.Kind(), rest,
+				fmt.Sprintf("本条消息已达渠道长度上限，仅送达前 %d 条，其余留待下一批", delivered))
 		}
 		return
 	}
@@ -299,41 +292,35 @@ func (n *Notifier) send(ctx context.Context, channel notify.Channel, cfg map[str
 	// 全新的投递（attempts=1）一起拖进 failed——新漏洞一条重试都没用上就永久丢了，
 	// 与「不让老行拖新行下水」的初衷正好相反。
 	permanent := notify.IsPermanent(err)
-	var failIDs, exhaustedIDs []int64
-	byDelay := map[time.Duration][]int64{}
+	var failDels, exhaustedDels []*db.NotificationDelivery
+	byDelay := map[time.Duration][]*db.NotificationDelivery{}
 	for _, dl := range deliveries {
 		switch {
 		case permanent:
-			failIDs = append(failIDs, dl.ID)
+			failDels = append(failDels, dl)
 		case dl.Attempts >= db.MaxNotifyAttempts:
-			exhaustedIDs = append(exhaustedIDs, dl.ID)
+			exhaustedDels = append(exhaustedDels, dl)
 		default:
 			delay := notifyBackoff[min(dl.Attempts, len(notifyBackoff)-1)]
-			byDelay[delay] = append(byDelay[delay], dl.ID)
+			byDelay[delay] = append(byDelay[delay], dl)
 		}
 	}
 
-	if len(failIDs) > 0 {
-		if fErr := n.pg.FailDeliveries(ctx, failIDs, err.Error()); fErr != nil {
-			log.Printf("[notify] 标记失败状态出错 channel=%s ids=%v: %v", channel.Kind(), failIDs, fErr)
-		}
+	if len(failDels) > 0 {
+		n.failLease(ctx, channel.Kind(), failDels, err.Error())
 	}
-	if len(exhaustedIDs) > 0 {
+	if len(exhaustedDels) > 0 {
 		reason := fmt.Sprintf("重试 %d 次后仍失败: %s", db.MaxNotifyAttempts, err)
-		if fErr := n.pg.FailDeliveries(ctx, exhaustedIDs, reason); fErr != nil {
-			log.Printf("[notify] 标记失败状态出错 channel=%s ids=%v: %v", channel.Kind(), exhaustedIDs, fErr)
-		}
+		n.failLease(ctx, channel.Kind(), exhaustedDels, reason)
 	}
 	// 按延迟分组重排：只有 3 档退避，分组数天然很小，不必为每条单独发一次
 	// UPDATE（那会让一个 500 条的批次产生 500 次往返）。
 	for delay, group := range byDelay {
-		if rErr := n.pg.RescheduleDeliveries(ctx, group, delay, err.Error()); rErr != nil {
-			log.Printf("[notify] 重排投递失败 channel=%s ids=%v: %v", channel.Kind(), group, rErr)
-		}
+		n.rescheduleLease(ctx, channel.Kind(), group, delay, err.Error())
 	}
-	if len(failIDs)+len(exhaustedIDs) > 0 {
+	if len(failDels)+len(exhaustedDels) > 0 {
 		log.Printf("[notify] 投递失败 channel=%d kind=%s 永久失败=%d 重试耗尽=%d 待重试=%d: %s",
-			deliveries[0].ChannelID, channel.Kind(), len(failIDs), len(exhaustedIDs), len(byDelay), err)
+			deliveries[0].ChannelID, channel.Kind(), len(failDels), len(exhaustedDels), len(byDelay), err)
 	}
 }
 
@@ -532,12 +519,94 @@ func parseSnapshot(dl *db.NotificationDelivery) (notify.Snapshot, error) {
 	return snap, nil
 }
 
-func deliveryIDs(deliveries []*db.NotificationDelivery) []int64 {
-	out := make([]int64, 0, len(deliveries))
+// leaseBatch 是「同一个租约代次」下的一批投递 id。
+//
+// 一次领取（ClaimRealtimeDeliveries / ClaimDigestBatch）给整批行分配**同一个**
+// 租约截止时间，回填时必须把那个截止时间原样带回去（db 层的代次 fencing 令牌，
+// 见 db/notification_delivery.go）。按令牌分组是刻意的：一条 UPDATE 只能带一个
+// 令牌，把不同批次混进同一条回填会让整批都被判成迟到 ACK，白丢一整批进度。
+type leaseBatch struct {
+	token time.Time
+	ids   []int64
+}
+
+// deliveriesByLease 按租约代次给投递分组。正常只有一组（同一次领取），
+// 但分组写法让「拿错令牌的批次」在结构上不可能发生。
+func deliveriesByLease(deliveries []*db.NotificationDelivery) []leaseBatch {
+	idx := map[time.Time]int{}
+	out := make([]leaseBatch, 0, 1)
 	for _, dl := range deliveries {
-		out = append(out, dl.ID)
+		token := dl.LeaseToken()
+		i, ok := idx[token]
+		if !ok {
+			i = len(out)
+			idx[token] = i
+			out = append(out, leaseBatch{token: token})
+		}
+		out[i].ids = append(out[i].ids, dl.ID)
 	}
 	return out
+}
+
+// logLeaseRejected 把「回填被租约 fencing 拦下」变成一条可读日志。
+//
+// affected < len(ids) 意味着这些行在投递期间已经易主：租约到期后被另一个 worker
+// 领走并拿到了新截止时间。此时丢弃本次回填是**正确**行为——对方正按自己的租约
+// 处理这些行，覆盖回去就是重复推送 + attempts 双计 + 把对方的终态改回旧终态。
+func logLeaseRejected(action, kind string, batch leaseBatch, affected int64) {
+	if affected == int64(len(batch.ids)) {
+		return
+	}
+	log.Printf("[notify] %s 被租约 fencing 拦下 %d/%d 条 channel=%s token=%s（租约已易主，迟到回填已丢弃）ids=%v",
+		action, int64(len(batch.ids))-affected, len(batch.ids), kind,
+		batch.token.Format("2006-01-02T15:04:05.000Z07:00"), batch.ids)
+}
+
+// 四个带租约令牌的回填出口：所有状态流转都必须经它们出去，
+// 于是「忘记带令牌」在投递引擎里不可能发生。
+
+func (n *Notifier) markSentLease(ctx context.Context, kind string, deliveries []*db.NotificationDelivery) {
+	for _, batch := range deliveriesByLease(deliveries) {
+		affected, err := n.pg.MarkDeliveriesSent(ctx, batch.ids, batch.token)
+		if err != nil {
+			log.Printf("[notify] 标记已送达失败 channel=%s ids=%v: %v", kind, batch.ids, err)
+			continue
+		}
+		logLeaseRejected("标记已送达", kind, batch, affected)
+	}
+}
+
+func (n *Notifier) deferLease(ctx context.Context, kind string, deliveries []*db.NotificationDelivery, reason string) {
+	for _, batch := range deliveriesByLease(deliveries) {
+		affected, err := n.pg.DeferDeliveries(ctx, batch.ids, batch.token, reason)
+		if err != nil {
+			log.Printf("[notify] 分段续发排队失败 channel=%s ids=%v: %v", kind, batch.ids, err)
+			continue
+		}
+		logLeaseRejected("分段续发排队", kind, batch, affected)
+	}
+}
+
+func (n *Notifier) failLease(ctx context.Context, kind string, deliveries []*db.NotificationDelivery, reason string) {
+	for _, batch := range deliveriesByLease(deliveries) {
+		affected, err := n.pg.FailDeliveries(ctx, batch.ids, batch.token, reason)
+		if err != nil {
+			log.Printf("[notify] 标记失败状态出错 channel=%s ids=%v: %v", kind, batch.ids, err)
+			continue
+		}
+		logLeaseRejected("标记失败状态", kind, batch, affected)
+	}
+}
+
+func (n *Notifier) rescheduleLease(ctx context.Context, kind string, deliveries []*db.NotificationDelivery, delay time.Duration, reason string) {
+	for _, batch := range deliveriesByLease(deliveries) {
+		affected, err := n.pg.RescheduleDeliveries(ctx, batch.ids, batch.token, delay, reason)
+		if err != nil {
+			log.Printf("[notify] 重排投递失败 channel=%s ids=%v: %v", kind, batch.ids, err)
+			continue
+		}
+		logLeaseRejected("重排投递", kind, batch, affected)
+	}
 }
 
 func trimTrailingSlash(s string) string {
