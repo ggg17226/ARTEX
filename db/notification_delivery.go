@@ -280,7 +280,9 @@ func (d *DB) claimDeliveries(
 	}
 	if len(ids) == 0 {
 		return nil, tx.Commit()
-	} // 阶段 2：assignedDeadline 即本次领取的代次，提交后随投递结果一起被带回。
+	}
+
+	// 阶段 2：assignedDeadline 即本次领取的代次，提交后随投递结果一起被带回。
 	assignedDeadline := deliveryClockAt(lease)
 	ph, idArgs := markList(ids)
 	res, err := tx.ExecContext(ctx, fmt.Sprintf(claimAssignQuery, ph), append([]any{assignedDeadline}, idArgs...)...)
@@ -503,7 +505,7 @@ JOIN notification_events e ON e.id = d.event_id`+where, args...).Scan(&total); e
 		return nil, 0, err
 	}
 
-	q := fmt.Sprintf("%s%s ORDER BY d.id DESC LIMIT ?, ?", joinedDeliveryQuery, where)
+	q := fmt.Sprintf("%s%s ORDER BY d.id DESC LIMIT ? OFFSET ?", joinedDeliveryQuery, where)
 	rows, err := d.QueryContext(ctx, q, append(args, pageSize, (page-1)*pageSize)...)
 	if err != nil {
 		return nil, 0, err

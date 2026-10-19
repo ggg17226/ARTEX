@@ -966,20 +966,26 @@ func ndqIntegrationFixture(t *testing.T, d *DB, evFindingID int64) (int64, int64
 	if err != nil {
 		t.Fatalf("SaveNotificationChannel failed: %v", err)
 	}
+	t.Cleanup(func() {
+		if _, err := d.ExecContext(ctx, "DELETE FROM notification_deliveries WHERE channel_id = ?", chID); err != nil {
+			t.Errorf("cleanup channel deliveries failed: %v", err)
+		}
+		if _, err := d.ExecContext(ctx, "DELETE FROM notification_channels WHERE id = ?", chID); err != nil {
+			t.Errorf("cleanup notification_channels failed: %v", err)
+		}
+	})
+
 	evID, err := d.AddNotificationEvent(ctx, notify.EventFindingCreated, evFindingID,
 		notify.Snapshot{Severity: "high", VulnClass: "XSS"})
 	if err != nil {
 		t.Fatalf("AddNotificationEvent failed: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := d.ExecContext(ctx, "DELETE FROM notification_deliveries WHERE channel_id = ? OR event_id = ?", chID, evID); err != nil {
-			t.Errorf("cleanup channel deliveries failed: %v", err)
+		if _, err := d.ExecContext(ctx, "DELETE FROM notification_deliveries WHERE event_id = ?", evID); err != nil {
+			t.Errorf("cleanup event deliveries failed: %v", err)
 		}
 		if _, err := d.ExecContext(ctx, "DELETE FROM notification_events WHERE id = ?", evID); err != nil {
 			t.Errorf("cleanup notification_events failed: %v", err)
-		}
-		if _, err := d.ExecContext(ctx, "DELETE FROM notification_channels WHERE id = ?", chID); err != nil {
-			t.Errorf("cleanup notification_channels failed: %v", err)
 		}
 		var delCount, eventCount, chCount int
 		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_deliveries WHERE channel_id = ? OR event_id = ?", chID, evID).Scan(&delCount); err != nil {

@@ -166,15 +166,20 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		}
 		return id, nil
 	}
-	res, err := d.ExecContext(ctx, `UPDATE notification_channels
+	// 先核验渠道真实存在，解耦存在性与 changed rows（解决相同配置保存/重复启停问题，闭环 F03）
+	var exists int
+	if err := d.QueryRowContext(ctx, `SELECT 1 FROM notification_channels WHERE id = ?`, c.ID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotificationChannelNotFound
+		}
+		return 0, err
+	}
+	_, err := d.ExecContext(ctx, `UPDATE notification_channels
 SET name = ?, kind = ?, enabled = ?, config = ?, mode = ?, filter = ?, rate_per_min = ?
 WHERE id = ?`,
 		c.Name, c.Kind, enabled, string(c.Config), c.Mode, string(c.Filter), c.RatePerMin, c.ID)
 	if err != nil {
 		return 0, err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return 0, ErrNotificationChannelNotFound
 	}
 	return c.ID, nil
 }
@@ -185,12 +190,15 @@ WHERE id = ?`,
 // 会突然收到一批「停用期间积压」的旧漏洞，时效已失且容易误判为新增。
 func (d *DB) SetNotificationChannelEnabled(ctx context.Context, id int64, enabled bool) error {
 	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE notification_channels SET enabled = ? WHERE id = ?`, enabled, id)
-		if err != nil {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_channels WHERE id = ? FOR UPDATE`, id).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotificationChannelNotFound
+			}
 			return err
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return ErrNotificationChannelNotFound
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_channels SET enabled = ? WHERE id = ?`, enabled, id); err != nil {
+			return err
 		}
 		if !enabled {
 			if _, err := tx.ExecContext(ctx, `UPDATE notification_deliveries SET state = ?, last_error = ?
@@ -292,8 +300,8 @@ func (d *DB) AddNotificationEvent(ctx context.Context, kind string, findingID in
 // 整轮操作在一个事务里：事件用 SELECT … FOR UPDATE 有界领取，多个进程同时跑
 // 也各自拿到不同的行（拿不到锁的一方会等上一轮提交，然后看见这些行已被标记
 // fanned_out、自然落空）。刻意不用 SKIP LOCKED：投递队列已整体改成「有界锁定 +
-// CAS 推进」的两阶段租约（见 db/notification_delivery.go 的 M33 改造），
-// 同一套并发手法只留一种。
+// CAS 推进」的两阶段租约状态机（见 db/notification_delivery.go），事件分派沿用
+// 同一种有界锁定手法，不再在同一套代码里混用两种并发原语。
 //
 // 过滤匹配刻意放在 Go 侧而非 SQL：渠道的过滤条件是一组可选字段的 JSON，
 // 用 SQL 表达六种组合的匹配会让查询难以维护，而渠道数量是「人手配的几条」，
@@ -367,10 +375,10 @@ WHERE NOT fanned_out ORDER BY id LIMIT ? FOR UPDATE`, limit)
 			args []any
 		)
 		for _, p := range toInsert {
-			vals = append(vals, "(?, ?)")
+			vals = append(vals, "(?, ?, 'pending', '')")
 			args = append(args, p.eventID, p.channelID)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO notification_deliveries(event_id,channel_id) VALUES `+strings.Join(vals, ","), args...); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO notification_deliveries(event_id, channel_id, state, last_error) VALUES `+strings.Join(vals, ","), args...); err != nil {
 			return 0, 0, err
 		}
 	}

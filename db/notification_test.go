@@ -15,11 +15,16 @@ import (
 
 func notifyTestDB(t *testing.T) *DB {
 	t.Helper()
-	d, err := Open(testDSN(t))
+	dsn := testDSN(t)
+	d, err := Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		t.Fatalf("Open TiDB failed with DSN: %v", err)
 	}
-	t.Cleanup(func() { d.Close() })
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
 	return d
 }
 

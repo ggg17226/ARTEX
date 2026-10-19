@@ -483,12 +483,12 @@ func expDropSideQuestionSessions(ex expQueryExecer, intentID int64) error {
 }
 
 // expDropNodes 删除一批节点，并把它名下的关联行与弱引用一次收尾。
-// 0) 前置锁定待删除全部节点（FOR UPDATE）：杜绝并发写者（如 AddDigest）在清边后、
-//    删节点前向本节点建立新的 covers 边留下悬挂引用（闭环 I1）；
-// 1) 边：两端任一在删除集内即断开（含 covers 这类非产出边）；
-// 2) 锚点：node_id 是锚点的归属键，节点没了锚点就没有意义；
-// 3) 弱引用置空：活动、漏洞、资产绑定均改设为 NULL；
-// 4) 节点：逐行删并核对行数。
+//  0. 前置锁定待删除全部节点（FOR UPDATE）：杜绝并发写者（如 AddDigest）在清边后、
+//     删节点前向本节点建立新的 covers 边留下悬挂引用（闭环 I1）；
+//  1. 边：两端任一在删除集内即断开（含 covers 这类非产出边）；
+//  2. 锚点：node_id 是锚点的归属键，节点没了锚点就没有意义；
+//  3. 弱引用置空：活动、漏洞、资产绑定均改设为 NULL；
+//  4. 节点：逐行删并核对行数。
 func expDropNodes(ex expExecer, expID int64, ids []int64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
