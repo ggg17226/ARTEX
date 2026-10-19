@@ -136,6 +136,14 @@ func IsRetryableConflict(err error) bool {
 		return false
 	}
 
+	// 外部撤销失败 → 永不重试（致命错误，防止在未正确撤销的外部暂存上继续重放，R4-a）。
+	// 无论包装链内部是否有 1213/1205/1062，撤销失败一律终止自动重试。
+	type fatalUndo interface{ StageUndoFailed() bool }
+	var fu fatalUndo
+	if errors.As(err, &fu) && fu.StageUndoFailed() {
+		return false
+	}
+
 	// 漂移类冲突：一律整体回滚 + 退避后重做非加锁 Locator（P04b Global Constraint 5）。
 	// ErrEntityNotFound（R2 I5）：持锁/复核阶段实体物理缺失等同"实体缺失"漂移，
 	// 不得当作终态业务错误结束事务，必须退避重试并重新定位快照。

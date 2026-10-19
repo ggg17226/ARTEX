@@ -91,20 +91,30 @@ type TaskDeletePreparation struct {
 	TrafficHosts  []string
 }
 
+// ErrTaskStageUndoFailed 表示外部暂存（如 traffic / files）在单次尝试失败后撤销失败。
+// 致命错误：外部写锁或暂存树可能处于不一致状态，严禁继续自动重试或静默吞掉（R4-a）。
+var ErrTaskStageUndoFailed = errors.New("task cascade: failed to unwind staged external work after failed attempt")
+
+// StageUndoError 包装外部暂存撤销失败，并实现 fatalUndo 接口通知 TxRunner 永不重试。
+type StageUndoError struct {
+	Err error
+}
+
+func (e *StageUndoError) Error() string          { return e.Err.Error() }
+func (e *StageUndoError) Unwrap() error          { return e.Err }
+func (e *StageUndoError) Is(target error) bool   { return target == ErrTaskStageUndoFailed }
+func (e *StageUndoError) StageUndoFailed() bool { return true }
+
 // TaskDeleteUndo undoes (and releases) the external work staged by **one single
 // attempt** of the cascade. TxRunner replays the whole payload on a retryable
 // conflict, so a stage that outlives its attempt would be re-entered while still
 // holding its non-reentrant writer lock — a self-deadlock (R4).
 //
-// The cascade guarantees, for every attempt:
-//   - the undo of a failed attempt runs once, before the runner backs off and
-//     before any later attempt may call prepare again;
-//   - the undo of the final attempt runs before DeleteTaskCascadePrepared
-//     returns, so the caller only ever has to Commit a stage on success;
-//   - on a successful commit no undo is produced by the cascade at all — the
-//     caller owns the stage and must finalize it.
-//
-// Returning a nil undo from prepare means "nothing to unwind".
+// 契约（Spec §3.2.2、审查 R4）：
+//   - 单次失败尝试的 undo 恰好执行一次，在退避重放前执行完毕；
+//   - 若 undo 返回错误，必须包装 ErrTaskStageUndoFailed 并立即中止重试（不可重试终态）；
+//   - panic 时无论是正常错误还是展开，必须同样触发 undo 释放外部写锁（R4-b）；
+//   - 最终成功提交时，undo 自动注销，由调用方负责 Commit 阶段。
 type TaskDeleteUndo func() error
 
 // IsTerminal reports whether a task status is a terminal (finished) state.
@@ -927,14 +937,27 @@ func (d *DB) runTaskCascadeAttempt(
 	prepare func(TaskDeletePreparation) (TaskDeleteUndo, error),
 ) (result TaskDeleteResult, err error) {
 	var undo TaskDeleteUndo
+	attemptCompleted := false
 	defer func() {
-		if undo == nil || err == nil {
+		// 捕获 panic 并确保在展开前执行撤销释放外部写锁（R4-b）
+		if p := recover(); p != nil {
+			if undo != nil && !attemptCompleted {
+				staged := undo
+				undo = nil
+				_ = staged()
+			}
+			panic(p)
+		}
+		if undo == nil || attemptCompleted {
 			return
 		}
 		staged := undo
 		undo = nil // 恰好一次：绝不重复撤销，也绝不留给下一轮
 		if uerr := staged(); uerr != nil {
-			err = errors.Join(err, fmt.Errorf("task cascade: unwind staged external work after failed attempt: %w", uerr))
+			// 撤销失败必须转化为不可重试的致命错误，中断 Runner 的后续自动重试（R4-a）
+			err = &StageUndoError{
+				Err: fmt.Errorf("%w: %v (underlying failure: %v)", ErrTaskStageUndoFailed, uerr, err),
+			}
 		}
 	}()
 
@@ -1015,6 +1038,7 @@ func (d *DB) runTaskCascadeAttempt(
 	result.AssetsDetached = int64(len(locked.AssetIDsToDetach))
 	result.FindingsDeleted = audit.EntitiesDeleted["findings"]
 	result.LLMRecordsDeleted = audit.EntitiesDeleted["llm_records"]
+	attemptCompleted = true
 	return result, nil
 }
 

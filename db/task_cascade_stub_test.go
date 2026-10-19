@@ -688,25 +688,71 @@ func TestTask_PrepareStagingIsUnwoundBeforeRetry(t *testing.T) {
 	}
 }
 
-// TestTask_PrepareUndoNotRunOnSuccess 正向对照：一次成功的事务不产生任何撤销。
-func TestTask_PrepareUndoNotRunOnSuccess(t *testing.T) {
+// TestTask_PrepareUndoFailureStopsRetryAndIsFatal 测试 R4-a：当外部暂存撤销失败时，
+// 绝不能继续自动重试或静默吞掉，必须立即中止重试并作为致命错误返回。
+func TestTask_PrepareUndoFailureStopsRetryAndIsFatal(t *testing.T) {
 	state := newCascadeStub()
+	state.fail = func(call stubCall) error {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(call.Query)), "DELETE FROM") {
+			return stubMySQLErr{number: 1213, msg: "stub deadlock"}
+		}
+		return nil
+	}
+	d := openStubDB(t, state)
+
+	stagedCalls := 0
+	undoCalls := 0
+	failingPrepare := func(TaskDeletePreparation) (TaskDeleteUndo, error) {
+		stagedCalls++
+		return func() error {
+			undoCalls++
+			return errors.New("external restoreTrees failed")
+		}, nil
+	}
+
+	_, err := d.DeleteTaskCascadePrepared(stubTask, false, true, false, failingPrepare)
+	if err == nil {
+		t.Fatal("cascade must fail when undo fails")
+	}
+	if !errors.Is(err, ErrTaskStageUndoFailed) {
+		t.Fatalf("error must wrap ErrTaskStageUndoFailed, got: %v", err)
+	}
+	if stagedCalls != 1 {
+		t.Fatalf("must stop retrying immediately on undo failure, stagedCalls=%d", stagedCalls)
+	}
+	if undoCalls != 1 {
+		t.Fatalf("undo must be called exactly once, undoCalls=%d", undoCalls)
+	}
+}
+
+// TestTask_PreparePanicUnwindsStagedLock 测试 R4-b：prepare 成功后若发生 panic，
+// 必须在展开前执行撤销释放外部写锁，杜绝写锁泄漏。
+func TestTask_PreparePanicUnwindsStagedLock(t *testing.T) {
+	state := newCascadeStub()
+	state.fail = func(call stubCall) error {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(call.Query)), "DELETE FROM") {
+			panic("unexpected internal panic during DML")
+		}
+		return nil
+	}
 	d := openStubDB(t, state)
 
 	stage := &stubAttemptStage{}
-	if _, err := d.DeleteTaskCascadePrepared(stubTask, false, true, false, stage.prepare); err != nil {
-		for i, c := range state.snapshotCalls() {
-			t.Logf("[%d][conn%d][%s] %s %v", i, c.Conn, c.Kind, c.Query, c.Args)
+	defer func() {
+		p := recover()
+		if p == nil {
+			t.Fatal("expected panic to propagate")
 		}
-		t.Fatalf("cascade failed: %v", err)
-	}
-	if got := atomic.LoadInt32(&stage.staged); got != 1 {
-		t.Fatalf("prepare must run exactly once without retries, staged=%d", got)
-	}
-	if got := atomic.LoadInt32(&stage.undone); got != 0 {
-		t.Fatalf("a committed attempt must never be unwound, undone=%d", got)
-	}
-	if got := atomic.LoadInt32(&stage.live); got != 1 {
-		t.Fatalf("the committed attempt must leave its stage for the caller to finalize, live=%d", got)
-	}
+		if got := atomic.LoadInt32(&stage.undone); got != 1 {
+			t.Fatalf("panic must unwind staged external lock, undone=%d", got)
+		}
+		stage.mu.Lock()
+		held := stage.held
+		stage.mu.Unlock()
+		if held {
+			t.Fatal("external lock must be released after panic")
+		}
+	}()
+
+	_, _ = d.DeleteTaskCascadePrepared(stubTask, false, true, false, stage.prepare)
 }

@@ -240,6 +240,12 @@ func TestTask_DeleteTaskCascade_CrossRootLockPlanAndNarrowDML(t *testing.T) {
 		t.Fatalf("lock plan contains duplicates: %v", dup)
 	}
 
+	// 验证跨根弱关联物理行被严格断言包含在闭包与锁计划中（变异拦截守卫：若 locator 漏收必判红）
+	if len(closure.CrossRootActivityIDs) == 0 || len(closure.CrossRootLinkIDs) == 0 {
+		t.Fatalf("cross-root physical rows must not be empty in fixture closure: activities=%v links=%v",
+			closure.CrossRootActivityIDs, closure.CrossRootLinkIDs)
+	}
+
 	// ② 跨根物理副作用必须纳锁：其他 exploration 的 activity.id、其他任务的
 	//    task_asset_links.row_id / exploration_anchors.row_id、引用共享资产的其他 task.id
 	lockPlanContains(t, plan, "tasks", fixtureTaskA)
