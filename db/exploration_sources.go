@@ -23,7 +23,7 @@ SELECT source.id, source.exploration_id, source.description, source.goal, source
 FROM tasks owner
 JOIN task_relations relation ON relation.task_id=owner.id
 JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
-WHERE owner.exploration_id=$1 AND owner.deleted_at IS NULL
+WHERE owner.exploration_id=? AND owner.deleted_at IS NULL
 ORDER BY relation.created_at, source.id`, s.expID)
 	if err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ ORDER BY relation.created_at, source.id`, s.expID)
 // directly in tests or maintenance code have no task and return zero.
 func (s *ExplorationStore) TaskID() (int64, error) {
 	var id int64
-	err := s.db.QueryRow(`SELECT id FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL`, s.expID).Scan(&id)
+	err := s.db.QueryRow(`SELECT id FROM tasks WHERE exploration_id=? AND deleted_at IS NULL`, s.expID).Scan(&id)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return 0, nil
