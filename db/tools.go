@@ -1,14 +1,50 @@
 package db
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/Autumn-27/artex/db/schema"
+	"github.com/Autumn-27/artex/db/tidb"
 )
+
+// =====================================================================
+// 工具目录层（P08-03 Task 3.3：原生 TiDB 8.5 方言，M12）
+//
+// 新库里的 tools 是「隐藏 row_id 物理主键 + key_hash 唯一键」的 hash DDL 表
+// （schema.BaselineTables §31、schema.HashIdentityColumns）：
+//
+//   - 自然键 `key` 是 MEDIUMTEXT（TEXT 族不能直接建唯一索引），唯一性完全由
+//     uq_tools_key_hash 承载，因此**每一条 INSERT 都必须同时写 key_identity
+//     （canonical 载荷）与 key_hash（其 SHA-256）**：漏写这两列等于把唯一键
+//     退化成 NULL，重复行再也挡不住；
+//   - 身份载荷沿用 schema.SettingsKeyIdentity —— 该 builder 的契约注释明确写着
+//     「SettingsKeyIdentity 是 settings/tools/scheduler_state 的 canonical
+//     identity（分支 key）」。schema 包不存在独立的 ToolKeyIdentity，另起分支
+//     会让同一张表的 identity 出现两套编码，唯一键与 VerifyHashArbitration
+//     仲裁双双失配；
+//   - 物理主键 row_id 只在包内定位行，绝不进入 Tool 或任何对外 API
+//     （hash_arbitration 契约第 4 条）。因此本文件没有 LastInsertId 取号路径，
+//     写入结果一律由 RowsAffected 与 1062 冲突表达。
+//
+// 四条硬性约定：
+//  1. 占位符一律 `?`，并按 SQL 文本出现顺序逐个绑定；
+//  2. `key` / `schema` / `exec` / `system` / `enabled` 都是 MySQL/TiDB 关键字，
+//     列名一律反引号（toolKeyCol / toolCols 是唯一来源）；
+//  3. 没有 `INSERT … RETURNING`，也没有 `ON CONFLICT`：首插入用 1062 判重，
+//     强制覆盖用 TiDB 原生 `ON DUPLICATE KEY UPDATE`；
+//  4. `agents` 是存 JSON 文本的 MEDIUMTEXT，PG 的 jsonb `||`（追加）、`-`（删元素）、
+//     `?`（成员判定）三件套在 TiDB 没有等价写法，改由 Go 端「锁行读 → 解析 →
+//     改写」；非法 JSON 一律 fail closed，绝不静默把用户的绑定重写成空数组。
+// =====================================================================
 
 // Tool is one row of the built-in tool catalog. key + handler live in code; this
 // row carries only the page-editable surface: description, parameter schema
 // (structure read-only, per-param description/default editable), agent binding,
-// and the on/off switch. See schema.sql §H and agent/toolcatalog.go.
+// and the on/off switch. See schema baseline §tools and agent/toolcatalog.go.
 type Tool struct {
 	Key         string          `json:"key"`
 	System      bool            `json:"system"`
@@ -22,72 +58,299 @@ type Tool struct {
 	Calls       int             `json:"calls"`    // runtime ledger aggregate; not stored in tools
 }
 
-const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred`
+// toolKeyCol / toolCols 里的反引号不是装饰：`key`、`schema`、`exec`、`system`
+// 都是 MySQL/TiDB 关键字，裸列名会让解析器把 key = ? 读成索引属性、把 schema 读成
+// 数据库名（Error 1064）。所有读写 tools 的语句都必须从这里取列清单。
+const (
+	toolKeyCol = "`key`"
+	toolCols   = "`key`, `system`, description, `schema`, agents, `enabled`, `kind`, `exec`, `deferred`"
+)
 
-// SeedTool inserts a built-in tool's code-defined defaults ONCE. ON CONFLICT DO
-// NOTHING: an existing row (possibly edited in the UI) is never overwritten on
-// startup — that's what keeps page edits from being wiped every restart. Use
-// UpsertToolForce for an explicit "reset to code default".
-func (d *DB) SeedTool(key, desc string, schema, agents json.RawMessage) error {
-	if len(schema) == 0 {
-		schema = json.RawMessage("{}")
+// toolKeyIdentity 是 tools 表的 canonical 身份对：载荷进 key_identity，
+// SHA-256 进 key_hash（与 settings / scheduler_state 同分支 "key"）。
+func toolKeyIdentity(key string) (payload []byte, hash []byte) {
+	return canonicalIdentityPair(schema.SettingsKeyIdentity(key))
+}
+
+// toolAgents 把 agents 列的 JSON 文本解成有序元素。非数组或非法 JSON 直接报错：
+// 这是用户手配的绑定数据，按"空数组"重写等于把绑定抹掉，必须 fail closed。
+func toolAgents(raw []byte, toolKey string) ([]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return []json.RawMessage{}, nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return nil, fmt.Errorf("tools %s: agents 列不是 JSON 数组，拒绝改写: %w", toolKey, err)
+	}
+	return items, nil
+}
+
+// toolAgentsText 把元素写回 JSON 数组文本；空集合恒为 `[]`，与列默认值一致。
+func toolAgentsText(items []json.RawMessage) (string, error) {
+	if len(items) == 0 {
+		return "[]", nil
+	}
+	raw, err := json.Marshal(items)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// toolAgentLiteral 是要匹配/追加的 agent key 的紧凑 JSON 字面量（"worker"）。
+func toolAgentLiteral(agentKey string) ([]byte, bool) {
+	raw, err := json.Marshal(agentKey)
+	if err != nil {
+		return nil, false
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// toolAgentsContains 按 JSON 值判定成员资格（元素带内部空白也不漏判；非字符串元素
+// 永远不相等，因此不会被误当成某个 key）。
+func toolAgentsContains(items []json.RawMessage, agentKey string) bool {
+	want, ok := toolAgentLiteral(agentKey)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, bytes.TrimSpace(item)); err != nil {
+			continue
+		}
+		if bytes.Equal(buf.Bytes(), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolAgentsWithout 剔除数组里的 agentKey；第二个返回值表示是否真的删掉了元素
+// （false → 调用方跳过 UPDATE，不产生空转写入）。
+func toolAgentsWithout(items []json.RawMessage, agentKey string) ([]json.RawMessage, bool) {
+	want, ok := toolAgentLiteral(agentKey)
+	if !ok {
+		return items, false
+	}
+	out := make([]json.RawMessage, 0, len(items))
+	removed := false
+	for _, item := range items {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, bytes.TrimSpace(item)); err == nil && bytes.Equal(buf.Bytes(), want) {
+			removed = true
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, removed
+}
+
+// toolLikePattern 把 agent key 编成"可能含该 key 的 JSON 文本"粗筛模式。
+// 它只负责把明显无关的行挡在行锁之外，判定一律以 Go 端 JSON 解析为准，误匹配无害；
+// LIKE 元字符仍须转义，否则 key 里的 % _ 会退化成通配符。
+func toolLikePattern(agentKey string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(agentKey)
+	return `%"` + escaped + `"%`
+}
+
+// SeedTool inserts a built-in tool's code-defined defaults ONCE. 首插入语义落在
+// uq_tools_key_hash 的 1062 上（TiDB 没有 ON CONFLICT … DO NOTHING）：撞键就是
+// "已有行（可能已被页面改过）"，原样保留并返回 nil —— 这正是每次重启不覆盖页面
+// 编辑的关键。需要显式"恢复代码默认"时走 UpsertToolForce。
+func (d *DB) SeedTool(key, desc string, schemaDoc, agents json.RawMessage) error {
+	if len(schemaDoc) == 0 {
+		schemaDoc = json.RawMessage("{}")
 	}
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
+	identity, hash := toolKeyIdentity(key)
 	_, err := d.Exec(`
-INSERT INTO tools(key, system, description, schema, agents, enabled)
-VALUES ($1, true, $2, $3, $4, true)
-ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
-	return err
+INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`)
+VALUES (?, ?, ?, TRUE, ?, ?, ?, TRUE)`,
+		key, identity, hash, desc, schemaDoc, agents)
+	if err != nil {
+		if tidb.IsDuplicateKey(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // AddAgentToToolBinding adds an agent key to the given tools' `agents` arrays if
 // not already present (idempotent). Used to give the built-in Auto agent its
-// default toolset on existing DBs.
+// default toolset on existing DBs. 未 seed 的 key 直接跳过（只给已存在的行补绑）。
 func (d *DB) AddAgentToToolBinding(agentKey string, keys []string) error {
 	for _, k := range keys {
-		if _, err := d.Exec(`UPDATE tools SET agents = agents || to_jsonb($1::text) WHERE key=$2 AND NOT (agents ? $1)`, agentKey, k); err != nil {
+		if err := d.addToolAgentBinding(k, agentKey); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// addToolAgentBinding 在行锁保护下往单个工具的 agents 数组追加一个元素。
+// 读-改-写必须同事务加锁：PG 的 `agents || to_jsonb(x)` 是单语句原子更新，换成
+// Go 端组装之后，少了 FOR UPDATE 就会让两个并发补绑互相覆盖（后提交者赢）。
+func (d *DB) addToolAgentBinding(toolKey, agentKey string) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var rowID int64
+	var raw []byte
+	err = tx.QueryRow("SELECT row_id, agents FROM tools WHERE "+toolKeyCol+" = ? FOR UPDATE", toolKey).Scan(&rowID, &raw)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	items, err := toolAgents(raw, toolKey)
+	if err != nil {
+		return err
+	}
+	if toolAgentsContains(items, agentKey) {
+		return nil
+	}
+	literal, ok := toolAgentLiteral(agentKey)
+	if !ok {
+		return fmt.Errorf("tools %s: agent key %q 无法编码为 JSON 字面量", toolKey, agentKey)
+	}
+	text, err := toolAgentsText(append(items, json.RawMessage(literal)))
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE tools SET agents = ?, updated_at = NOW(3) WHERE row_id = ?", text, rowID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // RemoveAgentFromToolBindings strips an agent key from every tool's `agents`
-// JSONB array — called when a custom agent is deleted so no tool keeps a dangling
-// binding. Uses jsonb `-` (remove array element) guarded by `?` (membership).
+// JSON array — called when a custom agent is deleted so no tool keeps a dangling
+// binding. 候选行由 LIKE 粗筛后在同一条 `SELECT … FOR UPDATE` 里锁住，剔除与写回
+// 全落在这一个事务里，语义与旧的单条全表 UPDATE 一样原子。
 func (d *DB) RemoveAgentFromToolBindings(agentKey string) error {
-	_, err := d.Exec(`UPDATE tools SET agents = agents - $1 WHERE agents ? $1`, agentKey)
-	return err
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	rows, err := tx.Query(`SELECT row_id, `+toolKeyCol+`, agents FROM tools
+WHERE agents LIKE ? ESCAPE '\\'
+ORDER BY row_id
+FOR UPDATE`, toolLikePattern(agentKey))
+	if err != nil {
+		return err
+	}
+	type toolRow struct {
+		rowID int64
+		key   string
+		raw   []byte
+	}
+	var candidates []toolRow
+	for rows.Next() {
+		var c toolRow
+		if err := rows.Scan(&c.rowID, &c.key, &c.raw); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, c := range candidates {
+		items, err := toolAgents(c.raw, c.key)
+		if err != nil {
+			return err
+		}
+		next, removed := toolAgentsWithout(items, agentKey)
+		if !removed {
+			continue
+		}
+		text, err := toolAgentsText(next)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE tools SET agents = ?, updated_at = NOW(3) WHERE row_id = ?", text, c.rowID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // RemoveAgentFromTool strips one agent key from a SINGLE tool's `agents` array —
 // used by one-time migrations that change a tool's default binding on existing DBs
 // (SeedTool is first-insert-only, so a changed default never reaches a seeded row).
 func (d *DB) RemoveAgentFromTool(agentKey, toolKey string) error {
-	_, err := d.Exec(`UPDATE tools SET agents = agents - $1 WHERE key=$2 AND agents ? $1`, agentKey, toolKey)
-	return err
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var rowID int64
+	var raw []byte
+	err = tx.QueryRow("SELECT row_id, agents FROM tools WHERE "+toolKeyCol+" = ? FOR UPDATE", toolKey).Scan(&rowID, &raw)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	items, err := toolAgents(raw, toolKey)
+	if err != nil {
+		return err
+	}
+	next, removed := toolAgentsWithout(items, agentKey)
+	if !removed {
+		return nil
+	}
+	text, err := toolAgentsText(next)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE tools SET agents = ?, updated_at = NOW(3) WHERE row_id = ?", text, rowID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpsertToolForce overwrites a tool row with the given code-default values (used by
 // the per-tool "reset" action). It resets description/schema/agents and re-enables
 // the tool, but keeps system=true.
-func (d *DB) UpsertToolForce(key, desc string, schema, agents json.RawMessage) error {
-	if len(schema) == 0 {
-		schema = json.RawMessage("{}")
+//
+// 冲突判定落在 uq_tools_key_hash 上（TiDB 原生 ON DUPLICATE KEY UPDATE）；
+// key_identity / key_hash 是不可变身份列，只在插入分支写入，更新分支绝不改写它们。
+func (d *DB) UpsertToolForce(key, desc string, schemaDoc, agents json.RawMessage) error {
+	if len(schemaDoc) == 0 {
+		schemaDoc = json.RawMessage("{}")
 	}
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
+	identity, hash := toolKeyIdentity(key)
 	_, err := d.Exec(`
-INSERT INTO tools(key, system, description, schema, agents, enabled)
-VALUES ($1, true, $2, $3, $4, true)
-ON CONFLICT (key) DO UPDATE
-  SET description = EXCLUDED.description,
-      schema      = EXCLUDED.schema,
-      agents      = EXCLUDED.agents,
-      enabled     = true`, key, desc, schema, agents)
+INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`)
+VALUES (?, ?, ?, TRUE, ?, ?, ?, TRUE)
+ON DUPLICATE KEY UPDATE
+  description   = VALUES(description),
+  `+"`schema`"+`      = VALUES(`+"`schema`"+`),
+  agents        = VALUES(agents),
+  `+"`enabled`"+`     = TRUE,
+  updated_at    = NOW(3)`,
+		key, identity, hash, desc, schemaDoc, agents)
 	return err
 }
 
@@ -96,11 +359,12 @@ ON CONFLICT (key) DO UPDATE
 // migrations to propagate a code schema change (SeedTool is first-insert-only, so a new
 // parameter added in code otherwise never reaches an already-seeded row). No-op for
 // custom tools or unknown keys.
-func (d *DB) RefreshToolDefaults(key, desc string, schema json.RawMessage) error {
-	if len(schema) == 0 {
-		schema = json.RawMessage("{}")
+func (d *DB) RefreshToolDefaults(key, desc string, schemaDoc json.RawMessage) error {
+	if len(schemaDoc) == 0 {
+		schemaDoc = json.RawMessage("{}")
 	}
-	_, err := d.Exec(`UPDATE tools SET description=$2, schema=$3, updated_at=now() WHERE key=$1 AND system`, key, desc, schema)
+	_, err := d.Exec(`UPDATE tools SET description = ?, `+"`schema`"+` = ?, updated_at = NOW(3)
+WHERE `+toolKeyCol+` = ? AND `+"`system`"+` = TRUE`, desc, schemaDoc, key)
 	return err
 }
 
@@ -121,7 +385,7 @@ func scanTool(rows interface{ Scan(...any) error }) (*Tool, error) {
 
 // ListTools returns the whole tool catalog, ordered by key.
 func (d *DB) ListTools() ([]*Tool, error) {
-	rows, err := d.Query(`SELECT ` + toolCols + ` FROM tools ORDER BY key`)
+	rows, err := d.Query("SELECT " + toolCols + " FROM tools ORDER BY " + toolKeyCol)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +403,7 @@ func (d *DB) ListTools() ([]*Tool, error) {
 
 // GetTool fetches one tool row (nil if absent).
 func (d *DB) GetTool(key string) (*Tool, error) {
-	row := d.QueryRow(`SELECT `+toolCols+` FROM tools WHERE key=$1`, key)
+	row := d.QueryRow("SELECT "+toolCols+" FROM tools WHERE "+toolKeyCol+" = ?", key)
 	t, err := scanTool(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -148,11 +412,12 @@ func (d *DB) GetTool(key string) (*Tool, error) {
 }
 
 // CreateCustomTool inserts a user-defined tool (system=false) with an execution
-// spec. Fails if the key already exists.
+// spec. Fails if the key already exists —— 撞键由 uq_tools_key_hash 的 1062 表达并
+// 原样回给调用方（页面据此提示"标识已存在"），绝不静默覆盖既有行。
 func (d *DB) CreateCustomTool(t *Tool) error {
-	schema := t.Schema
-	if len(schema) == 0 {
-		schema = json.RawMessage("{}")
+	schemaDoc := t.Schema
+	if len(schemaDoc) == 0 {
+		schemaDoc = json.RawMessage("{}")
 	}
 	exec := t.Exec
 	if len(exec) == 0 {
@@ -162,19 +427,20 @@ func (d *DB) CreateCustomTool(t *Tool) error {
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
+	identity, hash := toolKeyIdentity(t.Key)
 	_, err := d.Exec(`
-INSERT INTO tools(key, system, description, schema, agents, enabled, kind, exec, deferred)
-VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8)`,
-		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
+INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`, `+"`kind`"+`, `+"`exec`"+`, deferred)
+VALUES (?, ?, ?, FALSE, ?, ?, ?, ?, ?, ?, ?)`,
+		t.Key, identity, hash, t.Description, schemaDoc, agents, t.Enabled, t.Kind, exec, t.Deferred)
 	return err
 }
 
 // UpdateCustomTool updates a custom tool's editable fields (kind/exec/deferred +
 // desc/schema/agents/enabled). Only touches system=false rows.
 func (d *DB) UpdateCustomTool(t *Tool) error {
-	schema := t.Schema
-	if len(schema) == 0 {
-		schema = json.RawMessage("{}")
+	schemaDoc := t.Schema
+	if len(schemaDoc) == 0 {
+		schemaDoc = json.RawMessage("{}")
 	}
 	exec := t.Exec
 	if len(exec) == 0 {
@@ -184,22 +450,21 @@ func (d *DB) UpdateCustomTool(t *Tool) error {
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
-	_, err := d.Exec(`
-UPDATE tools SET description=$2, schema=$3, agents=$4, enabled=$5, kind=$6, exec=$7, deferred=$8
-WHERE key=$1 AND system=false`,
-		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
+	_, err := d.Exec(`UPDATE tools SET description = ?, `+"`schema`"+` = ?, agents = ?, `+"`enabled`"+` = ?, `+"`kind`"+` = ?, `+"`exec`"+` = ?, deferred = ?, updated_at = NOW(3)
+WHERE `+toolKeyCol+` = ? AND `+"`system`"+` = FALSE`,
+		t.Description, schemaDoc, agents, t.Enabled, t.Kind, exec, t.Deferred, t.Key)
 	return err
 }
 
 // DeleteCustomTool removes a custom tool (system=false only; built-ins protected).
 func (d *DB) DeleteCustomTool(key string) error {
-	_, err := d.Exec(`DELETE FROM tools WHERE key=$1 AND system=false`, key)
+	_, err := d.Exec("DELETE FROM tools WHERE "+toolKeyCol+" = ? AND `system` = FALSE", key)
 	return err
 }
 
 // ListCustomTools returns only the user-defined (system=false) tools.
 func (d *DB) ListCustomTools() ([]*Tool, error) {
-	rows, err := d.Query(`SELECT ` + toolCols + ` FROM tools WHERE system=false ORDER BY key`)
+	rows, err := d.Query("SELECT " + toolCols + " FROM tools WHERE `system` = FALSE ORDER BY " + toolKeyCol)
 	if err != nil {
 		return nil, err
 	}
@@ -218,15 +483,14 @@ func (d *DB) ListCustomTools() ([]*Tool, error) {
 // UpdateTool saves the page-editable fields. key is never changed (it is welded to
 // the Go handler). system tools: the caller must keep the schema structure — only
 // per-param description/default and the agent binding are meant to move.
-func (d *DB) UpdateTool(key, desc string, schema, agents json.RawMessage, enabled bool) error {
-	if len(schema) == 0 {
-		schema = json.RawMessage("{}")
+func (d *DB) UpdateTool(key, desc string, schemaDoc, agents json.RawMessage, enabled bool) error {
+	if len(schemaDoc) == 0 {
+		schemaDoc = json.RawMessage("{}")
 	}
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
-	_, err := d.Exec(`
-UPDATE tools SET description=$2, schema=$3, agents=$4, enabled=$5 WHERE key=$1`,
-		key, desc, schema, agents, enabled)
+	_, err := d.Exec(`UPDATE tools SET description = ?, `+"`schema`"+` = ?, agents = ?, `+"`enabled`"+` = ?, updated_at = NOW(3)
+WHERE `+toolKeyCol+` = ?`, desc, schemaDoc, agents, enabled, key)
 	return err
 }

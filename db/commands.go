@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -24,25 +23,34 @@ type CommandRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// commandsLikePattern 把用户输入编成大小写不敏感的包含匹配模式：先转义 LIKE 元字符
+// （`\ % _`），再整体小写以配合列侧的 LOWER(…)，与 PG 的 `ILIKE '%q%'` 等价。
+func commandsLikePattern(q string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	return strings.ToLower("%" + escaped + "%")
+}
+
 // commandFilter builds the WHERE clause shared by the tool-execution list and
 // its per-tool tally, so the summary always describes exactly the rows the table
-// pages through. Returns the clause, its args, and the next placeholder index.
-func commandFilter(expID *int64, q string) (string, []any, int) {
+// pages through. Returns the clause and its args —— TiDB 的 `?` 没有编号，占位符
+// 与参数严格同序，分页的 LIMIT/OFFSET 由调用方追加在末尾（因此这里只产出前缀）。
+//
+// PG 的 ILIKE 没有对应操作符，基线表又是 COLLATE=utf8mb4_bin（比较区分大小写），
+// 所以两侧都显式 LOWER：列侧 LOWER(…)，模式在 Go 端预先小写，语义等价原 ILIKE。
+func commandFilter(expID *int64, q string) (string, []any) {
 	where := `WHERE u.kind = 'tool_use'`
 	args := []any{}
-	argN := 1
 
 	if expID != nil {
-		where += fmt.Sprintf(` AND u.exploration_id = $%d`, argN)
+		where += ` AND u.exploration_id = ?`
 		args = append(args, *expID)
-		argN++
 	}
 	if q != "" {
-		where += fmt.Sprintf(` AND (u.tool ILIKE $%d OR u.detail ILIKE $%d)`, argN, argN)
-		args = append(args, "%"+q+"%")
-		argN++
+		where += ` AND (LOWER(COALESCE(u.tool, '')) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(u.detail, '')) LIKE ? ESCAPE '\\')`
+		pattern := commandsLikePattern(q)
+		args = append(args, pattern, pattern)
 	}
-	return where, args, argN
+	return where, args
 }
 
 // ToolStat is one tool's execution tally for the usage summary.
@@ -56,11 +64,14 @@ type ToolStat struct {
 // ListCommands takes. Unpaginated on purpose: the tally describes the whole
 // filtered set, not the page currently on screen.
 func (d *DB) ToolStats(expID *int64, q string) ([]ToolStat, error) {
-	where, args, _ := commandFilter(expID, q)
+	where, args := commandFilter(expID, q)
 
+	// PG 的 `COUNT(*) FILTER (WHERE …)` 在 TiDB 没有对应语法，改写成
+	// COUNT(CASE WHEN … THEN 1 END)：CASE 在没有匹配行时恒为数值 0，
+	// 不会把 SQL NULL 灌进 Scan（is_error 是 TINYINT，0 即"非错误"）。
 	rows, err := d.Query(`
 SELECT COALESCE(NULLIF(u.tool,''),'-') AS tool, COUNT(*) AS total,
-       COUNT(*) FILTER (WHERE COALESCE(r.is_error,false)) AS errors
+       COUNT(CASE WHEN COALESCE(r.is_error, 0) <> 0 THEN 1 END) AS errors
 FROM activity u
 LEFT JOIN activity r ON r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
 `+where+`
@@ -94,7 +105,7 @@ func (d *DB) ListCommands(expID *int64, q string, page, size int) ([]CommandReco
 	}
 	offset := page * size
 
-	where, args, argN := commandFilter(expID, q)
+	where, args := commandFilter(expID, q)
 
 	// count
 	var total int
@@ -104,14 +115,15 @@ func (d *DB) ListCommands(expID *int64, q string, page, size int) ([]CommandReco
 	}
 
 	// data query: join tool_use with its tool_result
+	// is_error 是可空 TINYINT：COALESCE(…, 0) 保证左连接未命中的行扫进 bool 时是 false。
 	dataQ := `
 SELECT u.id, u.exploration_id, COALESCE(u.worker,''), COALESCE(u.tool,''), COALESCE(u.detail,''),
-       COALESCE(r.detail,''), COALESCE(r.is_error, false), u.created_at
+       COALESCE(r.detail,''), COALESCE(r.is_error, 0), u.created_at
 FROM activity u
 LEFT JOIN activity r ON r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
 ` + where + `
 ORDER BY u.id DESC
-LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
+LIMIT ? OFFSET ?`
 
 	args = append(args, size, offset)
 	rows, err := d.Query(dataQ, args...)
@@ -160,58 +172,23 @@ type LLMRecord struct {
 	RawResponse string `json:"raw_response,omitempty"`
 }
 
-const llmRecordsSchema = `
-CREATE TABLE IF NOT EXISTS llm_records (
-    id            BIGSERIAL PRIMARY KEY,
-    ts            TIMESTAMPTZ DEFAULT now(),
-    model         TEXT,
-    profile_name  TEXT,
-    session_id    TEXT,
-    task_id       TEXT,
-    worker        TEXT,
-    latency_ms    INTEGER,
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    cache_read    INTEGER,
-    cache_write   INTEGER,
-    status        TEXT,
-    error         TEXT,
-    request_body  TEXT,
-    response_body TEXT,
-    raw_request   TEXT,
-    raw_response  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_llm_records_ts ON llm_records(ts);
-CREATE INDEX IF NOT EXISTS idx_llm_records_session ON llm_records(session_id);
-`
+// llm_records 的建表与列演进**不再由运行期 DDL 负责**（M12）：
+// 该表是基线目录里的第 50 张扩展表（schema.ExtensionTables §50，含
+// idx_llm_records_ts / idx_llm_records_session 两个索引，以及旧的
+// llmRecordsMigrate 逐列 ADD COLUMN 想补的 task_id/worker/profile_name/
+// raw_request/raw_response），启动路径由 db.Open → schema.VerifyBaseline
+// 只读校验，缺表/缺列一律 fail closed 拒绝启动。旧的 llmRecordsSchema /
+// llmRecordsMigrate 两份 DDL 文本已一并删除：运行期偷偷建出一张与目录不一致的表，
+// 只会让后续每一处读写都在错误的物理形状上失败。
 
-// llmRecordsMigrate adds new columns to existing tables.
-const llmRecordsMigrate = `
-ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS task_id TEXT;
-ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS worker TEXT;
-ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_name TEXT;
-ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_request TEXT;
-ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_response TEXT;
-`
-
-// EnsureLLMRecordsTable creates the llm_records table if it does not exist.
-func (d *DB) EnsureLLMRecordsTable() error {
-	tx, err := d.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck
-	if err := d.coordinateWithSchemaMigration(tx); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(llmRecordsSchema); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(llmRecordsMigrate); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
+// EnsureLLMRecordsTable 已废弃（Deprecated），恒返回 nil，且**不再执行任何 DDL**。
+//
+// 原有的 `CREATE TABLE IF NOT EXISTS llm_records` 与 5 条 ADD COLUMN 已按 M12
+// 彻底废除（表结构由 65 表基线目录与 schema.VerifyBaseline 保障）。这里只剩下一个
+// 空实现，唯一的原因是 server/manager.go 与 server/db 侧若干测试 fixture 仍在
+// 启动路径上调用它，而这些文件的删改不在本次改造清单内 —— 调用点清理完成后
+// （见 .superpowers/sdd/P08-03/task-3.3-report.md 的越界清单）本函数应整体删除。
+func (d *DB) EnsureLLMRecordsTable() error { return nil }
 
 // InsertLLMRecord stores one LLM call record using TiDB dialect.
 // 若关联有效任务 ID，接入任务写者门禁协议核验父任务存活，严禁向正在被删除的任务并发写入记录（F1/R3）。
@@ -252,23 +229,21 @@ func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMR
 	}
 	offset := page * size
 
-	where := `WHERE true`
+	where := `WHERE 1`
 	args := []any{}
-	argN := 1
 	if model != "" {
-		where += fmt.Sprintf(` AND model = $%d`, argN)
+		where += ` AND model = ?`
 		args = append(args, model)
-		argN++
 	}
 	if session != "" {
-		where += fmt.Sprintf(` AND session_id ILIKE $%d`, argN)
-		args = append(args, "%"+session+"%")
-		argN++
+		// ILIKE → LOWER(col) LIKE ?：列是 utf8mb4_bin 的 MEDIUMTEXT，裸 LIKE 大小写敏感，
+		// 模式在 Go 端预先小写；元字符先转义再折叠，`%`/`_` 不会变成通配。
+		where += ` AND LOWER(session_id) LIKE ? ESCAPE '\\'`
+		args = append(args, commandsLikePattern(session))
 	}
 	if task != "" {
-		where += fmt.Sprintf(` AND COALESCE(task_id,'') = $%d`, argN)
+		where += ` AND COALESCE(task_id,'') = ?`
 		args = append(args, task)
-		argN++
 	}
 
 	var total int
@@ -279,7 +254,7 @@ func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMR
 	dataQ := `SELECT id, ts, COALESCE(model,''), COALESCE(profile_name,''), COALESCE(session_id,''), COALESCE(task_id,''), COALESCE(worker,''),
 		COALESCE(latency_ms,0), COALESCE(input_tokens,0), COALESCE(output_tokens,0), COALESCE(cache_read,0), COALESCE(cache_write,0),
 		COALESCE(status,''), COALESCE(error,'')
-		FROM llm_records ` + where + ` ORDER BY id DESC LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
+		FROM llm_records ` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`
 	args = append(args, size, offset)
 
 	rows, err := d.Query(dataQ, args...)
@@ -341,7 +316,7 @@ WHERE COALESCE(task_id,'') <> '' GROUP BY task_id ORDER BY MAX(id) DESC`)
 // DeleteLLMRecords removes every LLM record for one exact task_id — the same
 // match the page's task picker/filter uses. Returns rows deleted.
 func (d *DB) DeleteLLMRecords(task string) (int64, error) {
-	res, err := d.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'') = $1`, task)
+	res, err := d.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'') = ?`, task)
 	if err != nil {
 		return 0, err
 	}
@@ -355,7 +330,7 @@ func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	err := d.QueryRow(`SELECT id, ts, COALESCE(model,''), COALESCE(profile_name,''), COALESCE(session_id,''), COALESCE(task_id,''), COALESCE(worker,''),
 		COALESCE(latency_ms,0), COALESCE(input_tokens,0), COALESCE(output_tokens,0), COALESCE(cache_read,0), COALESCE(cache_write,0),
 		COALESCE(status,''), COALESCE(error,''), request_body, response_body, raw_request, raw_response
-		FROM llm_records WHERE id=$1`, id).
+		FROM llm_records WHERE id=?`, id).
 		Scan(&r.ID, &r.Ts, &r.Model, &r.ProfileName, &r.SessionID, &r.TaskID, &r.Worker, &r.LatencyMs,
 			&r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite, &r.Status, &r.Error,
 			&reqBody, &respBody, &rawReq, &rawResp)

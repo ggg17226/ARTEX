@@ -13,10 +13,14 @@ type ToolUsage struct {
 
 // InsertToolUsage appends one ledger row. Runtime callers treat metering as
 // best-effort so a statistics failure never interrupts the tool itself.
+//
+// NULLIF 包住 agent_key / session_id 两个维度列：空值写 NULL 而不是空串，
+// ToolUsageCounts 之类的聚合才不会把"未归因"混成一个具名桶。ts 由列默认
+// CURRENT_TIMESTAMP(3) 盖章。
 func (d *DB) InsertToolUsage(u *ToolUsage) error {
 	_, err := d.Exec(`
 INSERT INTO tool_usage(tool_key, agent_key, task_id, exploration_id, intent_id, session_id)
-VALUES ($1, NULLIF($2,''), $3, $4, $5, NULLIF($6,''))`,
+VALUES (?, NULLIF(?,''), ?, ?, ?, NULLIF(?,''))`,
 		u.ToolKey, u.AgentKey, nullIfZero(u.TaskID), nullIfZero(u.ExplorationID),
 		nullIfZero(u.IntentID), u.SessionID)
 	return err

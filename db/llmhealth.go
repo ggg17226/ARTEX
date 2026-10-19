@@ -22,7 +22,7 @@ type LLMHealth struct {
 // call, not resurrected as broken.
 func (d *DB) LoadLLMHealth() ([]LLMHealth, error) {
 	rows, err := d.Query(`SELECT profile_id,fails,trips,open_until,COALESCE(last_error,''),last_at
-FROM llm_profile_health WHERE open_until IS NOT NULL AND open_until > now()`)
+FROM llm_profile_health WHERE open_until IS NOT NULL AND open_until > NOW(3)`)
 	if err != nil {
 		return nil, err
 	}
@@ -39,19 +39,26 @@ FROM llm_profile_health WHERE open_until IS NOT NULL AND open_until > now()`)
 }
 
 // SaveLLMHealth upserts one profile's circuit-breaker state.
+//
+// profile_id 是这张 1:1 表的物理主键（非自增，直接引用 llm_profiles.id），
+// 所以 TiDB 原生 `ON DUPLICATE KEY UPDATE` 就是旧的 `ON CONFLICT (profile_id)`；
+// 时序列统一 NOW(3)，与列默认 CURRENT_TIMESTAMP(3) 的精度一致。
 func (d *DB) SaveLLMHealth(h LLMHealth) error {
 	_, err := d.Exec(`
 INSERT INTO llm_profile_health(profile_id,fails,trips,open_until,last_error,last_at)
-VALUES ($1,$2,$3,$4,$5,now())
-ON CONFLICT (profile_id) DO UPDATE SET
-  fails=EXCLUDED.fails, trips=EXCLUDED.trips, open_until=EXCLUDED.open_until,
-  last_error=EXCLUDED.last_error, last_at=now()`,
+VALUES (?,?,?,?,?,NOW(3))
+ON DUPLICATE KEY UPDATE
+  fails      = VALUES(fails),
+  trips      = VALUES(trips),
+  open_until = VALUES(open_until),
+  last_error = VALUES(last_error),
+  last_at    = NOW(3)`,
 		h.ProfileID, h.Fails, h.Trips, h.OpenUntil, h.LastError)
 	return err
 }
 
 // ClearLLMHealth drops one profile's state (manual "recover now" from the UI).
 func (d *DB) ClearLLMHealth(profileID int64) error {
-	_, err := d.Exec(`DELETE FROM llm_profile_health WHERE profile_id=$1`, profileID)
+	_, err := d.Exec(`DELETE FROM llm_profile_health WHERE profile_id=?`, profileID)
 	return err
 }

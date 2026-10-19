@@ -3,27 +3,46 @@ package db
 // cold-digest §1/§2.3/§5: persistence for cold-node compression — the round
 // counter, cold_since_round stamps, content versions, digest nodes and the
 // covers edges that are the source of truth for "which digest folds node X".
+//
+// P08-03 Task 3.3（M21）：本文件全部语句已是原生 TiDB 8.5 方言 —— 占位符一律 `?`
+// 并按文本顺序绑定；没有 `INSERT … RETURNING`（自增主键走 LastInsertId + 范围校验，
+// 复用 Task 3.1 的 expInsertID）、没有 `ON CONFLICT`（幂等插入用 uq_exploration_edges
+// 上的 `ON DUPLICATE KEY UPDATE 列 = 列` 空转换）。
 
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"sort"
-	"strings"
 )
 
 // BumpRound advances this exploration's planner-round counter and returns the
 // new value (§2.3). Called once per planner wake-up.
+//
+// TiDB 没有 `UPDATE … RETURNING`。这里把它拆成一个事务里的两步：先按主键 UPDATE
+// （该语句在行上持有排他锁，别的写者进不来），再在同一事务里回读。事务内的读取
+// 必定包含自己的写入，因此回读到的就是刚刚自增后的值 —— 语义与 RETURNING 一致，
+// 且不会像"两条独立语句"那样被并发写者插队读到中间值。
+// 目标 exploration 不存在时，回读返回 sql.ErrNoRows（旧 RETURNING 同样是零行）。
 func (s *ExplorationStore) BumpRound() (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.Exec(`UPDATE explorations SET round_no = round_no + 1 WHERE id = ?`, s.expID); err != nil {
+		return 0, err
+	}
 	var r int64
-	err := s.db.QueryRow(`UPDATE explorations SET round_no = round_no + 1 WHERE id=$1 RETURNING round_no`, s.expID).Scan(&r)
-	return r, err
+	if err := tx.QueryRow(`SELECT round_no FROM explorations WHERE id = ?`, s.expID).Scan(&r); err != nil {
+		return 0, err
+	}
+	return r, tx.Commit()
 }
 
 // RoundNo returns the current planner-round counter.
 func (s *ExplorationStore) RoundNo() (int64, error) {
 	var r int64
-	err := s.db.QueryRow(`SELECT round_no FROM explorations WHERE id=$1`, s.expID).Scan(&r)
+	err := s.db.QueryRow(`SELECT round_no FROM explorations WHERE id = ?`, s.expID).Scan(&r)
 	return r, err
 }
 
@@ -32,7 +51,7 @@ func (s *ExplorationStore) RoundNo() (int64, error) {
 // debounce and to know which stamps to set/clear this round.
 func (s *ExplorationStore) ColdStamps() (map[int64]*int64, error) {
 	rows, err := s.db.Query(`SELECT id, cold_since_round FROM exploration_nodes
-		WHERE exploration_id=$1 AND kind IN ('intent','fact')`, s.expID)
+		WHERE exploration_id = ? AND kind IN ('intent','fact')`, s.expID)
 	if err != nil {
 		return nil, err
 	}
@@ -70,14 +89,16 @@ func (s *ExplorationStore) ApplyStampOps(ops []StampOp) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
 	for _, o := range ops {
 		if o.Set {
-			if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round=$1 WHERE id=$2 AND exploration_id=$3`, o.Round, o.ID, s.expID); err != nil {
+			if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round = ? WHERE id = ? AND exploration_id = ?`,
+				o.Round, o.ID, s.expID); err != nil {
 				return err
 			}
 		} else {
-			if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round=NULL WHERE id=$1 AND exploration_id=$2`, o.ID, s.expID); err != nil {
+			if _, err := tx.Exec(`UPDATE exploration_nodes SET cold_since_round = NULL WHERE id = ? AND exploration_id = ?`,
+				o.ID, s.expID); err != nil {
 				return err
 			}
 		}
@@ -87,7 +108,7 @@ func (s *ExplorationStore) ApplyStampOps(ops []StampOp) error {
 
 // ContentVersions returns id → content_version for all nodes (§5.3 signature).
 func (s *ExplorationStore) ContentVersions() (map[int64]int, error) {
-	rows, err := s.db.Query(`SELECT id, content_version FROM exploration_nodes WHERE exploration_id=$1`, s.expID)
+	rows, err := s.db.Query(`SELECT id, content_version FROM exploration_nodes WHERE exploration_id = ?`, s.expID)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +129,7 @@ func (s *ExplorationStore) ContentVersions() (map[int64]int, error) {
 // oldest first.
 func (s *ExplorationStore) ActiveDigests() ([]*Node, error) {
 	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
-		WHERE exploration_id=$1 AND kind=$2 AND state=$3 ORDER BY id`, s.expID, KindDigest, StateDigestActive)
+		WHERE exploration_id = ? AND kind = ? AND state = ? ORDER BY id`, s.expID, KindDigest, StateDigestActive)
 	if err != nil {
 		return nil, err
 	}
@@ -119,18 +140,26 @@ func (s *ExplorationStore) ActiveDigests() ([]*Node, error) {
 // AddDigest writes one digest node and its covers edges (digest→member) in a
 // single transaction. payload is the digest body + member_ids + generation +
 // signature (see cold-digest §1). Returns the new digest id.
+//
+// 自增主键经 LastInsertId 取回并做 [1, MaxInt64] 校验（expInsertID）；covers 边的
+// "已存在即幂等"落在 uq_exploration_edges 上，用 `src_id = src_id` 的空转换表达
+// DO NOTHING —— 不用 INSERT IGNORE，免得把非空/截断这类真错误一起吞掉。
 func (s *ExplorationStore) AddDigest(payload map[string]any, memberIDs []int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
-	var id int64
-	if err := tx.QueryRow(`
+	defer tx.Rollback() //nolint:errcheck
+	res, err := tx.Exec(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
-VALUES ($1, $2, $3, 0, $4, 'compactor') RETURNING id`,
-		s.expID, KindDigest, string(raw), StateDigestActive).Scan(&id); err != nil {
+VALUES (?, ?, ?, 0, ?, 'compactor')`,
+		s.expID, KindDigest, string(raw), StateDigestActive)
+	if err != nil {
+		return 0, err
+	}
+	id, err := expInsertID(res, "exploration_nodes")
+	if err != nil {
 		return 0, err
 	}
 	for _, m := range memberIDs {
@@ -138,8 +167,8 @@ VALUES ($1, $2, $3, 0, $4, 'compactor') RETURNING id`,
 			continue
 		}
 		if _, err := tx.Exec(`
-INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
-ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, id, RelCovers, m); err != nil {
+INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES (?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE src_id = src_id`, s.expID, id, RelCovers, m); err != nil {
 			return 0, err
 		}
 	}
@@ -155,7 +184,7 @@ func (s *ExplorationStore) CoveredMembers() (map[int64]int64, error) {
 SELECT e.dst_id, e.src_id
 FROM exploration_edges e
 JOIN exploration_nodes d ON d.id=e.src_id AND d.exploration_id=e.exploration_id
-WHERE e.exploration_id=$1 AND e.rel=$2 AND d.kind=$3 AND d.state=$4
+WHERE e.exploration_id = ? AND e.rel = ? AND d.kind = ? AND d.state = ?
 ORDER BY e.src_id`, s.expID, RelCovers, KindDigest, StateDigestActive)
 	if err != nil {
 		return nil, err
@@ -177,7 +206,7 @@ ORDER BY e.src_id`, s.expID, RelCovers, KindDigest, StateDigestActive)
 // DigestMembers returns the member ids a digest covers (covers edges), sorted.
 func (s *ExplorationStore) DigestMembers(digestID int64) ([]int64, error) {
 	rows, err := s.db.Query(`SELECT dst_id FROM exploration_edges
-		WHERE exploration_id=$1 AND src_id=$2 AND rel=$3`, s.expID, digestID, RelCovers)
+		WHERE exploration_id = ? AND src_id = ? AND rel = ?`, s.expID, digestID, RelCovers)
 	if err != nil {
 		return nil, err
 	}
@@ -206,13 +235,13 @@ func (s *ExplorationStore) SupersedeDigests(ids []int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
 	for _, id := range ids {
 		if _, err := tx.Exec(`DELETE FROM exploration_edges
-			WHERE exploration_id=$1 AND src_id=$2 AND rel=$3`, s.expID, id, RelCovers); err != nil {
+			WHERE exploration_id = ? AND src_id = ? AND rel = ?`, s.expID, id, RelCovers); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE exploration_nodes SET state=$1 WHERE id=$2 AND exploration_id=$3 AND kind=$4`,
+		if _, err := tx.Exec(`UPDATE exploration_nodes SET state = ? WHERE id = ? AND exploration_id = ? AND kind = ?`,
 			StateDigestSuperseded, id, s.expID, KindDigest); err != nil {
 			return err
 		}
@@ -222,22 +251,20 @@ func (s *ExplorationStore) SupersedeDigests(ids []int64) error {
 
 // NodeAssets maps each of the given node ids → the asset ids it is anchored to
 // (exploration_anchors). Used to group cold digests by asset (§6.2 index).
+//
+// IN (…) 的占位符由 expInPlaceholders 逐个产出 `?` 并把值按同一顺序追加进 args；
+// 这里绝不能像 PG 那样按 $n 下标自举，否则参数顺序会与占位符错位。
 func (s *ExplorationStore) NodeAssets(ids []int64) (map[int64][]int64, error) {
 	out := map[int64][]int64{}
 	if len(ids) == 0 {
 		return out, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, s.expID)
-	for i, id := range ids {
-		placeholders[i] = fmt.Sprintf("$%d", i+2)
-		args = append(args, id)
-	}
+	args := []any{s.expID}
+	list := expInPlaceholders(ids, &args)
 	rows, err := s.db.Query(`SELECT a.node_id, a.asset_id
 		FROM exploration_anchors a
 		JOIN exploration_nodes n ON n.id=a.node_id
-		WHERE n.exploration_id=$1 AND a.node_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		WHERE n.exploration_id = ? AND a.node_id IN (`+list+`)`, args...)
 	if err != nil {
 		return nil, err
 	}

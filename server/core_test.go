@@ -131,9 +131,7 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.pg.EnsureLLMRecordsTable(); err != nil {
-		t.Fatal(err)
-	}
+	// llm_records 由 65 表基线目录 + schema.VerifyBaseline 保障，启动期建表调用已随 M12 删除。
 	if err := m.pg.InsertLLMRecord(&db.LLMRecord{TaskID: id, SessionID: "delete-test", Status: "ok", RequestBody: "secret"}); err != nil {
 		t.Fatal(err)
 	}
