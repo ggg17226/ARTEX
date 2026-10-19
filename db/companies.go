@@ -619,7 +619,8 @@ func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason str
 		valDomain, valNet, valVal       *string
 	)
 
-	switch rule.Kind {
+	// 根据 branch.ValueCol 精确判定目标载荷列与对应的 identity/hash 分支列
+	switch branch.ValueCol {
 	case "domain":
 		identDomain = branch.Identity
 		hashDomain = branch.Hash
@@ -632,13 +633,6 @@ func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason str
 		identVal = branch.Identity
 		hashVal = branch.Hash
 		valVal = &branch.Value
-	default:
-		// icp 与 keyword 对应 ValueCol="value"
-		if branch.ValueCol == "value" {
-			identVal = branch.Identity
-			hashVal = branch.Hash
-			valVal = &branch.Value
-		}
 	}
 
 	res, err := tx.Exec(`

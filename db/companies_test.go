@@ -317,6 +317,41 @@ func companyExecutableSQL(source string) string {
 // hash 唯一键表少写一对 identity/hash，那条唯一索引就永久退化成"全 NULL"，
 // 去重彻底失效而且一声不响（MySQL 唯一索引不约束 NULL）。所以"每一处 INSERT
 // 都写满了身份列"必须由测试守住，不能靠 review 的眼力。
+func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
+	// 验证 domain, net(ip/cidr), value(icp/keyword) 三个分支在生成 SQL 绑定时，
+	// 仅当前激活分支有值，其余分支均为 nil (SQL NULL)
+	rules := []ParsedScope{
+		{Kind: "domain", Domain: "example.com", Raw: "example.com"},
+		{Kind: "ip", Net: "1.1.1.1/32", Raw: "1.1.1.1"},
+		{Kind: "cidr", Net: "10.0.0.0/8", Raw: "10.0.0.0/8"},
+		{Kind: "icp", Value: "京ICP备12345678号", Raw: "京ICP备12345678号"},
+		{Kind: "keyword", Value: "Corp", Raw: "Corp"},
+	}
+	for _, r := range rules {
+		branch, err := companyScopeBranchFor(100, r)
+		if err != nil {
+			t.Fatalf("companyScopeBranchFor(%s): %v", r.Kind, err)
+		}
+		if branch.ValueCol == "" || len(branch.Identity) == 0 || len(branch.Hash) != 32 {
+			t.Fatalf("invalid branch for %s: %+v", r.Kind, branch)
+		}
+		switch r.Kind {
+		case "domain":
+			if branch.ValueCol != "domain" || branch.IdentCol != "identity_scope_domain" || branch.HashCol != "hash_scope_domain" {
+				t.Fatalf("domain mapping wrong: %+v", branch)
+			}
+		case "ip", "cidr":
+			if branch.ValueCol != "net" || branch.IdentCol != "identity_scope_net" || branch.HashCol != "hash_scope_net" {
+				t.Fatalf("net mapping wrong for %s: %+v", r.Kind, branch)
+			}
+		case "icp", "keyword":
+			if branch.ValueCol != "value" || branch.IdentCol != "identity_scope_value" || branch.HashCol != "hash_scope_value" {
+				t.Fatalf("value mapping wrong for %s: %+v", r.Kind, branch)
+			}
+		}
+	}
+}
+
 func TestCompaniesHashUniqueKeyWritesAreComplete(t *testing.T) {
 	raw, err := os.ReadFile("companies.go")
 	if err != nil {
