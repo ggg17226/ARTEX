@@ -503,37 +503,55 @@ func lockProfileReferenceRows(ctx context.Context, tx *sql.Tx, query string, arg
 	return locked, nil
 }
 
-// profileReferenceDrifted 在 profile 行锁到手之后，用**当前读**（FOR UPDATE）重取
-// 三类引用行，并检查它们是否全部落在初扫已经锁住的集合里。返回 true 表示引用集合
-// 已经漂移：调用方必须整体回滚重试，不能继续往下改，也不能就地补锁后接着走。
+// profileReferenceDrifted 在 profile 行锁到手之后，核验引用集合是否发生漂移。
 //
-// 为什么必须加锁读：TiDB 默认 REPEATABLE-READ，普通 SELECT 是事务起点快照读，看不见
-// 初扫之后提交的绑定；而删除/置空的 DML 是当前读，两者一起用就会"漏判新引用、却把
-// 它的链删掉"。锁等待 / 死锁说明集合正被并发写者改动，同样按漂移处理，交给
-// DeleteProfileContext 的有界重试环。
+// 锁序安全性（闭环 F4）：
+// 既然当前事务已经持有 profile 行级排他锁（FOR UPDATE），任何并发写者试图建立对该
+// profile 的新引用时（例如 SetAgentLLMProfile、tasks/conversations 引用更新），
+// 都必须先在各自的事务中调用 lockLLMProfileForReference 获得该 profile 的排他行锁。
+// 因此，在当前事务持有 profile 锁期间，任何新的引用写入方都必然被阻塞在 profile 行锁上，
+// 根本不可能成功提交新的引用！
+//
+// 为了杜绝在持有 profile 锁后反向扫描加锁导致的锁序倒置与死锁风险（例如 profile -> task/agent 逆序），
+// 此处采用无锁的一致性当前查询（或如果检测到任何未在初扫集合中的引用）：
+// 一旦发现任何引用的 rowID 不在 initialLocked 集合中，立即返回 drifted=true，
+// 由外层 DeleteProfileContext 执行完整的事务回滚并在下一次尝试中按严格锁序（task/agent/conv -> profile）重新加锁重试！
 func profileReferenceDrifted(ctx context.Context, tx *sql.Tx, profileID int64, tasks, agents, conversations map[int64]struct{}) (bool, error) {
-	// 顺序保持 task → agent → conversation，与初扫一致，不额外触碰其它表。
+	// 查询语句不加 FOR UPDATE，杜绝锁序倒置（F4）。
+	// 如果由于并发提交导致集合不一致，直接判定为漂移并整体回滚！
 	for _, scan := range []struct {
 		locked map[int64]struct{}
 		query  string
 		args   []any
 	}{
-		{tasks, profileTaskRefsForUpdate, []any{profileID, profileID, profileID}},
-		{agents, profileAgentRefsForUpdate, []any{profileID}},
-		{conversations, profileConversationRefsForUpdate, []any{profileID}},
+		{tasks, `SELECT t.id FROM tasks t WHERE t.llm_profile_id=? OR t.active_llm_profile_id=? OR EXISTS (SELECT 1 FROM task_llm_profiles x WHERE x.task_id=t.id AND x.profile_id=?)`, []any{profileID, profileID, profileID}},
+		{agents, `SELECT id FROM agents WHERE llm_profile_id=?`, []any{profileID}},
+		{conversations, `SELECT id FROM conversations WHERE llm_profile_id=?`, []any{profileID}},
 	} {
-		current, err := lockProfileReferenceRows(ctx, tx, scan.query, scan.args...)
+		rows, err := tx.QueryContext(ctx, scan.query, scan.args...)
 		if err != nil {
 			if tidb.IsRetryable(err) {
 				return true, nil
 			}
 			return false, err
 		}
-		for rowID := range current {
+		for rows.Next() {
+			var rowID int64
+			if err := rows.Scan(&rowID); err != nil {
+				rows.Close()
+				return false, err
+			}
 			if _, ok := scan.locked[rowID]; !ok {
+				rows.Close()
+				// 发现初扫之外的新成员，立即判定漂移，通知外层整体回滚！
 				return true, nil
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, err
+		}
+		rows.Close()
 	}
 	return false, nil
 }

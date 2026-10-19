@@ -135,23 +135,24 @@ func lockInterceptRuleForReference(tx *sql.Tx, ruleID int64) error {
 }
 
 // resolveInterceptRuleParent 在写入方的事务里判定 rule_id 这一列最终写什么：
-//   - ruleID == 0：本来就是无父规则（LLM 兜底判定）→ (nil, 0)；
-//   - 父规则存活：写 ruleID，decision_source 仍记 'rule'；
-//   - 父规则已被删除（陈旧请求）：写 NULL，并按"无规则"重算 decision_source，
-//     与 DeleteInterceptRule 的 SET NULL 语义一致 —— 审计记录要留下，但绝不能
-//     留下指向不存在规则的悬空引用让前端误判"规则还在"。
-func resolveInterceptRuleParent(tx *sql.Tx, ruleID int64) (*int64, int64, error) {
+//   - ruleID == 0：本来就是无父规则（LLM 兜底判定）→ (nil, nil)；
+//   - 父规则存活：写 &ruleID；
+//   - 父规则已被删除（陈旧请求）：写 NULL；
+//
+// 无论父规则是否存活，原始触发原因（原 ruleID != 0）始终保持真实记录：
+// decision_source 依然应当记录为 'rule'，不能被错误重算为 'model' 或 'unknown'（审查 N1）。
+func resolveInterceptRuleParent(tx *sql.Tx, ruleID int64) (*int64, error) {
 	if ruleID == 0 {
-		return nil, 0, nil
+		return nil, nil
 	}
 	if err := lockInterceptRuleForReference(tx, ruleID); err != nil {
 		if errors.Is(err, ErrInterceptRuleNotFound) {
-			return nil, 0, nil
+			return nil, nil
 		}
-		return nil, 0, err
+		return nil, err
 	}
 	id := ruleID
-	return &id, id, nil
+	return &id, nil
 }
 
 // DeleteInterceptRule removes a rule.
@@ -222,15 +223,15 @@ func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, too
 	}
 	defer tx.Rollback()
 	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
-	// ruleID != 0 但父规则已消失 → 同样写 NULL，decision_source 随之退回 model/unknown。
-	ruleIDPtr, sourceRuleID, err := resolveInterceptRuleParent(tx, ruleID)
+	// ruleID != 0 但父规则已消失 → 同样写 NULL，但 decision_source 仍记录真实的原始 ruleID（'rule'），杜绝篡改审计来源（N1）。
+	ruleIDPtr, err := resolveInterceptRuleParent(tx, ruleID)
 	if err != nil {
 		return 0, err
 	}
 	res, err := tx.Exec(`
 INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(sourceRuleID, reason), firstAudit(audits))
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(ruleID, reason), firstAudit(audits))
 	if err != nil {
 		return 0, err
 	}
@@ -275,14 +276,14 @@ func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, too
 	}
 	defer tx.Rollback()
 	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
-	ruleIDPtr, sourceRuleID, err := resolveInterceptRuleParent(tx, ruleID)
+	ruleIDPtr, err := resolveInterceptRuleParent(tx, ruleID)
 	if err != nil {
 		return 0, err
 	}
 	res, err := tx.Exec(`
 INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(3), ?, ?)`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(sourceRuleID, reason), firstAudit(audits))
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits))
 	if err != nil {
 		return 0, err
 	}

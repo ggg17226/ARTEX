@@ -89,14 +89,41 @@ func TestConfigStores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open TiDB failed: %v", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+
+	// 记录原有的 active profile（如果存在），以便测试结束时恢复
+	var origActiveID *int64
+	if act, err := d.ActiveProfile(); err == nil && act != nil {
+		id := act.ID
+		origActiveID = &id
+	}
+	t.Cleanup(func() {
+		if origActiveID != nil {
+			_ = d.SetActiveProfile(*origActiveID)
+		}
+	})
 
 	// LLM profile: save, active, key never serialized
 	pid, err := d.SaveProfile(&LLMProfile{Name: "t-default", Format: "openai", Model: "gpt-x", APIKey: "secret123"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM llm_profiles WHERE id=?`, pid)
+	t.Cleanup(func() {
+		if _, err := d.Exec(`DELETE FROM llm_profiles WHERE id=?`, pid); err != nil {
+			t.Errorf("cleanup llm_profile %d failed: %v", pid, err)
+		}
+		var count int
+		if err := d.QueryRow(`SELECT count(*) FROM llm_profiles WHERE id=?`, pid).Scan(&count); err != nil {
+			t.Errorf("query residual llm_profile failed: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("residual llm_profile %d found after cleanup", pid)
+		}
+	})
 	if err := d.SetActiveProfile(pid); err != nil {
 		t.Fatal(err)
 	}

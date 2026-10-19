@@ -71,11 +71,33 @@ func Open(dsn string) (*DB, error) {
 		return nil, withPrepareHint(err)
 	}
 	d := &DB{sqlDB}
-	if err := d.seedBuiltins(); err != nil {
+	// 跨实例安全：seedBuiltins 使用单例行 maintenance 排他锁串行化（F6）
+	if err := d.seedBuiltinsLocked(); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("seed builtins: %w", err)
 	}
 	return d, nil
+}
+
+// seedBuiltinsLocked 在事务内持有 maintenance 行级排他锁执行 seedBuiltins，
+// 彻底杜绝多实例或并发 Open 时检查与写入之间的竞态（F6）。
+func (d *DB) seedBuiltinsLocked() error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 锁定 maintenance 表中的 main 单例行进行启动串行化
+	var rowID uint64
+	if err := tx.QueryRow(`SELECT row_id FROM maintenance WHERE singleton_key = 'main' FOR UPDATE`).Scan(&rowID); err != nil {
+		return fmt.Errorf("lock maintenance for startup seed: %w", err)
+	}
+
+	if err := d.seedBuiltins(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // coordinateWithSchemaMigration 让"长时间、跨表的归档事务"与运维侧的 DDL /
@@ -292,18 +314,15 @@ func (d *DB) seedDefaultAssetInterceptRules() error {
 
 // insertAssetInterceptRuleSeed 幂等插入一条内置资产规则。
 // 新表 builtin 列 NOT NULL 且 MEDIUMTEXT 列没有 DDL 默认值，必须逐列显式给值。
+// 跨实例安全：采用单条原子的 INSERT ... SELECT ... WHERE NOT EXISTS 语法，彻底消除 SELECT COUNT 后的并发竞争窗口（F6）。
 func (d *DB) insertAssetInterceptRuleSeed(kind, pattern, note string) error {
-	var n int
-	if err := d.QueryRow(`
-SELECT COUNT(*) FROM asset_intercept_rules WHERE kind = ? AND pattern = ?`, kind, pattern).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return nil
-	}
 	_, err := d.Exec(`
 INSERT INTO asset_intercept_rules(enabled, kind, pattern, note, builtin)
-VALUES (TRUE, ?, ?, ?, TRUE)`, kind, pattern, note)
+SELECT TRUE, ?, ?, ?, TRUE
+FROM (SELECT 1) AS dummy
+WHERE NOT EXISTS (
+    SELECT 1 FROM asset_intercept_rules WHERE kind = ? AND pattern = ?
+)`, kind, pattern, note, kind, pattern)
 	return err
 }
 
@@ -364,22 +383,18 @@ type interceptRuleSeed struct {
 // insertInterceptRuleSeed 幂等插入一条内置拦截规则。
 //
 // 新基线 intercept_rules 的 name 上没有唯一索引（内置规则本就允许同名多行），
-// 所以 ON CONFLICT DO NOTHING 那种"靠约束去重"在 TiDB 上等于完全不去重，
-// 一旦 settings 开关丢失就会每次重启插一份重复规则。这里改成显式的 name 存在性
-// 判定：启动期单线程，判定与写入之间没有并发窗口。
+// 跨实例安全：采用单条原子的 INSERT ... SELECT ... WHERE NOT EXISTS 语法，彻底消除
+// 检查与写入之间的并发竞争，防止多进程首次启动时重复插入规则（F6）。
 func (d *DB) insertInterceptRuleSeed(r interceptRuleSeed) error {
-	var n int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM intercept_rules WHERE name = ?`, r.name).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return nil
-	}
 	_, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+FROM (SELECT 1) AS dummy
+WHERE NOT EXISTS (
+    SELECT 1 FROM intercept_rules WHERE name = ?
+)`,
 		r.name, r.enabled, r.priority, r.matchTarget, r.matchType, r.pattern, r.action, r.message,
-		r.timeoutEnabled, r.timeoutSeconds, r.timeoutAction)
+		r.timeoutEnabled, r.timeoutSeconds, r.timeoutAction, r.name)
 	return err
 }
 
