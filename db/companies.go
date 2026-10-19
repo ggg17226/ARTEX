@@ -604,15 +604,14 @@ func insertScopeRulesTx(tx *sql.Tx, companyID int64, rules []ParsedScope, reason
 // reported by MySQL 1062 on that branch's hash unique index, which is the TiDB
 // equivalent of the old ON CONFLICT … DO NOTHING (and, unlike PG, a 1062 does not
 // poison the surrounding transaction, so the remaining rules still get their turn).
-func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason string) (inserted bool, err error) {
-	branch, err := companyScopeBranchFor(companyID, rule)
+// computeScopeInsertArgs 纯函数：根据 companyID、rule 和 reason 计算 INSERT INTO company_scope 的 13 个参数。
+// 暴露该函数便于在离线单元测试中逐位精确断言激活分支列与非激活 nil 列（M1 测试闭环）。
+func computeScopeInsertArgs(companyID int64, rule ParsedScope, reason string) (branch companyScopeBranch, args []any, err error) {
+	branch, err = companyScopeBranchFor(companyID, rule)
 	if err != nil {
-		return false, err
+		return companyScopeBranch{}, nil, err
 	}
 
-	// 显式将未激活的另外两组 identity 与 hash 列绑定为 NULL（满足 M1 审查要求）：
-	// 无论当前是哪一个分支，全表 3 对 hash 与 identity 列在 INSERT 语句中完整列出，
-	// 仅当前激活分支传入有效值，其余两对显式传入 nil (SQL NULL)。
 	var (
 		identDomain, identNet, identVal []byte
 		hashDomain, hashNet, hashVal   []byte
@@ -635,6 +634,21 @@ func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason str
 		valVal = &branch.Value
 	}
 
+	args = []any{
+		companyID, rule.Kind, valDomain, valNet, valVal, rule.Raw, reason,
+		identDomain, hashDomain,
+		identNet, hashNet,
+		identVal, hashVal,
+	}
+	return branch, args, nil
+}
+
+func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason string) (inserted bool, err error) {
+	_, args, err := computeScopeInsertArgs(companyID, rule, reason)
+	if err != nil {
+		return false, err
+	}
+
 	res, err := tx.Exec(`
 INSERT INTO company_scope(
     company_id, kind, domain, net, value, raw, reason,
@@ -643,10 +657,7 @@ INSERT INTO company_scope(
     identity_scope_value, hash_scope_value
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		companyID, rule.Kind, valDomain, valNet, valVal, rule.Raw, reason,
-		identDomain, hashDomain,
-		identNet, hashNet,
-		identVal, hashVal,
+		args...,
 	)
 	if err != nil {
 		if tidb.IsDuplicateKey(err) {

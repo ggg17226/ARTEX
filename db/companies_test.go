@@ -318,35 +318,72 @@ func companyExecutableSQL(source string) string {
 // 去重彻底失效而且一声不响（MySQL 唯一索引不约束 NULL）。所以"每一处 INSERT
 // 都写满了身份列"必须由测试守住，不能靠 review 的眼力。
 func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
-	// 验证 domain, net(ip/cidr), value(icp/keyword) 三个分支在生成 SQL 绑定时，
-	// 仅当前激活分支有值，其余分支均为 nil (SQL NULL)
-	rules := []ParsedScope{
-		{Kind: "domain", Domain: "example.com", Raw: "example.com"},
-		{Kind: "ip", Net: "1.1.1.1/32", Raw: "1.1.1.1"},
-		{Kind: "cidr", Net: "10.0.0.0/8", Raw: "10.0.0.0/8"},
-		{Kind: "icp", Value: "京ICP备12345678号", Raw: "京ICP备12345678号"},
-		{Kind: "keyword", Value: "Corp", Raw: "Corp"},
+	// 验证 domain, net(ip/cidr), value(icp/keyword) 五种规则在生成 SQL 插入参数时，
+	// 13 个参数中的非激活载荷列与非激活 identity/hash 列必须严格为 nil (SQL NULL)！
+	rules := []struct {
+		rule     ParsedScope
+		valueCol string
+	}{
+		{ParsedScope{Kind: "domain", Domain: "example.com", Raw: "example.com"}, "domain"},
+		{ParsedScope{Kind: "ip", Net: "1.1.1.1/32", Raw: "1.1.1.1"}, "net"},
+		{ParsedScope{Kind: "cidr", Net: "10.0.0.0/8", Raw: "10.0.0.0/8"}, "net"},
+		{ParsedScope{Kind: "icp", Value: "京ICP备12345678号", Raw: "京ICP备12345678号"}, "value"},
+		{ParsedScope{Kind: "keyword", Value: "Corp", Raw: "Corp"}, "value"},
 	}
-	for _, r := range rules {
-		branch, err := companyScopeBranchFor(100, r)
+	for _, tc := range rules {
+		branch, args, err := computeScopeInsertArgs(100, tc.rule, "test")
 		if err != nil {
-			t.Fatalf("companyScopeBranchFor(%s): %v", r.Kind, err)
+			t.Fatalf("computeScopeInsertArgs(%s): %v", tc.rule.Kind, err)
 		}
-		if branch.ValueCol == "" || len(branch.Identity) == 0 || len(branch.Hash) != 32 {
-			t.Fatalf("invalid branch for %s: %+v", r.Kind, branch)
+		if len(args) != 13 {
+			t.Fatalf("expected 13 insert args, got %d", len(args))
 		}
-		switch r.Kind {
+		// args 布局：
+		// 0: company_id
+		// 1: kind
+		// 2: domain (*string)
+		// 3: net (*string)
+		// 4: value (*string)
+		// 5: raw
+		// 6: reason
+		// 7: identity_scope_domain ([]byte)
+		// 8: hash_scope_domain ([]byte)
+		// 9: identity_scope_net ([]byte)
+		// 10: hash_scope_net ([]byte)
+		// 11: identity_scope_value ([]byte)
+		// 12: hash_scope_value ([]byte)
+
+		valDomain := args[2].(*string)
+		valNet := args[3].(*string)
+		valVal := args[4].(*string)
+		identDomain, _ := args[7].([]byte)
+		hashDomain, _ := args[8].([]byte)
+		identNet, _ := args[9].([]byte)
+		hashNet, _ := args[10].([]byte)
+		identVal, _ := args[11].([]byte)
+		hashVal, _ := args[12].([]byte)
+
+		switch tc.valueCol {
 		case "domain":
-			if branch.ValueCol != "domain" || branch.IdentCol != "identity_scope_domain" || branch.HashCol != "hash_scope_domain" {
-				t.Fatalf("domain mapping wrong: %+v", branch)
+			if valDomain == nil || *valDomain != branch.Value || len(identDomain) == 0 || len(hashDomain) != 32 {
+				t.Fatalf("domain branch must be active: val=%v ident=%v hash=%v", valDomain, identDomain, hashDomain)
 			}
-		case "ip", "cidr":
-			if branch.ValueCol != "net" || branch.IdentCol != "identity_scope_net" || branch.HashCol != "hash_scope_net" {
-				t.Fatalf("net mapping wrong for %s: %+v", r.Kind, branch)
+			if valNet != nil || valVal != nil || identNet != nil || hashNet != nil || identVal != nil || hashVal != nil {
+				t.Fatalf("domain branch must have net and value columns set to nil: net=%v val=%v identNet=%v identVal=%v", valNet, valVal, identNet, identVal)
 			}
-		case "icp", "keyword":
-			if branch.ValueCol != "value" || branch.IdentCol != "identity_scope_value" || branch.HashCol != "hash_scope_value" {
-				t.Fatalf("value mapping wrong for %s: %+v", r.Kind, branch)
+		case "net":
+			if valNet == nil || *valNet != branch.Value || len(identNet) == 0 || len(hashNet) != 32 {
+				t.Fatalf("net branch must be active for %s: val=%v ident=%v hash=%v", tc.rule.Kind, valNet, identNet, hashNet)
+			}
+			if valDomain != nil || valVal != nil || identDomain != nil || hashDomain != nil || identVal != nil || hashVal != nil {
+				t.Fatalf("net branch must have domain and value columns set to nil: domain=%v val=%v identDomain=%v identVal=%v", valDomain, valVal, identDomain, identVal)
+			}
+		case "value":
+			if valVal == nil || *valVal != branch.Value || len(identVal) == 0 || len(hashVal) != 32 {
+				t.Fatalf("value branch must be active for %s: val=%v ident=%v hash=%v", tc.rule.Kind, valVal, identVal, hashVal)
+			}
+			if valDomain != nil || valNet != nil || identDomain != nil || hashDomain != nil || identNet != nil || hashNet != nil {
+				t.Fatalf("value branch must have domain and net columns set to nil: domain=%v net=%v identDomain=%v identNet=%v", valDomain, valNet, identDomain, identNet)
 			}
 		}
 	}
