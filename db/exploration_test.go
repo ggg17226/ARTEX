@@ -1447,15 +1447,15 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 		[]driver.Value{int64(10), "yields", int64(30)},
 		[]driver.Value{int64(10), "yields", int64(31)},
 	)
-	// 前置锁读：故意乱序返回，钉住「持锁后仍按主键升序重排」这一可重放性要求。
-	eng.on("SELECT id FROM findings WHERE id IN", []string{"id"},
+	// 两个 finding 节点名下各挂一行漏洞（故意乱序返回 702/701，断言加锁前排序生效）。
+	eng.on("SELECT id FROM findings WHERE node_id IN", []string{"id"},
 		[]driver.Value{int64(702)},
 		[]driver.Value{int64(701)},
 	)
-	// 两个 finding 节点名下各挂一行漏洞（701/702），其一有证据绑定与复测。
-	eng.on("SELECT id FROM findings", []string{"id"},
-		[]driver.Value{int64(701)},
+	// 前置锁读：故意再次乱序返回，钉住「持锁后仍按主键升序重排」这一可重放性要求。
+	eng.on("SELECT id FROM findings WHERE id IN", []string{"id"},
 		[]driver.Value{int64(702)},
+		[]driver.Value{int64(701)},
 	)
 
 	cleanup, err := d.Exploration(501).CancelIntent(10)
@@ -1491,6 +1491,15 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 		order["DELETE FROM finding_retests"] < order["DELETE FROM findings WHERE id IN"] &&
 		order["DELETE FROM findings WHERE id IN"] < order["DELETE FROM exploration_nodes"]) {
 		t.Fatalf("必须先锁 finding、再子表、再 findings、最后节点: %+v", order)
+	}
+
+	// 明确断言：即使定位查询返回的是乱序主键 [702, 701]，发出的前置锁参数也必须升序排序为 [701, 702]
+	lockCall := expCallFor(t, calls, "SELECT id FROM findings WHERE id IN")
+	if !strings.Contains(lockCall.Query, "FOR UPDATE") {
+		t.Fatalf("前置锁语句必须带 FOR UPDATE: %s", lockCall.Query)
+	}
+	if got := fmt.Sprint(lockCall.Args); got != "[701 702]" {
+		t.Fatalf("前置锁参数必须在加锁前完成升序排序: got %v, want [701 702]", lockCall.Args)
 	}
 
 	// 证据绑定按查到的 finding 主键整行删除（无 FK，没有置空这条路）。
