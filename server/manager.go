@@ -1437,8 +1437,9 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 // DeleteTask removes a task and optionally its related global data. Traffic has
 // no task-id column, so related exchanges are resolved by exact hosts from the
 // task's asset rows. Files are staged before the database operation; traffic is
-// staged while PostgreSQL excludes asset/anchor writers. Both are restored on a
-// database failure and purged only after its commit.
+// staged inside the deletion transaction while the cascade excludes asset/anchor
+// writers. A failed attempt unwinds its own traffic stage before the cascade
+// retries, and the surviving stage is purged only after the commit.
 func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResult, error) {
 	result := DeleteTaskResult{Deleted: id}
 	n, err := strconv.ParseInt(id, 10, 64)
@@ -1464,18 +1465,32 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	}
 
 	var trafficStage *traffic.HostDeleteStage
-	var prepare func(pgdb.TaskDeletePreparation) error
+	var prepare func(pgdb.TaskDeletePreparation) (pgdb.TaskDeleteUndo, error)
 	if opts.DeleteTraffic && m.traffic != nil {
-		prepare = func(p pgdb.TaskDeletePreparation) error {
+		// Attempt-scoped staging (R4): the cascade replays its whole payload on a
+		// retryable conflict, and StageDeleteHostsExact holds the traffic writer
+		// lock until the stage is committed or rolled back. The undo handed back is
+		// invoked as soon as the attempt that staged it fails, so the lock is
+		// released before a later attempt stages again — re-entering a live stage
+		// would deadlock on that very lock.
+		prepare = func(p pgdb.TaskDeletePreparation) (pgdb.TaskDeleteUndo, error) {
 			if len(p.TrafficHosts) == 0 {
-				return nil
+				return nil, nil
 			}
-			trafficStage, err = m.traffic.StageDeleteHostsExact(p.TrafficHosts)
+			stage, err := m.traffic.StageDeleteHostsExact(p.TrafficHosts)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			result.TrafficDeleted = trafficStage.Deleted()
-			return nil
+			trafficStage = stage
+			result.TrafficDeleted = stage.Deleted()
+			return func() error {
+				// The cascade owns this attempt's stage: drop the handle so the
+				// failure path below never rolls the same stage back twice.
+				if trafficStage == stage {
+					trafficStage = nil
+				}
+				return stage.Rollback()
+			}, nil
 		}
 	}
 
@@ -1487,6 +1502,9 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 			// 提交结局未知：严禁执行任何外部补偿（rollbackTaskDelete），挂起进入人工对账保护
 			return result, err
 		}
+		// Each failed attempt already unwound its own stage inside the cascade, so
+		// trafficStage is nil on every path that staged something; the file stage is
+		// still manager-owned (it predates the database transaction entirely).
 		return result, rollbackTaskDelete(err, trafficStage, fileStage)
 	}
 	result.AssetsDeleted = dbResult.AssetsDeleted

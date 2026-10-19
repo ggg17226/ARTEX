@@ -153,7 +153,12 @@ var assetWriteRetryDelays = []time.Duration{
 
 // errAssetWriteRetry 标记"本轮尝试已完整回滚，必须在新事务里重放"的内部信号。
 // 它只在外层重试循环内部出现，绝不会返回给调用方（耗尽后会被包装成显式错误）。
-var errAssetWriteRetry = errors.New("assets: retryable write conflict")
+//
+// **必须包装 lockorder.ErrApplicationRetry（R2）**：带 TaskID 的资产写者跑在
+// lockorder.TxRunner 上，没有 withAssetMutation 这层私有循环，重试判定只能从
+// 错误链做结构化分类；私有哨兵若对本包之外的 Runner 不可见，"候选在加锁前消失"
+// 这类信号就会变成终局错误，永远等不到新事务里的 Path A 重放。
+var errAssetWriteRetry = fmt.Errorf("assets: retryable write conflict: %w", lockorder.ErrApplicationRetry)
 
 // ErrAssetWriteRetriesExhausted 表示外层事务重试循环已耗尽。
 var ErrAssetWriteRetriesExhausted = errors.New("assets: write retry attempts exhausted")
@@ -801,6 +806,10 @@ type assetRawExpr string
 // assetWrite 是一次分支写入：全量插入列 + 身份不可变更新所需的回读列与合并器。
 type assetWrite struct {
 	branch assetBranch
+	// taskID > 0 表示本次写入同时把资产归属到该任务：writeAsset 必须在**同一事务**
+	// 里补一条 task_asset_links（PG 触发器 trg_assets_task_links 的 TiDB 替身，
+	// M26 / M30），否则 assets.task_ids 与 link 表就会分叉。
+	taskID int64
 	// insert 是业务列（不含 identity_*/hash_*，那些由引擎按严格激活规则追加）。
 	insert []assetCol
 	// mergeCols 是 Path A 在持锁保护下需要回读的非身份业务列。
@@ -886,10 +895,24 @@ func (s *AssetStore) writeAsset(w assetWrite) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	id := int64(0)
 	if candidate > 0 {
-		return s.assetPathA(ctx, w, candidate)
+		id, err = s.assetPathA(ctx, w, candidate)
+	} else {
+		id, err = s.assetPathB(ctx, w)
 	}
-	return s.assetPathB(ctx, w)
+	if err != nil {
+		return 0, err
+	}
+	// **双写闭环（R3）**：写资产与写归属在同一个事务、同一个出口里完成。
+	// 任何一条带 TaskID 的资产 upsert（含 subdomain/service 的嵌套副作用）都从这里
+	// 长出 link 行，绝不允许出现"task_ids 记了、link 没有"的半态。
+	if w.taskID > 0 {
+		if err := ensureTaskAssetLinkTx(ctx, s.tx, w.taskID, id); err != nil {
+			return 0, err
+		}
+	}
+	return id, nil
 }
 
 // assetCandidatePK 按 hash 唯一索引定位候选物理 PK（非锁定读；真正的悲观锁
@@ -1008,7 +1031,12 @@ func (s *AssetStore) assetPathB(ctx context.Context, w assetWrite) (int64, error
 	if err != nil {
 		if assetIsDuplicateKey(err) {
 			// 并发插入赢家：本轮尝试必须整体回滚，由外层重试循环在全新事务里转 Path A。
-			return 0, fmt.Errorf("%w: duplicate %s on branch %s: %v", errAssetWriteRetry, b.hashCol, b.name, err)
+			//
+			// **必须用 %w 保留原始 *mysql.MySQLError（R2）**：接入 lockorder.TxRunner 的
+			// 任务写者（TaskID > 0）拿不到本包私有的 withAssetMutation 循环，重试判定
+			// 完全依赖 `lockorder.IsRetryableConflict` 从错误链里**结构化**取到 1062。
+			// 用 %v 会把编号抹掉，输家只回滚一次就直接报错，永远不会在新事务里转 Path A。
+			return 0, fmt.Errorf("%w: duplicate %s on branch %s: %w", errAssetWriteRetry, b.hashCol, b.name, err)
 		}
 		return 0, err
 	}
@@ -1153,6 +1181,40 @@ func assetTaskIDsOf(taskID int64) []int64 {
 	return nil
 }
 
+// runTaskBoundUpsert 是**带 TaskID 的资产 upsert** 的统一事务边界（R3）：
+//
+//   - s.tx != nil：外层已经持有业务门禁与父任务行锁（写者协议入口唯一赋予该推定），
+//     直接执行；在同一事务里重复取父锁只会自锁；
+//   - s.tx == nil 且 taskID > 0：经写者协议（全局业务门禁 → 行锁父任务 → 核验存活 →
+//     整体退避重放）。正在被级联删除的任务不可能再被挂上新资产（I1 屏障）；
+//   - s.tx == nil 且无 TaskID：走资产引擎自己的 1062/1205/1213 重试循环。
+//
+// 归属 link 的双写不在这里做，而在 writeAsset 这个**唯一写入出口**里完成：嵌套副作用
+// （subdomain 顺带 upsert root_domain / IP 等）复用同一个 s.tx，同样会经过出口，
+// 因此"task_ids 记了、link 没跟上"的分支被结构性排除。
+func (s *AssetStore) runTaskBoundUpsert(taskID int64, upsert func(*AssetStore) (int64, error)) (int64, error) {
+	if s.tx != nil {
+		return upsert(s)
+	}
+	if taskID <= 0 {
+		return s.withCompanyScopeMutation(upsert)
+	}
+	var out int64
+	err := s.withTaskChildWriter(taskID, func(_ context.Context, tx *sql.Tx) error {
+		scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
+		id, err := upsert(scoped)
+		if err != nil {
+			return err
+		}
+		out = id
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
 // =====================================================================
 // UpsertRootDomain
 // =====================================================================
@@ -1171,20 +1233,7 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 		return 0, fmt.Errorf("domain is required")
 	}
 	if s.tx == nil {
-		if req.TaskID > 0 {
-			var assetID int64
-			err := s.withTaskChildWriter(req.TaskID, func(ctx context.Context, tx *sql.Tx) error {
-				scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
-				id, err := scoped.UpsertRootDomain(req)
-				if err != nil {
-					return err
-				}
-				assetID = id
-				return upsertTaskAssetLinkTx(ctx, tx, req.TaskID, id, defaultTaskAssetSource, "", nil)
-			})
-			return assetID, err
-		}
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertRootDomain(req)
 		})
 	}
@@ -1201,6 +1250,7 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 	branch := newAssetBranch("assets_root_domain", schema.AssetsRootDomainIdentity(domain))
 	return s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "root_domain"},
 			{"domain", domain},
@@ -1272,7 +1322,7 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 		return 0, fmt.Errorf("%w: %s", ErrAssetIPInvalid, req.IP)
 	}
 	if s.tx == nil {
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertIP(req)
 		})
 	}
@@ -1301,6 +1351,7 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 	branch := newAssetBranch("assets_ip", schema.AssetsIPIdentity(ipStr))
 	return s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "ip"},
 			{"ip", ipStr},
@@ -1469,7 +1520,7 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		return 0, fmt.Errorf("domain is required")
 	}
 	if s.tx == nil {
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertSubdomain(req)
 		})
 	}
@@ -1554,6 +1605,7 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 	branch := newAssetBranch("assets_subdomain", schema.AssetsSubdomainIdentity(domain, recordType))
 	return s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "subdomain"},
 			{"domain", domain},
@@ -1614,7 +1666,7 @@ func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 		return 0, fmt.Errorf("app name is required")
 	}
 	if s.tx == nil {
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertApp(req)
 		})
 	}
@@ -1653,6 +1705,7 @@ func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 
 	return s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "app"},
 			{"bundle_id", bundleCol},
@@ -1715,7 +1768,7 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	}
 	normURL := normalizeURL(req.URL)
 	if s.tx == nil {
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertHTTPService(req)
 		})
 	}
@@ -1765,6 +1818,7 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	branch := newAssetBranch("assets_service_http", schema.AssetsServiceHTTPIdentity(normURL))
 	id, err := s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "service"},
 			{"service_type", "http"},
@@ -1885,7 +1939,7 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 		return 0, fmt.Errorf("service_name is required")
 	}
 	if s.tx == nil {
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertOtherService(req)
 		})
 	}
@@ -1940,6 +1994,7 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 		domain, canonicalIPStr, uint64(req.Port), false, serviceName, false))
 	id, err := s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "service"},
 			{"service_type", "other"},
@@ -2047,7 +2102,7 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	normURL := normalizeURL(req.URL)
 	if s.tx == nil {
-		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
+		return s.runTaskBoundUpsert(req.TaskID, func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertEndpoint(req)
 		})
 	}
@@ -2093,6 +2148,7 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	branch := newAssetBranch("assets_endpoint", schema.AssetsEndpointIdentity(normURL, method))
 	id, err := s.writeAsset(assetWrite{
 		branch: branch,
+		taskID: req.TaskID,
 		insert: append([]assetCol{
 			{"type", "endpoint"},
 			{"url", normURL},

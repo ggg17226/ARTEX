@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Autumn-27/artex/db/lockorder"
 	"github.com/Autumn-27/artex/db/schema"
 	"github.com/go-sql-driver/mysql"
 )
@@ -1729,6 +1730,34 @@ func (e *assetMockEngine) handle(c assetMockCall) assetMockReply {
 	q := c.Query
 	upper := strings.ToUpper(q)
 
+	// 0) 写者协议替身（P08-02 Task 2.3 R7）：带 TaskID 的资产 upsert 现在必须走完整
+	//    写者协议 —— 全局业务门禁行 → 父任务行锁 + 存活核验 → 资产写入 → link 双写。
+	//    mock 不模拟并发，只需让"门禁行存在""父任务存活"两个前提成立，
+	//    使协议链路在离线替身上与真机同构（而不是像之前那样 unsupported statement 报错）。
+
+	// 0.1 业务门禁 / 命名空间：INSERT IGNORE INTO locks (name) VALUES (?)
+	if strings.HasPrefix(upper, "INSERT IGNORE INTO LOCKS") {
+		return assetMockReply{rowsAffected: 1}
+	}
+	// 0.2 门禁行锁：SELECT name FROM locks WHERE name = ? FOR UPDATE
+	if strings.Contains(upper, "FROM LOCKS") {
+		name := driver.Value("")
+		if len(c.Args) > 0 {
+			name = c.Args[0]
+		}
+		return assetReplyRows([]string{"name"}, []driver.Value{name})
+	}
+	// 0.3 父任务存活核验：SELECT deleted_at IS NULL FROM tasks WHERE id = ? FOR UPDATE
+	if strings.Contains(upper, "FROM TASKS") {
+		return assetReplyRows([]string{"alive"}, []driver.Value{int64(1)})
+	}
+	// 0.4 归属双写：INSERT INTO task_asset_links … ON DUPLICATE KEY UPDATE
+	//     它不是 assets 分支写入，不参与 8 对 identity/hash 与 hash 唯一索引校验；
+	//     真实"link 是否被写"由测试侧的语句断言负责。
+	if strings.Contains(upper, "INTO TASK_ASSET_LINKS") {
+		return assetReplyInsert(1)
+	}
+
 	// 1) 公司归属解析：一律"无匹配企业"。
 	if strings.Contains(q, "FROM company_scope") {
 		return assetReplyNoRows("company_id")
@@ -2156,7 +2185,10 @@ func assetAssertTiDBDialect(t *testing.T, calls []assetMockCall) {
 		if strings.Contains(c.Query, "$1") || strings.Contains(c.Query, "$2") {
 			t.Fatalf("PostgreSQL placeholder in %s", c.line())
 		}
-		for _, frag := range []string{"RETURNING", "ON CONFLICT", "ON DUPLICATE KEY UPDATE", "array_to_json", "::jsonb", "::bigint", "::cidr", "unnest(", "ILIKE", "DISTINCT ON"} {
+		// ON DUPLICATE KEY UPDATE 是 MySQL/TiDB 语法（task_asset_links 双写合法使用），
+		// 不列入 PG 残留；assets 主写入"必须是严格 INSERT、不得带 ODKU"由 mock 引擎
+		// 在 INSERT 分派里单独把关（assetMockEngine.handle）。
+		for _, frag := range []string{"RETURNING", "ON CONFLICT", "array_to_json", "::jsonb", "::bigint", "::cidr", "unnest(", "ILIKE", "DISTINCT ON"} {
 			if strings.Contains(strings.ToUpper(c.Query), strings.ToUpper(frag)) {
 				t.Fatalf("PostgreSQL dialect fragment %q in %s", frag, c.line())
 			}
@@ -2183,12 +2215,58 @@ func assetCallsString(calls []assetMockCall) string {
 	return "\n" + strings.Join(parts, "\n")
 }
 
+// assetContainsArg 判断语句参数里是否出现某个整数绑定值（容忍 int64/int 两种形态）。
+func assetContainsArg(args []driver.Value, want int64) bool {
+	for _, a := range args {
+		switch v := a.(type) {
+		case int64:
+			if v == want {
+				return true
+			}
+		case int:
+			if int64(v) == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func assetWantString(t *testing.T, v driver.Value, want, what string) {
 	t.Helper()
 	got, _ := assetBytes(v)
 	if string(got) != want {
 		t.Fatalf("%s = %q, want %q", what, string(got), want)
 	}
+}
+
+// assetIsWriterProtocol 判定"写者协议自身"的语句（业务门禁行、命名空间行、父任务
+// 存活核验）。它们由 lockorder 的 Runner 在**任何业务 DML 之前**发出，用来把
+// "本事务正在向这个任务追加子实体"登记进全局门禁，不属于业务写集。
+func assetIsWriterProtocol(c assetMockCall) bool {
+	upper := strings.ToUpper(c.Query)
+	return strings.HasPrefix(upper, "INSERT IGNORE INTO LOCKS") ||
+		strings.Contains(upper, "FROM LOCKS") ||
+		strings.Contains(upper, "FROM TASKS")
+}
+
+// assetIsBusinessDML 判定一条**业务**写入（assets 分支行与其归属 link），
+// 排除写者协议自身的全局门禁语句。
+func assetIsBusinessDML(c assetMockCall) bool {
+	return c.isExec() && (strings.Contains(c.Query, "INSERT INTO assets") ||
+		strings.Contains(c.Query, "UPDATE assets") ||
+		strings.Contains(c.Query, "INSERT INTO task_asset_links"))
+}
+
+// assetIsAssetsInsert 判定 assets 分支的严格 INSERT（不含 task_asset_links 双写）。
+func assetIsAssetsInsert(c assetMockCall) bool {
+	return c.isInsert() && strings.Contains(strings.ToUpper(c.Query), "INTO ASSETS")
+}
+
+// assetIsTaskLinkInsert 判定 task_asset_links 的双写语句（assetMockCall.isInsert
+// 刻意只认 assets 分支写入，因此这里单独判别）。
+func assetIsTaskLinkInsert(c assetMockCall) bool {
+	return c.isExec() && strings.Contains(c.Query, "INSERT INTO task_asset_links")
 }
 
 // assetIsArbitration 判定 schema.VerifyHashArbitration 发出的那条带 hash 列的行锁读取。
@@ -2202,8 +2280,14 @@ func assetIsCandidateLookup(c assetMockCall) bool {
 }
 
 // assetIsPKLock 判定 `SELECT id FROM assets WHERE id = ? FOR UPDATE` 行级悲观锁。
+// 必须限定表名：写者协议的父任务存活核验 `… FROM tasks WHERE id = ? FOR UPDATE`
+// 形态相同，混判会让时序断言指错语句。
 func assetIsPKLock(c assetMockCall) bool {
-	return c.isSelectForUpdate() && strings.Contains(strings.ReplaceAll(c.Query, "`", ""), "WHERE id = ? FOR UPDATE")
+	if !c.isSelectForUpdate() {
+		return false
+	}
+	normalized := strings.ToUpper(strings.ReplaceAll(c.Query, "`", ""))
+	return strings.Contains(normalized, " FROM ASSETS ") && strings.Contains(normalized, "WHERE ID = ? FOR UPDATE")
 }
 
 // =============================================================================
@@ -2234,11 +2318,33 @@ func TestAssets_RootDomainUpsert_VerifyBeforeUpdate(t *testing.T) {
 	}
 	assetAssertTiDBDialect(t, calls)
 
-	inserts := eng.callsFor(assetMockCall.isInsert)
-	if len(inserts) != 1 {
-		t.Fatalf("Path B must issue exactly one strict INSERT, got %d%s", len(inserts), assetCallsString(calls))
+	// R3 双写：assets 分支的严格 INSERT 恰好一条，归属 link 另计一条。
+	assetsInserts := eng.callsFor(assetIsAssetsInsert)
+	if len(assetsInserts) != 1 {
+		t.Fatalf("Path B must issue exactly one strict assets INSERT, got %d%s", len(assetsInserts), assetCallsString(calls))
 	}
-	ins := inserts[0]
+	ins := assetsInserts[0]
+
+	// R3 写者协议：TaskID > 0 的入口必须先过业务门禁 + 父任务行锁，再写资产与 link。
+	if assetIndexOf(calls, assetIsWriterProtocol) < 0 {
+		t.Fatalf("TaskID > 0 must run the writer protocol (business gate + parent task lock) before any asset DML:%s", assetCallsString(calls))
+	}
+	if gateIdx := assetIndexOf(calls, func(c assetMockCall) bool {
+		return strings.HasPrefix(strings.ToUpper(c.Query), "INSERT IGNORE INTO LOCKS")
+	}); !(gateIdx >= 0 && gateIdx < assetIndexOf(calls, assetIsAssetsInsert)) {
+		t.Fatalf("business gate must be taken before the asset write (gate=%d):%s", gateIdx, assetCallsString(calls))
+	}
+	links := eng.callsFor(assetIsTaskLinkInsert)
+	if len(links) != 1 {
+		t.Fatalf("TaskID > 0 must double-write exactly one task_asset_links row in the same transaction, got %d:%s",
+			len(links), assetCallsString(calls))
+	}
+	if !assetContainsArg(links[0].Args, int64(7)) {
+		t.Fatalf("task_asset_links row must bind the writer task id 7, got %v", links[0].Args)
+	}
+	if assetIndexOf(calls, func(c assetMockCall) bool { return c.Kind == assetKindCommit }) < 0 {
+		t.Fatal("link double-write must be committed with the asset row, not after it")
+	}
 	cols := assetInsertColumns(ins.Query)
 	assetWantString(t, assetColumnArg(cols, ins.Args, "type"), "root_domain", "insert type")
 	assetWantString(t, assetColumnArg(cols, ins.Args, "domain"), domain, "insert domain")
@@ -2932,9 +3038,11 @@ func TestAssets_NestedRootDomainCollisionRollsBackWholeTransaction(t *testing.T)
 		t.Fatalf("nested collision must roll the whole transaction back exactly once (begins=%d commits=%d rollbacks=%d)%s",
 			begins, commits, rollbacks, assetCallsString(calls))
 	}
-	// 协议层零写入：整笔事务里连一条 DML 都不允许出现。
-	if got := eng.callsFor(func(c assetMockCall) bool { return c.isInsert() || c.isUpdate() }); len(got) != 0 {
-		t.Fatalf("nested collision must not issue any DML, first write: %s%s", got[0].line(), assetCallsString(calls))
+	// 协议层零业务写入：整笔事务里连一条**业务** DML 都不允许出现。
+	// 写者协议自身的全局门禁行（INSERT IGNORE INTO locks / 父任务存活核验）由 Runner
+	// 在任何业务 DML 之前发出，是"本事务正在追加子实体"的登记，不计入业务写集。
+	if got := eng.callsFor(assetIsBusinessDML); len(got) != 0 {
+		t.Fatalf("nested collision must not issue any business DML, first write: %s%s", got[0].line(), assetCallsString(calls))
 	}
 	// 状态层零写入：回滚后表必须回到 begin 时刻。
 	if eng.rowCount() != rowsBefore {
@@ -3375,5 +3483,213 @@ func TestAssets_WriteRetryBackoffLadderAligned(t *testing.T) {
 		if assetWriteRetryDelays[i] < assetWriteRetryDelays[i-1] {
 			t.Fatalf("backoff ladder must be non-decreasing: %v", assetWriteRetryDelays)
 		}
+	}
+}
+
+// =============================================================================
+// 修复轮次 2 — R3：所有带 TaskID 的资产入口都必须走写者协议并原子双写归属
+// =============================================================================
+//
+// PG 时代的 trg_assets_task_links 触发器被 native 化后，assets.task_ids（JSON）与
+// task_asset_links（关系表）的双写点只剩 writeAsset 一处。任何一个入口绕过它，
+// 就会留下"JSON 里有 task、关系表里没有"的孤儿归属（M26/M30）。
+// 这里逐个入口验证三件事：① 业务门禁先于业务 DML；② 真实父任务被行锁核验存活；
+// ③ task_asset_links 与资产行同事务双写（提交前完成，绝不事后补写）。
+
+func TestAssets_EveryTaskBoundEntryDoubleWritesOwnership(t *testing.T) {
+	stamp := time.Now().UnixNano()
+	const ownerTask int64 = 4242
+
+	type entry struct {
+		name string
+		call func(*AssetStore, int64) error
+	}
+	entries := []entry{
+		{"root_domain", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("r3-root-%d.example.com", stamp), TaskID: taskID})
+			return err
+		}},
+		{"ip", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertIP(UpsertIPReq{IP: fmt.Sprintf("198.51.100.%d", stamp%200+10), TaskID: taskID})
+			return err
+		}},
+		{"subdomain", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertSubdomain(UpsertSubdomainReq{Domain: fmt.Sprintf("r3-sub-%d.example.com", stamp), RecordType: "A", TaskID: taskID})
+			return err
+		}},
+		{"app", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertApp(UpsertAppReq{Name: fmt.Sprintf("r3-app-%d", stamp), TaskID: taskID})
+			return err
+		}},
+		{"service_http", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertHTTPService(UpsertHTTPServiceReq{URL: fmt.Sprintf("http://r3-http-%d.example.com/", stamp), TaskID: taskID})
+			return err
+		}},
+		{"service_other", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertOtherService(UpsertOtherServiceReq{Domain: fmt.Sprintf("r3-other-%d.example.com", stamp), Port: 3306, ServiceName: "mysql", TaskID: taskID})
+			return err
+		}},
+		{"endpoint", func(s *AssetStore, taskID int64) error {
+			_, err := s.UpsertEndpoint(UpsertEndpointReq{URL: fmt.Sprintf("http://r3-api-%d.example.com/v1/ping", stamp), Method: "GET", TaskID: taskID})
+			return err
+		}},
+	}
+
+	for _, e := range entries {
+		e := e
+		t.Run(e.name, func(t *testing.T) {
+			eng := newAssetMockEngine()
+			d := openAssetMockDB(t, eng)
+
+			if err := e.call(d.Assets(), ownerTask); err != nil {
+				t.Fatalf("task-bound %s upsert failed: %v", e.name, err)
+			}
+
+			calls := eng.snapshot()
+			assetAssertTiDBDialect(t, calls)
+
+			assetsWrites := eng.callsFor(func(c assetMockCall) bool { return assetIsAssetsInsert(c) || assetMockCallIsAssetsUpdate(c) })
+			if len(assetsWrites) == 0 {
+				t.Fatalf("%s upsert wrote no asset row:%s", e.name, assetCallsString(calls))
+			}
+			links := eng.callsFor(assetIsTaskLinkInsert)
+			if len(links) == 0 {
+				t.Fatalf("%s must double-write task_asset_links in the same transaction:%s", e.name, assetCallsString(calls))
+			}
+			for _, link := range links {
+				if !assetContainsArg(link.Args, ownerTask) {
+					t.Fatalf("task_asset_links row must bind the writer task id %d, got %v", ownerTask, link.Args)
+				}
+			}
+			// ① 业务门禁 → ② 父任务存活核验，都必须早于第一条业务 DML。
+			firstBusiness := -1
+			for i, c := range calls {
+				if assetIsBusinessDML(c) {
+					firstBusiness = i
+					break
+				}
+			}
+			gate := assetIndexOf(calls, func(c assetMockCall) bool {
+				return strings.HasPrefix(strings.ToUpper(c.Query), "INSERT IGNORE INTO LOCKS")
+			})
+			parent := assetIndexOf(calls, func(c assetMockCall) bool {
+				return strings.Contains(c.Query, "FROM tasks WHERE id = ? FOR UPDATE")
+			})
+			if !(gate >= 0 && parent >= 0 && firstBusiness >= 0 && gate < firstBusiness && parent < firstBusiness) {
+				t.Fatalf("%s must take the business gate and lock the live parent task before any asset DML (gate=%d parent=%d firstBusiness=%d):%s",
+					e.name, gate, parent, firstBusiness, assetCallsString(calls))
+			}
+			// ③ 双写必须发生在提交之前（同事务原子），不允许提交后补写归属。
+			commitIdx := assetIndexOf(calls, func(c assetMockCall) bool { return c.Kind == assetKindCommit })
+			lastLink := -1
+			for i, c := range calls {
+				if assetIsTaskLinkInsert(c) {
+					lastLink = i
+				}
+			}
+			if !(lastLink >= 0 && commitIdx >= 0 && lastLink < commitIdx) {
+				t.Fatalf("ownership double-write must be committed with the asset row (link=%d commit=%d):%s", lastLink, commitIdx, assetCallsString(calls))
+			}
+			if _, commits, rollbacks := eng.txCounts(); commits != 1 || rollbacks != 0 {
+				t.Fatalf("%s must commit exactly once without retries (commits=%d rollbacks=%d)%s", e.name, commits, rollbacks, assetCallsString(calls))
+			}
+		})
+	}
+}
+
+// assetMockCallIsAssetsUpdate 判别 assets 业务列更新（isUpdate 已限定 UPDATE assets）。
+func assetMockCallIsAssetsUpdate(c assetMockCall) bool { return c.isUpdate() }
+
+// =============================================================================
+// 修复轮次 2 — R2：1062 必须以结构化错误穿透包装链，交给 TxRunner 分类重试
+// =============================================================================
+
+// TestAssets_TaskBound1062RollsBackAndReplaysInFreshTransaction 注入"并发赢家抢先"：
+// 第一次严格 INSERT 返回 1062。修复前 assetPathB 用 %v 吞掉 *mysql.MySQLError，
+// TxRunner 把它当普通失败直接上抛（begins=1、错误落库）；修复后必须
+// **整笔回滚 → 全新事务重放 → 成功**。
+func TestAssets_TaskBound1062RollsBackAndReplaysInFreshTransaction(t *testing.T) {
+	domain := fmt.Sprintf("r2-race-%d.example.com", time.Now().UnixNano())
+
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	injected := 0
+	eng.setHook(func(c assetMockCall) (assetMockReply, bool) {
+		if !assetIsAssetsInsert(c) {
+			return assetMockReply{}, false
+		}
+		injected++
+		if injected == 1 {
+			return assetReplyErr(&mysql.MySQLError{
+				Number:  1062,
+				Message: "Duplicate entry for key 'assets.hash_root_domain'",
+			}), true
+		}
+		return assetMockReply{}, false
+	})
+
+	id, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: 91})
+	if err != nil {
+		t.Fatalf("the losing writer must replay in a fresh transaction, got %v", err)
+	}
+	if injected < 2 {
+		t.Fatalf("the strict INSERT must be issued again on the replayed attempt, injections=%d", injected)
+	}
+	begins, commits, rollbacks := eng.txCounts()
+	if begins < 2 {
+		t.Fatalf("1062 must roll the whole attempt back and replay (begins=%d commits=%d rollbacks=%d)", begins, commits, rollbacks)
+	}
+	if rollbacks < 1 || commits != 1 {
+		t.Fatalf("expected one rolled-back attempt and exactly one commit (begins=%d commits=%d rollbacks=%d)", begins, commits, rollbacks)
+	}
+	if got := eng.rowCount(); got != 1 {
+		t.Fatalf("the replayed attempt must leave exactly one asset row, rows=%d (id=%d)", got, id)
+	}
+}
+
+// TestAssets_TaskBound1062KeepsTheMySQLNumber 是 R2 的可证伪判据：每次 INSERT 都返回
+// 1062 → 重试耗尽，终态错误链必须仍然能被 errors.As 结构化取到
+// *mysql.MySQLError{Number:1062}。用 %v 包装时这条断言必然失败。
+func TestAssets_TaskBound1062KeepsTheMySQLNumber(t *testing.T) {
+	domain := fmt.Sprintf("r2-exhaust-%d.example.com", time.Now().UnixNano())
+
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	attempts := 0
+	eng.setHook(func(c assetMockCall) (assetMockReply, bool) {
+		if !assetIsAssetsInsert(c) {
+			return assetMockReply{}, false
+		}
+		attempts++
+		return assetReplyErr(&mysql.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry for key 'assets.hash_root_domain'",
+		}), true
+	})
+
+	_, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: 92})
+	if err == nil {
+		t.Fatal("a permanently losing writer must surface an error")
+	}
+	if !errors.Is(err, lockorder.ErrRetryExhausted) {
+		t.Fatalf("a classified 1062 must exhaust the retry budget, got %v", err)
+	}
+	var myErr *mysql.MySQLError
+	if !errors.As(err, &myErr) {
+		t.Fatalf("the terminal error must still expose the structured MySQL error (R2: %%w, not %%v), got %v", err)
+	}
+	if myErr.Number != 1062 {
+		t.Fatalf("MySQL number must survive the wrapper chain, got %d", myErr.Number)
+	}
+	if !lockorder.IsRetryableConflict(myErr) {
+		t.Fatal("the extracted error must be classified retryable by the runner")
+	}
+	if attempts < 2 {
+		t.Fatalf("the runner must actually retry a 1062, attempts=%d", attempts)
+	}
+	if _, _, rollbacks := eng.txCounts(); rollbacks == 0 {
+		t.Fatal("every failed attempt must be rolled back")
 	}
 }

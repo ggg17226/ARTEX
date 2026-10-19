@@ -129,17 +129,6 @@ func newNarrowWriter(ctx context.Context, tx cascadeExecer, audit *CascadeExecut
 	return w, nil
 }
 
-// allowExtra 把"已枚举但未纳锁"的记账表写集并入收敛集合（当前只有 llm_records：
-// 持续追加的记账表若纳入成员复核，运行中的任务会永远漂移到重试耗尽）。
-func (w *narrowWriter) allowExtra(table string, pks []uint64) {
-	if w.locked[table] == nil {
-		w.locked[table] = make(map[uint64]struct{}, len(pks))
-	}
-	for _, pk := range pks {
-		w.locked[table][pk] = struct{}{}
-	}
-}
-
 // check 校验目标表在 Catalog 内，且绑定 PK 全部落在收敛集合内。
 func (w *narrowWriter) check(table string, pks []uint64) (string, error) {
 	meta, err := lockorder.LookupTableName(table)
@@ -290,19 +279,20 @@ func executeTaskCascade(
 
 	// Step 2: findings —— 整行删除，或按列置空（同行两列都要置空时只发一条语句）
 	if closure.Options.DeleteFindings {
-		// 删除 findings 时，必须先清理其关联弱引用子表（基线无 FK 约束）：
-		// 级联清理 finding_assets、finding_retests、finding_traffic_bindings
-		if len(closure.FindingIDs) > 0 {
-			fArgs := uint64Args(closure.FindingIDs)
-			ph := closurePlaceholders(len(closure.FindingIDs))
-			if _, err := tx.ExecContext(ctx, "DELETE FROM finding_assets WHERE finding_id IN ("+ph+")", fArgs...); err != nil {
-				return nil, fmt.Errorf("cascade delete finding_assets: %w", err)
-			}
-			if _, err := tx.ExecContext(ctx, "DELETE FROM finding_retests WHERE finding_id IN ("+ph+")", fArgs...); err != nil {
-				return nil, fmt.Errorf("cascade delete finding_retests: %w", err)
-			}
-			if _, err := tx.ExecContext(ctx, "DELETE FROM finding_traffic_bindings WHERE finding_id IN ("+ph+")", fArgs...); err != nil {
-				return nil, fmt.Errorf("cascade delete finding_traffic_bindings: %w", err)
+		// findings 的三张无 FK 子表必须由闭包**枚举物理 PK → 纳锁 → 逆拓扑按 PK 删除**。
+		// 这里曾经写过 `DELETE FROM finding_assets WHERE finding_id IN (...)`：那是
+		// 开放范围 DML —— 拿计划外的锁、删计划外的行、绕过 narrowWriter 的收敛校验
+		// 与行数审计（R1 判红样本），现已彻底移除。
+		for _, child := range []struct {
+			table string
+			ids   []uint64
+		}{
+			{"finding_traffic_bindings", closure.FindingTrafficBindingIDs},
+			{"finding_retests", closure.FindingRetestIDs},
+			{"finding_assets", closure.FindingAssetIDs},
+		} {
+			if err := w.deleteByPK(child.table, child.ids); err != nil {
+				return nil, err
 			}
 		}
 		if err := w.deleteByPK("findings", closure.FindingIDs); err != nil {

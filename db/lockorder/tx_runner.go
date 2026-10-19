@@ -29,6 +29,15 @@ var (
 	ErrRetryExhausted = errors.New("lockorder: transaction retry attempts exhausted")
 	ErrOutcomeUnknown = errors.New("lockorder: transaction commit outcome unknown, local gates held")
 
+	// ErrApplicationRetry 是**调用方声明**的可重试写冲突哨兵（R2 适配缺口）：
+	// 应用层的定位失效（候选行在加锁前消失、仲裁返回的 PK 与候选不一致等）和
+	// 1062/1205/1213 语义同构 —— 本轮必须整体回滚并在全新事务里重放 —— 但它
+	// 天生没有 MySQL 错误编号，Runner 的结构化编号分类看不见它。
+	//
+	// 需要这层语义的调用方把自己私有的重试信号包装上本哨兵即可；它只表达
+	// "整体回滚后重放"，不参与 unknown-outcome 的 fail closed 判定。
+	ErrApplicationRetry = errors.New("lockorder: application-level retryable conflict")
+
 	// ErrNilTx 导出执行入口收到 nil *sql.Tx 时返回：禁止把"没有真实加锁"当离线成功（R2 I9）
 	ErrNilTx = errors.New("lockorder: nil transaction handle")
 )
@@ -139,6 +148,12 @@ func IsRetryableConflict(err error) bool {
 
 	// 连接池准入背压（R2 I2）：容量暂时不足，退避后重试是正确响应。
 	if errors.Is(err, ErrAdmissionTimeout) {
+		return true
+	}
+
+	// 调用方声明的应用级重试信号（R2）：定位失效类冲突没有服务端错误编号，
+	// 但"整体回滚 + 新事务重放"就是它的正确处置，语义与 1062 同构。
+	if errors.Is(err, ErrApplicationRetry) {
 		return true
 	}
 
@@ -606,7 +621,13 @@ func (r *TxRunner) Run(ctx context.Context, opts TxRunnerOptions, payload TxPayl
 		}
 	}
 
-	return fmt.Errorf("%w: attempts exhausted (last error: %v)", ErrRetryExhausted, lastErr)
+	// 重试耗尽必须**同时**保留两条错误链：ErrRetryExhausted（供限流/告警判定）与
+	// 最后一次的真实失败原因（供调用方 errors.Is/As 分类，例如成员漂移、1062、死锁）。
+	// 用 %v 只留文本会让上层退化为字符串匹配——与本文件 I6 的结构化提取规范冲突。
+	if lastErr == nil {
+		return fmt.Errorf("%w", ErrRetryExhausted)
+	}
+	return fmt.Errorf("%w: attempts exhausted (last error: %w)", ErrRetryExhausted, lastErr)
 }
 
 // runAttempt 执行单次尝试。所有资源（外层事务、本地门禁、准入许可、锁上下文）都在本函数内

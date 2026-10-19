@@ -173,6 +173,18 @@ ON DUPLICATE KEY UPDATE
 	return err
 }
 
+// ensureTaskAssetLinkTx 只保证 (task_id, asset_id) 这条 link **存在**，不改写它的
+// 来源三元组：资产 upsert（含 subdomain/service 的嵌套副作用）只是"顺带把宿主资产
+// 挂到任务上"，把 worker/scope 等真实来源与 summary 覆盖成 system/"" 会毁掉既有
+// 归属证据。与 upsertTaskAssetLinkTx 的分工即"新建 vs 刷新来源"。
+func ensureTaskAssetLinkTx(ctx context.Context, tx *sql.Tx, taskID, assetID int64) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO task_asset_links(task_id, asset_id, source, source_summary, created_at, updated_at)
+VALUES(?, ?, ?, '', NOW(3), NOW(3))
+ON DUPLICATE KEY UPDATE updated_at=NOW(3)`, taskID, assetID, defaultTaskAssetSource)
+	return err
+}
+
 // attachTaskAssetTx 把一个已存在的全局资产挂到任务上（双写第一步：锁资产行 →
 // 合并 task_ids → 写回；第二步：upsert link 行）。返回 attached 表示本次是否新增
 // 了归属（已存在时 link 仍会被刷新来源信息）。

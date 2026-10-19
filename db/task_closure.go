@@ -11,9 +11,11 @@ package db
 //  2. **物理 PK 定位**：所有集合都是各表 Catalog 的真实物理 PK（id / row_id / ordinal）。
 //     `side_question_sessions` 这类业务唯一键必须先翻译成物理 `row_id`，
 //     executor 绝不按 `session_key` 这类业务列做 DELETE。
-//  3. **同一套定位 SQL 两种读法**：快照阶段普通读（Fresh Locator 的非加锁快照），
-//     持锁后的成员复核显式 `FOR UPDATE` 当前读 —— TiDB SI 下普通 SELECT 读的是本
-//     事务旧快照，发现不了别的事务刚提交的新成员。
+//  3. **同一套定位 SQL、两个读视图**：阶段 1 在外层事务里做非加锁快照读；阶段 3 的
+//     成员复核在**第二条连接的一致性快照**上做（R5）—— TiDB SI 下外层事务的普通
+//     SELECT 永远读 begin 时刻的旧快照，看不见刚提交的新成员；而 `FOR UPDATE` 虽然
+//     是当前读，却会在返回新行的那一刻把它锁住（且锁在旧最大锁序之后），属于
+//     逆序补锁。新连接的普通 SELECT 同时满足"看见新提交"与"零加锁"。
 // =====================================================================
 
 import (
@@ -69,6 +71,13 @@ type TaskCascadeClosure struct {
 	FindingIDs          []uint64 // findings.id（task_id 或 node_id 命中本闭包）
 	LLMRecordIDs        []uint64 // llm_records.id（仅 DeleteLLMRecords 时枚举）
 
+	// ── findings 的三无（无 FK、无级联、无触发器）子表（闭环 F03）────────────────
+	// 开启 DeleteFindings 时这些子行必须**先按自己的物理 PK 枚举 + 纳锁 + 逆序删除**；
+	// 锁住父 finding 行既不枚举子行，也不阻止未接协议的写者继续追加子行。
+	FindingAssetIDs          []uint64 // finding_assets.id（finding_id IN FindingIDs）
+	FindingRetestIDs         []uint64 // finding_retests.id
+	FindingTrafficBindingIDs []uint64 // finding_traffic_bindings.id
+
 	// ── 置空集合（SET NULL，按物理 PK 限定）────────────────────────────────
 	NullifyFindingTaskIDs []uint64 // findings.id WHERE task_id = ?
 	NullifyFindingNodeIDs []uint64 // findings.id WHERE node_id IN (nodes)
@@ -120,6 +129,9 @@ func (c *TaskCascadeClosure) TotalCascadeDeleteCount() int {
 	total += len(c.MainSessionIDs)
 	total += len(c.NodeIDs)
 	total += len(c.FindingIDs)
+	total += len(c.FindingAssetIDs)
+	total += len(c.FindingRetestIDs)
+	total += len(c.FindingTrafficBindingIDs)
 	total += len(c.LLMRecordIDs)
 	total += len(c.AssetIDsToDelete)
 	total += len(c.ForeignAssetLinkIDs)
@@ -153,6 +165,13 @@ func (c *TaskCascadeClosure) Validate() error {
 				id, len(c.assetOtherTasks[id]))
 		}
 	}
+	// finding 子表只在 findings 整行删除时才允许被枚举/纳锁/清理：关闭删除选项时
+	// 这些集合非空意味着闭包要清理一批"父行还在"的子行，属于越界写集。
+	if !c.Options.DeleteFindings {
+		if len(c.FindingAssetIDs) > 0 || len(c.FindingRetestIDs) > 0 || len(c.FindingTrafficBindingIDs) > 0 {
+			return errors.New("task closure: finding child rows enumerated without DeleteFindings")
+		}
+	}
 	return nil
 }
 
@@ -183,6 +202,11 @@ func (c *TaskCascadeClosure) lockPlanSpecs() []struct {
 		{"exploration_nodes", c.NodeIDs},
 		{"assets", c.CandidateAssetIDs},
 		{"findings", c.FindingIDs},
+		// findings 的三无子表：物理 PK 与 findings 一样必须先进锁计划，executor
+		// 才有"已锁物理 PK 集合"可以收敛（否则只能写开放范围 DELETE）。
+		{"finding_assets", c.FindingAssetIDs},
+		{"finding_retests", c.FindingRetestIDs},
+		{"finding_traffic_bindings", c.FindingTrafficBindingIDs},
 		{"activity", append(append([]uint64{}, c.ActivityIDs...), c.CrossRootActivityIDs...)},
 		{"exploration_anchors", anchors},
 		{"exploration_edges", c.EdgeIDs},
@@ -246,16 +270,15 @@ func ComputeTaskClosure(ctx context.Context, tx DBTX, taskID uint64) (*TaskCasca
 func ComputeTaskClosureWithOptions(
 	ctx context.Context, tx DBTX, taskID uint64, opts TaskClosureOptions,
 ) (*TaskCascadeClosure, error) {
-	return collectTaskClosure(ctx, tx, taskID, opts, false)
+	return collectTaskClosure(ctx, tx, taskID, opts)
 }
 
-// ComputeLockedTaskClosure 持锁后用**当前读**重算闭包并完成仲裁，产出可直接交给
-// executor 的最终闭包。资产 delete/detach 的判定必须在持锁之后做，否则"共享"结论
-// 可能来自旧快照，会误删仍被其他任务引用的资产。
-func ComputeLockedTaskClosure(
-	ctx context.Context, tx DBTX, taskID uint64, opts TaskClosureOptions,
+// ComputeArbitratedTaskClosure 在**独立连接的一致性快照**上重算闭包并完成仲裁，
+// 产出可直接交给 executor 的最终闭包（持锁后的阶段 3 专用，见 RelocateTaskClosureMembers）。
+func ComputeArbitratedTaskClosure(
+	ctx context.Context, q DBTX, taskID uint64, opts TaskClosureOptions,
 ) (*TaskCascadeClosure, error) {
-	closure, err := collectTaskClosure(ctx, tx, taskID, opts, true)
+	closure, err := collectTaskClosure(ctx, q, taskID, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -266,16 +289,55 @@ func ComputeLockedTaskClosure(
 }
 
 // RelocateTaskClosureMembers 是持锁后的成员重定位（lockorder.ReLocator 契约：
-// **只发现，绝不补锁**）。定位查询全部显式 `FOR UPDATE` 走当前读；发现差异只由
-// CompareMembership 报错，外层 TxRunner 整体回滚 + 指数退避重放。
+// **只发现，绝不补锁**，R5）。
+//
+// 复核读必须满足两个互相拉扯的条件：
+//  1. 能看到别的事务**刚刚提交**的新成员（本事务的旧快照永远看不到它们）；
+//  2. 绝不给"计划外的新行"加锁（先锁再比 = 逆序补锁，可在报漂移前先死锁）。
+//
+// `SELECT … FOR UPDATE` 同时满足不了这两条：它确实是当前读，但返回新行的那一刻
+// 已经把它锁住了，而且该锁位于旧最大锁序**之后**，属于教科书式的逆序补锁。
+// 因此本函数刻意只做**一致性快照读**，并由调用方把它送到**第二条连接**上执行
+// （见 DB.relocateTaskClosureOnFreshSnapshot）：新连接的读视图晚于阶段 2 拿锁的
+// 时刻，能发现新提交的成员，同时一条 `FOR UPDATE` 都不发。
+//
+// 发现差异只由 CompareMembership 报错，外层 TxRunner 整体回滚 + 指数退避重放；
+// 本函数与原事务都不做任何"就地追加锁"的补救。
 func RelocateTaskClosureMembers(
-	ctx context.Context, tx DBTX, taskID uint64, opts TaskClosureOptions,
+	ctx context.Context, q DBTX, taskID uint64, opts TaskClosureOptions,
 ) ([]lockorder.EntityKey, error) {
-	closure, err := collectTaskClosure(ctx, tx, taskID, opts, true)
+	closure, err := ComputeArbitratedTaskClosure(ctx, q, taskID, opts)
 	if err != nil {
 		return nil, err
 	}
 	return closure.MembershipKeys()
+}
+
+// relocateTaskClosureOnFreshSnapshot 在**第二条连接**上开一个独立事务做成员复核，
+// 并保证该事务的读视图建立在外层事务**已持锁**之后（否则会漏掉更早提交的新成员）。
+//
+// 为什么不能直接用外层 tx：TiDB 的 SI 下本事务的普通 SELECT 永远读 begin 时刻的
+// 旧快照，连"更晚提交的新成员"都看不见，复核会退化成永远通过。
+// 为什么不用 FOR UPDATE：见 RelocateTaskClosureMembers —— 那会把计划外成员先锁住。
+//
+// 复用 lockorder.ExecuteFreshLocator：它自带 fresh-locator 连接准入（R2 I2 的
+// hold-and-wait 防线）、"独立新事务 = 新快照"的新鲜度，以及 TiDB 拒绝 READ ONLY
+// 事务声明（Error 1235 noop）时的兼容性降级；本包不再自己开第二条连接。
+// 复核只发普通 SELECT：不申请行锁、不参与锁等待，因此不可能与外层事务的行锁成环。
+func (d *DB) relocateTaskClosureOnFreshSnapshot(
+	ctx context.Context, taskID uint64, opts TaskClosureOptions,
+	fn func(DBTX) error,
+) error {
+	_, err := lockorder.ExecuteFreshLocator(ctx, d.DB,
+		func(ctx context.Context, view *sql.Tx) (*lockorder.LocatorSnapshot, error) {
+			if err := fn(view); err != nil {
+				return nil, err
+			}
+			// 闭包复核的实体集合由调用方直接与 LockPlan 比对，这里不借用
+			// LocatorSnapshot 做一次额外的排序去重。
+			return &lockorder.LocatorSnapshot{}, nil
+		})
+	return err
 }
 
 // arbitrate 在**持锁之后**完成资产 delete/detach 划分与跨根删除子集裁剪。
@@ -356,23 +418,16 @@ func purgeRowsForDeletedAssets(rows []AssetRefRow, deletedAssets []uint64) []uin
 // 定位查询实现
 // ---------------------------------------------------------------------------
 
-// closureReader 把"同一套定位 SQL 既可做快照读，也可做持锁当前读"收敛到一个出口。
+// closureReader 把"同一套定位 SQL 在不同读视图上复用"收敛到一个出口。
+// 所有语句都是**普通一致性快照读**：闭包定位阶段零加锁，复核阶段的"零补锁"
+// 因此是可静态审计的事实（R5），而不只是运行期约定。
 type closureReader struct {
-	ctx     context.Context
-	tx      DBTX
-	locking bool
-}
-
-// sql 在锁读模式下追加 FOR UPDATE —— TiDB 当前读的唯一可靠开关。
-func (r *closureReader) sql(query string) string {
-	if r.locking {
-		return query + " FOR UPDATE"
-	}
-	return query
+	ctx context.Context
+	tx  DBTX
 }
 
 func (r *closureReader) ids(dest *[]uint64, query string, args ...any) error {
-	rows, err := r.tx.QueryContext(r.ctx, r.sql(query), args...)
+	rows, err := r.tx.QueryContext(r.ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -387,8 +442,8 @@ func (r *closureReader) ids(dest *[]uint64, query string, args ...any) error {
 	return rows.Err()
 }
 
-// rows2 读取两列（均为 uint64）；join 查询一律**不加** FOR UPDATE（避免顺着 join
-// 把目录外的其他任务整片行也锁住），其"存活"语义由后续单表当前读复核。
+// rows2 读取两列（均为 uint64）；join 查询同样不加锁（顺着 join 会把目录外的
+// 其他任务整片行也锁住），其"存活"语义由后续单表快照读复核。
 func (r *closureReader) rows2(query string, args ...any) ([2][]uint64, error) {
 	rows, err := r.tx.QueryContext(r.ctx, query, args...)
 	if err != nil {
@@ -407,8 +462,10 @@ func (r *closureReader) rows2(query string, args ...any) ([2][]uint64, error) {
 	return out, rows.Err()
 }
 
+// collectTaskClosure 以**非加锁一致性快照读**枚举完整闭包。
+// 读视图由调用方决定：阶段 1 用外层事务的快照，阶段 3 复核用第二条连接的新快照。
 func collectTaskClosure(
-	ctx context.Context, tx DBTX, taskID uint64, opts TaskClosureOptions, locking bool,
+	ctx context.Context, tx DBTX, taskID uint64, opts TaskClosureOptions,
 ) (*TaskCascadeClosure, error) {
 	closure := &TaskCascadeClosure{
 		TaskID:          taskID,
@@ -416,7 +473,7 @@ func collectTaskClosure(
 		assetOtherTasks: map[uint64][]uint64{},
 		assetTaskIDsRaw: map[uint64]string{},
 	}
-	r := &closureReader{ctx: ctx, tx: tx, locking: locking}
+	r := &closureReader{ctx: ctx, tx: tx}
 
 	// 1. 任务绑定的 exploration_id（tasks 行本身由锁计划负责，这里不做锁定读）
 	err := tx.QueryRowContext(ctx, `SELECT exploration_id FROM tasks WHERE id = ? LIMIT 1`, taskID).
@@ -504,10 +561,19 @@ func collectTaskClosure(
 	}
 	closure.FindingIDs = joinUint64(closure.NullifyFindingTaskIDs, closure.NullifyFindingNodeIDs)
 
+	// 2b. findings 的三无子表（无 FK / 无级联 / 无触发器）：开启删除时按**自己的物理
+	// PK** 枚举，绝不允许 executor 用 `WHERE finding_id IN (...)` 这类开放范围 DELETE。
+	// 未开删除选项时保持空集合 —— 父 finding 只置空，子行必须原样存活。
+	if opts.DeleteFindings {
+		if err := collectFindingChildRows(r, closure); err != nil {
+			return nil, err
+		}
+	}
+
 	// 3. side_question_sessions：业务唯一键 session_key → 物理 row_id
 	{
-		rows, err := tx.QueryContext(ctx, r.sql(
-			`SELECT row_id, session_key FROM side_question_sessions WHERE task_id = ? OR exploration_id = ?`),
+		rows, err := tx.QueryContext(ctx,
+			`SELECT row_id, session_key FROM side_question_sessions WHERE task_id = ? OR exploration_id = ?`,
 			taskID, closure.ExplorationID)
 		if err != nil {
 			return nil, err
@@ -548,8 +614,10 @@ func collectTaskClosure(
 	}
 
 	// 6. llm_records（可选）：按枚举出的物理 id 分片删除，不写开放范围 DML。
-	//    刻意**不进**成员漂移复核集合：llm_records 是持续追加的记账表，把它纳入成员
-	//    集合会让运行中任务的重试永远漂移；它只受"枚举 → PK 分片"的写集收敛约束。
+	//    这些 id 与 findings 一样**进锁计划、进成员复核集合**（LockPlan 与
+	//    MembershipKeys 同源）：只枚举不纳锁就等于给"复核后追加的记账行"留口子，
+	//    删除提交后仍可能长出新的孤儿记账。运行中的任务在此期间追加 llm_records
+	//    会以成员漂移的形式整体回滚重放，而不是被静默越界删除。
 	if opts.DeleteLLMRecords {
 		if err := r.ids(&closure.LLMRecordIDs,
 			`SELECT id FROM llm_records WHERE COALESCE(task_id,'') = ?`, fmt.Sprintf("%d", taskID)); err != nil {
@@ -588,8 +656,8 @@ func collectCandidateAssets(r *closureReader, closure *TaskCascadeClosure, taskI
 	if len(candidates) == 0 {
 		return nil
 	}
-	rows, err := r.tx.QueryContext(r.ctx, r.sql(
-		`SELECT id, COALESCE(task_ids, '[]') FROM assets WHERE id IN (`+closurePlaceholders(len(candidates))+`)`),
+	rows, err := r.tx.QueryContext(r.ctx,
+		`SELECT id, COALESCE(task_ids, '[]') FROM assets WHERE id IN (`+closurePlaceholders(len(candidates))+`)`,
 		uint64Args(candidates)...)
 	if err != nil {
 		return err
@@ -721,6 +789,36 @@ WHERE ea.asset_id IN (`+ph+`) AND t.id <> ? AND t.deleted_at IS NULL`,
 	return nil
 }
 
+// collectFindingChildRows 枚举 findings 的三张**无外键**子表的物理主键
+// （finding_assets / finding_retests / finding_traffic_bindings）。
+//
+// 这三张表在 DDL 里没有指向 findings 的 FK（历史设计），数据库不会替我们级联；
+// 而"锁住父 finding 行"既不枚举子行，也不阻止未接写者协议的进程继续追加子行。
+// 因此必须把子行自己的物理 PK 收进闭包 → 进锁计划 → 由 executor 经 narrowWriter
+// 按 PK 逆拓扑删除（R1：任何 `WHERE finding_id IN (...)` 的裸范围 DELETE 都判红）。
+func collectFindingChildRows(r *closureReader, closure *TaskCascadeClosure) error {
+	findingIDs := dedupeSortedUint64(closure.FindingIDs)
+	closure.FindingIDs = findingIDs
+	if len(findingIDs) == 0 {
+		return nil
+	}
+	ph := closurePlaceholders(len(findingIDs))
+	args := uint64Args(findingIDs)
+	if err := r.ids(&closure.FindingAssetIDs,
+		`SELECT id FROM finding_assets WHERE finding_id IN (`+ph+`)`, args...); err != nil {
+		return err
+	}
+	if err := r.ids(&closure.FindingRetestIDs,
+		`SELECT id FROM finding_retests WHERE finding_id IN (`+ph+`)`, args...); err != nil {
+		return err
+	}
+	if err := r.ids(&closure.FindingTrafficBindingIDs,
+		`SELECT id FROM finding_traffic_bindings WHERE finding_id IN (`+ph+`)`, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
 // filterAliveTasks 判定一批 task.id 是否仍存活；锁模式下即当前读（行已由锁计划持有）。
 func filterAliveTasks(r *closureReader, ids []uint64) ([]uint64, error) {
 	ids = dedupeSortedUint64(ids)
@@ -753,6 +851,9 @@ func (c *TaskCascadeClosure) normalize() {
 	c.SideSessionRowIDs = dedupeSortedUint64(c.SideSessionRowIDs)
 	c.SideRequestOrdinals = dedupeSortedUint64(c.SideRequestOrdinals)
 	c.FindingIDs = dedupeSortedUint64(c.FindingIDs)
+	c.FindingAssetIDs = dedupeSortedUint64(c.FindingAssetIDs)
+	c.FindingRetestIDs = dedupeSortedUint64(c.FindingRetestIDs)
+	c.FindingTrafficBindingIDs = dedupeSortedUint64(c.FindingTrafficBindingIDs)
 	c.NullifyFindingTaskIDs = dedupeSortedUint64(c.NullifyFindingTaskIDs)
 	c.NullifyFindingNodeIDs = dedupeSortedUint64(c.NullifyFindingNodeIDs)
 	c.CrossRootActivityIDs = dedupeSortedUint64(c.CrossRootActivityIDs)

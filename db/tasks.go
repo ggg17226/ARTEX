@@ -91,6 +91,22 @@ type TaskDeletePreparation struct {
 	TrafficHosts  []string
 }
 
+// TaskDeleteUndo undoes (and releases) the external work staged by **one single
+// attempt** of the cascade. TxRunner replays the whole payload on a retryable
+// conflict, so a stage that outlives its attempt would be re-entered while still
+// holding its non-reentrant writer lock — a self-deadlock (R4).
+//
+// The cascade guarantees, for every attempt:
+//   - the undo of a failed attempt runs once, before the runner backs off and
+//     before any later attempt may call prepare again;
+//   - the undo of the final attempt runs before DeleteTaskCascadePrepared
+//     returns, so the caller only ever has to Commit a stage on success;
+//   - on a successful commit no undo is produced by the cascade at all — the
+//     caller owns the stage and must finalize it.
+//
+// Returning a nil undo from prepare means "nothing to unwind".
+type TaskDeleteUndo func() error
+
 // IsTerminal reports whether a task status is a terminal (finished) state.
 // 单一真源，替换散落各处的 done/failed 硬编码判定。
 func IsTerminal(status string) bool {
@@ -143,9 +159,9 @@ func lockTaskRowAlive(ctx context.Context, tx *sql.Tx, taskID int64) (bool, erro
 //	  → 核验 deleted_at IS NULL                     // 绝不向已删任务挂孤儿
 //	  → fn(tx)                                      // 子实体写入
 //
-// 冲突（1062 / 1205 / 1213 / 成员漂移）由 TxRunner **整体回滚 + 指数退避整体重放**；
-// 任何"部分写入 + 原地重试"都被禁止（payload 每次都拿到全新的 *sql.Tx）。
-// fn 返回 lockorder.RetryCurrentAttempt 可在同一 Runner 内重放本轮。
+// 冲突（1062 / 1205 / 1213 / 成员漂移 / 应用级重试信号 lockorder.ErrApplicationRetry）
+// 由 TxRunner **整体回滚 + 指数退避整体重放**；任何"部分写入 + 原地重试"都被禁止
+// （payload 每次都拿到全新的 *sql.Tx）。
 func (d *DB) runTaskChildWriter(taskID int64, fn func(ctx context.Context, tx *sql.Tx) error) error {
 	if taskID <= 0 {
 		return fmt.Errorf("%w: task id must be positive", ErrTaskNotAlive)
@@ -849,15 +865,24 @@ func (d *DB) DeleteTaskCascade(id int64, deleteAssets, deleteFindings bool, dele
 // side-effect closure has been locked, so a host cannot become shared after its
 // traffic had already been staged.
 //
-// prepare must only stage reversible work. Any returned error or later database
-// error rolls the transaction back and the caller remains responsible for undoing
-// the staged external work — **except** when the returned error wraps
-// ErrTaskDeleteOutcomeUnknown: then the commit outcome is unknown, the gates stay
-// held and no external compensation may run at all (manual reconciliation only).
+// Attempt-level lifecycle (R4): the Runner replays the entire payload on a
+// retryable conflict (1213/1205/1062/membership drift), which means prepare can
+// be invoked more than once per call. prepare therefore hands back a
+// TaskDeleteUndo that the cascade invokes as soon as — and exactly once for —
+// the attempt that staged it failed: the stage is unwound and its writer lock
+// released **before** the runner backs off, so the next attempt starts clean.
+// The caller only finalizes (Commit) the stage of the attempt that finally
+// committed.
+//
+// A stage is never unwound on the unknown-outcome path: when the returned error
+// wraps ErrTaskDeleteOutcomeUnknown the commit result is undetermined, the gates
+// stay held and no external compensation may run at all (manual reconciliation
+// only). Errors raised by the payload itself can never mean "possibly committed"
+// — the transaction never reached Commit — so unwinding there is always safe.
 func (d *DB) DeleteTaskCascadePrepared(
 	id int64,
 	deleteAssets, deleteFindings, deleteLLMRecords bool,
-	prepare func(TaskDeletePreparation) error,
+	prepare func(TaskDeletePreparation) (TaskDeleteUndo, error),
 ) (TaskDeleteResult, error) {
 	var result TaskDeleteResult
 	if id <= 0 {
@@ -890,15 +915,28 @@ func (d *DB) DeleteTaskCascadePrepared(
 
 // runTaskCascadeAttempt 是删除级联的**一次完整尝试**（四阶段）。任何错误都让
 // TxRunner 整体回滚，重试从阶段 1 的非加锁 Locator 重新开始。
+//
+// 本轮尝试若在 prepare 之后失败，defer 会先撤销/释放本轮暂存的外部工作再返回，
+// 因此下一轮 attempt 的 prepare 永远面对"零残留"的外部状态（R4）。
 func (d *DB) runTaskCascadeAttempt(
 	ctx context.Context,
 	tx *sql.Tx,
 	lockCtx *lockorder.LockContext,
 	id int64,
 	opts TaskClosureOptions,
-	prepare func(TaskDeletePreparation) error,
-) (TaskDeleteResult, error) {
-	var result TaskDeleteResult
+	prepare func(TaskDeletePreparation) (TaskDeleteUndo, error),
+) (result TaskDeleteResult, err error) {
+	var undo TaskDeleteUndo
+	defer func() {
+		if undo == nil || err == nil {
+			return
+		}
+		staged := undo
+		undo = nil // 恰好一次：绝不重复撤销，也绝不留给下一轮
+		if uerr := staged(); uerr != nil {
+			err = errors.Join(err, fmt.Errorf("task cascade: unwind staged external work after failed attempt: %w", uerr))
+		}
+	}()
 
 	// ── 阶段 1：Fresh Locator（业务门禁保护下的非加锁闭包快照）──────────────
 	snapshot, err := ComputeTaskClosureWithOptions(ctx, tx, uint64(id), opts)
@@ -923,16 +961,28 @@ func (d *DB) runTaskCascadeAttempt(
 		TaskCascadeTestHookAfterSnapshot(snapshot.TaskID)
 	}
 
-	// ── 阶段 3：持锁成员漂移复核（当前读重跑定位，只发现不补锁）────────────
-	locked, err := ComputeLockedTaskClosure(ctx, tx, uint64(id), opts)
-	if err != nil {
+	// ── 阶段 3：成员漂移复核（第二条连接的一致性快照；**只发现，不补锁**）────
+	// 复核读刻意不发出一条 FOR UPDATE：给计划外的新成员先加锁再比较，等于在旧最大
+	// 锁序之后逆序补锁，可能"报漂移前先死锁"（R5）。发现差异一律整体回滚重放。
+	var (
+		locked  *TaskCascadeClosure
+		current []lockorder.EntityKey
+	)
+	if err := d.relocateTaskClosureOnFreshSnapshot(ctx, uint64(id), opts, func(view DBTX) error {
+		closure, err := ComputeArbitratedTaskClosure(ctx, view, uint64(id), opts)
+		if err != nil {
+			return err
+		}
+		keys, err := closure.MembershipKeys()
+		if err != nil {
+			return err
+		}
+		locked, current = closure, keys
+		return nil
+	}); err != nil {
 		if errors.Is(err, ErrForeignKeyViolation) {
 			return result, nil
 		}
-		return result, err
-	}
-	current, err := locked.MembershipKeys()
-	if err != nil {
 		return result, err
 	}
 	if err := lockorder.CompareMembership(plan, current); err != nil {
@@ -946,12 +996,14 @@ func (d *DB) runTaskCascadeAttempt(
 		if err != nil {
 			return result, err
 		}
-		if err := prepare(TaskDeletePreparation{
+		staged, err := prepare(TaskDeletePreparation{
 			ExplorationID: int64(locked.ExplorationID),
 			TrafficHosts:  hosts,
-		}); err != nil {
+		})
+		if err != nil {
 			return result, err
 		}
+		undo = staged
 	}
 
 	// ── 阶段 4：物理逆拓扑清理（写集严格收敛于上面锁定的 PK 集合）──────────

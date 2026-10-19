@@ -426,7 +426,16 @@ func TestTask_DeleteTaskCascade_MembershipDriftRetryRollback(t *testing.T) {
 		t.Fatalf("nil tx must be rejected, got %v", err)
 	}
 
-	// ⑥ 真实 TiDB 集成：在"快照之后、复核之前"通过测试钩子注入更低 PK 成员，删除事务必须整体回滚后重放成功。
+	// ⑥ 真实 TiDB 集成（可证伪）：在"持锁之后、成员复核之前"用**第二条连接**以
+	//    TiDB 合法语法提交一条真实的计划外成员行，删除事务必须整体回滚 + 退避重放，
+	//    并且最终真的把这条行一起收掉。
+	//
+	//    修复说明（R6）：这里原先调用 d.Exploration().AddNode()。该 store 仍是 PG 方言
+	//    （$n 占位符 + RETURNING），在 native TiDB 上必然报语法错误，而调用点写成
+	//    `_, _ =` 把错误吞掉 → 注入从未发生，"漂移"分支一次都没跑到，测试仍然变绿。
+	//    现在：注入用 ? 占位的原生 INSERT + LastInsertId()，错误逐一检查，
+	//    并断言 ① 注入行确实是计划外新成员 ② 至少发生一次回滚重放
+	//    ③ 审计的 DELETE 里包含该物理 PK ④ 库里查得见它已经不存在。
 	t.Run("Live", func(t *testing.T) {
 		dsn := os.Getenv("ARTEX_TIDB_DSN")
 		if dsn == "" {
@@ -447,36 +456,97 @@ func TestTask_DeleteTaskCascade_MembershipDriftRetryRollback(t *testing.T) {
 			t.Fatalf("CreateTaskWithOptions failed: %v", err)
 		}
 		t.Cleanup(func() {
-			_, _ = d.Exec("DELETE FROM exploration_nodes WHERE exploration_id = ?", task.ExplorationID)
-			_, _ = d.Exec("DELETE FROM explorations WHERE id = ?", task.ExplorationID)
-			_, _ = d.Exec("DELETE FROM tasks WHERE id = ?", task.ID)
+			if _, err := d.Exec("DELETE FROM exploration_nodes WHERE exploration_id = ?", task.ExplorationID); err != nil {
+				t.Errorf("cleanup exploration_nodes: %v", err)
+			}
+			if _, err := d.Exec("DELETE FROM explorations WHERE id = ?", task.ExplorationID); err != nil {
+				t.Errorf("cleanup explorations: %v", err)
+			}
+			if _, err := d.Exec("DELETE FROM tasks WHERE id = ?", task.ID); err != nil {
+				t.Errorf("cleanup tasks: %v", err)
+			}
 		})
 
-		// 注入钩子：在快照后由独立连接注入更低 PK 行
-		injected := false
+		// 注入前的成员快照：用来证明注入行确实是"计划外"的（而不是本来就在锁计划里）。
+		before, err := ComputeTaskClosureWithOptions(context.Background(), d.DB, uint64(task.ID), TaskClosureOptions{})
+		if err != nil {
+			t.Fatalf("baseline closure failed: %v", err)
+		}
+		beforeNodes := map[uint64]bool{}
+		for _, pk := range before.NodeIDs {
+			beforeNodes[pk] = true
+		}
+
+		attempts := 0
+		var injected uint64
 		TaskCascadeTestHookAfterSnapshot = func(taskID uint64) {
-			if injected {
+			attempts++
+			if taskID != uint64(task.ID) {
+				t.Errorf("test hook fired for task %d, want %d", taskID, task.ID)
+			}
+			if injected != 0 {
+				return // 重放的那一轮不再注入
+			}
+			// TiDB 合法语法：? 占位 + LastInsertId()，无 RETURNING、无 $n。
+			res, err := d.Exec(`INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
+VALUES (?, ?, ?, ?, ?, ?)`, task.ExplorationID, "fact", "{}", 0, "confirmed", "drift-probe")
+			if err != nil {
+				t.Errorf("inject a concurrent member row failed: %v", err)
 				return
 			}
-			injected = true
-			// 在闭包快照后模拟外部并发插入更低 PK 节点
-			_, _ = d.Exploration(task.ExplorationID).AddNode("asset", map[string]any{"label": "injected"}, 99, "pending", "agent", nil)
+			pk, err := res.LastInsertId()
+			if err != nil {
+				t.Errorf("read the injected member PK failed: %v", err)
+				return
+			}
+			if pk <= 0 {
+				t.Errorf("the injected member PK is not a positive BIGINT: %d", pk)
+				return
+			}
+			if beforeNodes[uint64(pk)] {
+				t.Errorf("the injected member %d was already in the snapshot; the probe proves nothing", pk)
+			}
+			injected = uint64(pk)
 		}
-		t.Cleanup(func() {
-			TaskCascadeTestHookAfterSnapshot = nil
-		})
+		t.Cleanup(func() { TaskCascadeTestHookAfterSnapshot = nil })
 
-		res, err := d.DeleteTaskCascade(task.ID, false, false)
+		// 观测整条级联的 DML 审计（含重放的那一轮）。
+		previousHook := CascadeStatementHook
+		var records []CascadeStatementRecord
+		CascadeStatementHook = func(record CascadeStatementRecord) { records = append(records, record) }
+		t.Cleanup(func() { CascadeStatementHook = previousHook })
+
+		result, err := d.DeleteTaskCascade(task.ID, false, false)
 		if err != nil {
-			t.Fatalf("DeleteTaskCascade with membership drift should rollback and retry successfully, got err: %v", err)
+			t.Fatalf("DeleteTaskCascade must roll back and replay successfully after the injected member, got %v", err)
 		}
-		_ = res
+		if injected == 0 {
+			t.Fatal("the drift probe never landed; the drift branch was never exercised")
+		}
+		if attempts < 2 {
+			t.Fatalf("the injected member must force at least one full rollback + replay, attempts=%d", attempts)
+		}
+		if !containsUint64(deletedPKsForTest(records, "exploration_nodes"), injected) {
+			t.Fatalf("the DML audit must delete the injected member %d by physical PK, got %v",
+				injected, deletedPKsForTest(records, "exploration_nodes"))
+		}
+		// 删除选项必须被尊重：本次既没开资产也没开发现项。
+		if result.AssetsDeleted != 0 || result.FindingsDeleted != 0 {
+			t.Fatalf("deleteAssets=false/deleteFindings=false must delete neither assets nor findings, got %+v", result)
+		}
+		var left int
+		if err := d.QueryRow("SELECT COUNT(1) FROM exploration_nodes WHERE id = ?", injected).Scan(&left); err != nil {
+			t.Fatalf("query the injected member: %v", err)
+		}
+		if left != 0 {
+			t.Fatalf("the injected member %d survived the cascading delete", injected)
+		}
 
 		var taskLeft, expLeft int
-		if err := d.QueryRow("SELECT count(*) FROM tasks WHERE id = ?", task.ID).Scan(&taskLeft); err != nil {
+		if err := d.QueryRow("SELECT COUNT(1) FROM tasks WHERE id = ?", task.ID).Scan(&taskLeft); err != nil {
 			t.Fatalf("query task residual: %v", err)
 		}
-		if err := d.QueryRow("SELECT count(*) FROM explorations WHERE id = ?", task.ExplorationID).Scan(&expLeft); err != nil {
+		if err := d.QueryRow("SELECT COUNT(1) FROM explorations WHERE id = ?", task.ExplorationID).Scan(&expLeft); err != nil {
 			t.Fatalf("query exploration residual: %v", err)
 		}
 		if taskLeft != 0 || expLeft != 0 {
