@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -685,6 +687,10 @@ func TestFindings_RetestResultDoesNotTrustRowsAffected(t *testing.T) {
 
 // TestFindings_DeleteFindingUnbindsTrafficAndRetests 钉死删除语义：漏洞删除必须
 // 在同一事务里显式解除 evidence bindings 与 retest 关联（新库没有 FK 级联）。
+//
+// 「解除关联」只有一种合法实现：finding_retests 子行**整行删除**。把活跃复测改成
+// stopped 只终结了状态，completed/failed/stopped 的历史连同指向已删漏洞的
+// finding_id 仍然留在库里 —— 那是悬挂引用，不是解除关联。
 func TestFindings_DeleteFindingUnbindsTrafficAndRetests(t *testing.T) {
 	body := task32FuncBody(t, "findings.go", "func (d *DB) DeleteFinding(")
 	for _, want := range []string{"finding_traffic_bindings", "finding_retests", "exploration_nodes"} {
@@ -695,8 +701,239 @@ func TestFindings_DeleteFindingUnbindsTrafficAndRetests(t *testing.T) {
 	if strings.Contains(body, "RETURNING") {
 		t.Errorf("DeleteFinding must not use RETURNING (TiDB has none)")
 	}
-	if !strings.Contains(body, "status IN ('pending','running')") {
-		t.Errorf("DeleteFinding must seal the finding's unfinished retests (status IN ('pending','running'))")
+	if !strings.Contains(body, `DELETE FROM finding_retests WHERE finding_id = ?`) {
+		t.Errorf("DeleteFinding must delete the finding's retest rows outright (sealing status alone leaves dangling finding_id)")
+	}
+	if strings.Contains(body, `UPDATE finding_retests`) {
+		t.Errorf("DeleteFinding must not merely seal retest status; the whole child row has to go")
+	}
+	if !strings.Contains(body, "WithEvidenceTx") {
+		t.Errorf("DeleteFinding must run inside the shared evidence writer transaction")
+	}
+}
+
+// TestFindings_DeleteFindingsByTaskIsAtomic 钉死批量删除的事务与锁协议：成员定位、
+// 父任务锁、两张子表的清理与父表删除必须全部落在同一个 WithEvidenceTx 里；三条各自
+// 提交的 d.Exec 会让中途失败变成「绑定已删、漏洞还在」的半成品，并在语句之间给并发
+// 写者留下塞入孤儿子行的窗口。
+func TestFindings_DeleteFindingsByTaskIsAtomic(t *testing.T) {
+	body := task32FuncBody(t, "findings.go", "func (d *DB) DeleteFindingsByTask(")
+	if !strings.Contains(body, "WithEvidenceTx") {
+		t.Errorf("DeleteFindingsByTask must run in one WithEvidenceTx (shared writer gate + atomic rollback)")
+	}
+	if strings.Contains(body, "d.Exec(") {
+		t.Errorf("DeleteFindingsByTask must not issue auto-committed d.Exec statements; every statement belongs to the tx")
+	}
+	if !strings.Contains(body, "LockTaskEvidenceTx") {
+		t.Errorf("DeleteFindingsByTask must take the parent task lock (tasks precede findings in the global lock order)")
+	}
+	for _, want := range []string{
+		`DELETE FROM finding_traffic_bindings WHERE finding_id IN (`,
+		`DELETE FROM finding_retests WHERE finding_id IN (`,
+		`DELETE FROM findings WHERE task_id = ?`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("DeleteFindingsByTask is missing %q", want)
+		}
+	}
+	if strings.Contains(body, `UPDATE finding_retests`) {
+		t.Errorf("DeleteFindingsByTask must delete retest rows outright, not seal their status")
+	}
+	// 持锁后的成员集合必须是当前读，否则锁隙期变化的成员会被漏删或误删。
+	if !strings.Contains(body, "taskFindingIDsTx(tx, taskID, true)") {
+		t.Errorf("DeleteFindingsByTask must re-read its members under FOR UPDATE after locking the task")
+	}
+}
+
+// task32ParenGroup 吃一段含第一枚 '(' 的文本，返回该对括号内的内容与右括号之后的剩余。
+func task32ParenGroup(text string) (inner, rest string) {
+	open := strings.IndexByte(text, '(')
+	if open < 0 {
+		return text, ""
+	}
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth == 0 {
+				return text[open+1 : i], text[i+1:]
+			}
+		}
+	}
+	return text, ""
+}
+
+// task32InsertColumns 从一段代码里抠出 `INSERT INTO <table>(…)` 的列清单与 VALUES
+// 的顶层表达式，两者必须一一对应（列多参数少 = 严格模式下 1364 的现场）。
+func task32InsertColumns(t *testing.T, code, table string) (columns, values []string) {
+	t.Helper()
+	marker := "INSERT INTO " + table
+	start := strings.Index(code, marker)
+	if start < 0 {
+		t.Fatalf("no `%s` statement found", marker)
+	}
+	rest := code[start+len(marker):]
+	open := strings.Index(rest, "(")
+	if open < 0 {
+		t.Fatalf("%s: no column list after `%s`", table, marker)
+	}
+	columnText, afterColumns := task32ParenGroup(rest[open:])
+	for _, column := range strings.Split(columnText, ",") {
+		if column = strings.TrimSpace(column); column != "" {
+			columns = append(columns, column)
+		}
+	}
+	valuesStart := strings.Index(strings.ToUpper(afterColumns), "VALUES")
+	if valuesStart < 0 {
+		t.Fatalf("%s: no VALUES clause found", table)
+	}
+	valuesText, _ := task32ParenGroup(afterColumns[valuesStart+len("VALUES"):])
+	depth := 0
+	var current strings.Builder
+	for _, r := range valuesText {
+		if r == '(' {
+			depth++
+		} else if r == ')' {
+			depth--
+		} else if r == ',' && depth == 0 {
+			values = append(values, strings.TrimSpace(current.String()))
+			current.Reset()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	if last := strings.TrimSpace(current.String()); last != "" {
+		values = append(values, last)
+	}
+	return columns, values
+}
+
+// TestFindings_StrictInsertsPopulateEveryNotNullTextColumn 钉死 I1：基线里
+// findings.status/report 与 finding_retests.status/verdict/notes/summary/evidence/
+// error 都是 MEDIUMTEXT NOT NULL，而 TiDB 8.5 严格模式禁止 TEXT/JSON 列带 DEFAULT
+// （schema.TextN/JSONNN 的 def 只是声明期元数据，renderColumnFor 一律不输出），
+// 所以 INSERT 少写任何一列都不是「数据库补默认值」，而是 1364 直接失败。
+func TestFindings_StrictInsertsPopulateEveryNotNullTextColumn(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		file     string
+		decl     string
+		table    string
+		required []string
+	}{
+		{
+			name: "AddFinding", file: "findings.go", decl: "func (d *DB) AddFinding(",
+			table: "findings", required: []string{"task_id", "node_id", "vulnclass", "name", "severity", "summary", "evidence", "worker", "asset_ids", "status", "report"},
+		},
+		{
+			name: "RecordFindingTx", file: "finding_traffic.go", decl: "func RecordFindingTx(",
+			table: "findings", required: []string{"task_id", "node_id", "vulnclass", "name", "severity", "summary", "evidence", "worker", "asset_ids", "status", "report"},
+		},
+		{
+			name: "CreateFindingRetest", file: "finding_retests.go", decl: "func (d *DB) CreateFindingRetest(",
+			table: "finding_retests", required: []string{"finding_id", "conversation_id", "status", "notes", "verdict", "summary", "evidence", "error", "snapshot"},
+		},
+		{
+			// fixture 自身就在本文件里：按 decl 抠函数体会先命中下面这张表里的
+			// 那串声明文本，所以这条走"整份源码"路线（本文件里 INSERT INTO
+			// finding_retests 只此一处）。
+			name: "task32SeedRetest fixture", file: "findings_test.go", decl: "",
+			table: "finding_retests", required: []string{"finding_id", "conversation_id", "status", "notes", "verdict", "summary", "evidence", "error", "snapshot"},
+		},
+	} {
+		code := task32Source(t, tc.file)
+		if tc.decl != "" {
+			code = task32FuncBody(t, tc.file, tc.decl)
+		}
+		columns, values := task32InsertColumns(t, code, tc.table)
+		declared := map[string]bool{}
+		for _, column := range columns {
+			declared[strings.ToLower(column)] = true
+		}
+		for _, want := range tc.required {
+			if !declared[strings.ToLower(want)] {
+				t.Errorf("%s: INSERT INTO %s omits NOT NULL column %q (strict TiDB has no TEXT default, so this is 1364)", tc.name, tc.table, want)
+			}
+		}
+		if len(values) != len(columns) {
+			t.Errorf("%s: INSERT INTO %s lists %d columns but %d VALUES expressions", tc.name, tc.table, len(columns), len(values))
+		}
+		for i, value := range values {
+			if !strings.Contains(value, "?") {
+				t.Errorf("%s: VALUES expression %d (%s) is not a bound parameter", tc.name, i, value)
+			}
+		}
+	}
+}
+
+// TestFindings_FollowUpIntentLocksInGlobalOrder 钉死 I4：AddFindingFollowUpIntent
+// 必须按「普通读定位 → 按全局锁序加锁」实现。全局锁序是 tasks(1) →
+// exploration_nodes(7) → findings(9)；旧实现先锁 findings 再锁 tasks，与删除路径
+// （先 task 后 finding）逆序，两个事务交错时必死锁。
+func TestFindings_FollowUpIntentLocksInGlobalOrder(t *testing.T) {
+	body := task32FuncBody(t, "findings.go", "func (s *ExplorationStore) AddFindingFollowUpIntent(")
+	begin := strings.Index(body, "s.db.Begin()")
+	if begin < 0 {
+		t.Fatalf("AddFindingFollowUpIntent: transaction boundary not found")
+	}
+	// 定位读必须发生在开事务之前，且不得携带任何行锁。
+	locating := body[:begin]
+	if !strings.Contains(locating, "s.db.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ?`") {
+		t.Errorf("AddFindingFollowUpIntent must locate the finding with a plain (unlocked) read before opening the tx")
+	}
+	if strings.Contains(locating, "FOR UPDATE") {
+		t.Errorf("AddFindingFollowUpIntent must not take any row lock before the global lock order starts")
+	}
+	// 三把排他锁的先后顺序就是全局锁序本身。
+	step := begin
+	for _, want := range []string{
+		"FROM tasks WHERE id = ? FOR UPDATE",
+		"FROM exploration_nodes WHERE id = ? FOR UPDATE",
+		"FROM findings WHERE id = ? FOR UPDATE",
+	} {
+		at := strings.Index(body[step:], want)
+		if at < 0 {
+			t.Fatalf("AddFindingFollowUpIntent must lock in global order; missing %q after the previous lock", want)
+		}
+		step += at + len(want)
+	}
+	// 父任务的删除标记必须在持锁后核验，否则正在归档/清理的任务仍会被派生意图。
+	if !strings.Contains(body, "deleted_at") || !strings.Contains(body, "taskDeletedAt.Valid") {
+		t.Errorf("AddFindingFollowUpIntent must verify the task deleted_at marker after locking it")
+	}
+}
+
+// TestFindings_FilterQueryIsCaseInsensitiveUnderBinaryCollation 钉死 I5：基线表是
+// utf8mb4_bin，裸 LIKE 大小写敏感，直接拿它替换 ILIKE 会让大小写不同的关键词搜不到。
+// 形状门禁：列侧 5 个 LOWER(…)，参数侧在 Go 里已折叠成小写，且元字符转义原样保留。
+func TestFindings_FilterQueryIsCaseInsensitiveUnderBinaryCollation(t *testing.T) {
+	where, args := FindingFilter{Query: "SQL Injection"}.where()
+	if got, want := strings.Count(where, "LOWER("), 5; got != want {
+		t.Errorf("case-folded predicates = %d, want %d (one per searched column): %s", got, want, where)
+	}
+	if len(args) != 5 {
+		t.Fatalf("query filter: want 5 bound patterns, got %d", len(args))
+	}
+	for i, arg := range args {
+		pattern, ok := arg.(string)
+		if !ok {
+			t.Fatalf("arg %d is %T, want string", i, arg)
+		}
+		if pattern != "%sql injection%" {
+			t.Errorf("arg %d = %q, want the Go-side lower-cased %%sql injection%%", i, pattern)
+		}
+	}
+	// 折叠不能把 LIKE 元字符一起放出去：转义先发生，大小写折叠只作用于字母。
+	_, rawArgs := FindingFilter{Query: `MiXeD%\_`}.where()
+	if len(rawArgs) != 5 {
+		t.Fatalf("escaped query filter: want 5 args, got %d", len(rawArgs))
+	}
+	// 期望值按段拼接，免得反斜杠的层数在 raw string 里数错。
+	want := "%" + "mixed" + `\%` + `\\` + `\_` + "%"
+	if pattern, _ := rawArgs[0].(string); pattern != want {
+		t.Errorf("LIKE wildcards were not escaped before folding, got %q, want %q", pattern, want)
 	}
 }
 
@@ -751,9 +988,11 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 	})
 
 	vc := fmt.Sprintf("P08T32 %d", time.Now().UnixNano())
-	cleanup := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass = ?`, vc) }
-	cleanup()
-	t.Cleanup(cleanup)
+	var ids []int64
+	// M1：这条 cleanup **先注册所以最后运行**，负责终态零残留断言；每条 fixture 的
+	// 按主键清理则在创建成功后立刻登记（见 task32TrackFinding），因此即使中途 Fatal
+	// 或 fixture 被 SetFindingVulnClass 改了类别（vc+"-moved"）也不会留下残渣。
+	t.Cleanup(func() { task32AssertNoFindingResidue(t, d, vc, vc+"-moved") })
 
 	before, err := d.FindingStats()
 	if err != nil {
@@ -765,13 +1004,13 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 		{SeverityHigh, FindingInProgress, "P08T32 high case"},
 		{SeverityLow, FindingResolved, "P08T32 low case"},
 	}
-	ids := make([]int64, 0, len(seed))
 	for _, s := range seed {
 		id, err := d.AddFinding(0, 0, vc, "名称-"+s.severity, s.severity, s.summary, "poc", "worker", []int64{900001, 900002})
 		if err != nil || id <= 0 {
 			t.Fatalf("AddFinding(%s): id=%d err=%v", s.severity, id, err)
 		}
 		ids = append(ids, id)
+		task32TrackFinding(t, d, id)
 		if s.status != FindingPending {
 			if n, err := d.SetFindingStatus(id, s.status); err != nil || n != 1 {
 				t.Fatalf("SetFindingStatus(%d,%s): n=%d err=%v", id, s.status, n, err)
@@ -784,6 +1023,18 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 		}
 	}
 
+	// I1：TiDB 严格模式下这些 NOT NULL 文本列没有默认值可补，新增漏洞必须已经
+	// 带上应用层默认值（'pending' / 空报告），而不是留到读取时才"看起来对"。
+	for _, id := range ids {
+		var status, report string
+		if err := d.QueryRow(`SELECT status, report FROM findings WHERE id = ?`, id).Scan(&status, &report); err != nil {
+			t.Fatalf("read back strict defaults (%d): %v", id, err)
+		}
+		if status != FindingPending || report != "" {
+			t.Errorf("AddFinding defaults (%d): status=%q report=%q, want %q/%q", id, status, report, FindingPending, "")
+		}
+	}
+
 	after, err := d.FindingStats()
 	if err != nil {
 		t.Fatalf("FindingStats (after) failed: %v", err)
@@ -791,14 +1042,20 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 	if got, want := after.Total-before.Total, len(seed); got != want {
 		t.Errorf("stats total delta = %d, want %d", got, want)
 	}
-	if got, want := after.Critical-before.Critical, 1; got != want {
-		t.Errorf("stats critical delta = %d, want %d", got, want)
-	}
-	if got, want := after.High-before.High, 1; got != want {
-		t.Errorf("stats high delta = %d, want %d", got, want)
-	}
-	if got, want := after.Low-before.Low, 1; got != want {
-		t.Errorf("stats low delta = %d, want %d", got, want)
+	// 六个桶逐个核差值（M1）：少一个桶就少一条能证明 CASE 聚合真机行为的断言。
+	for _, bucket := range []struct {
+		name        string
+		delta, want int
+	}{
+		{"critical", after.Critical - before.Critical, 1},
+		{"high", after.High - before.High, 1},
+		{"medium", after.Medium - before.Medium, 0},
+		{"low", after.Low - before.Low, 1},
+		{"pending", after.Pending - before.Pending, 1},
+	} {
+		if bucket.delta != bucket.want {
+			t.Errorf("stats %s delta = %d, want %d", bucket.name, bucket.delta, bucket.want)
+		}
 	}
 	if !slices.Contains(after.VulnClasses, vc) {
 		t.Errorf("vulnclass %q missing from FindingStats.VulnClasses", vc)
@@ -813,10 +1070,13 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 		t.Errorf("severity sort: first row = %q, want %q", page[0].Severity, SeverityCritical)
 	}
 
-	// 关键词模糊筛选（LIKE 语义在 TiDB 默认排序规则下即大小写不敏感）
-	matched, matchedTotal, err := d.ListFindingsPage(FindingFilter{VulnClass: vc, Query: "high case"}, 1, 10)
-	if err != nil || matchedTotal != 1 || len(matched) != 1 {
-		t.Fatalf("query filter: len=%d total=%d err=%v", len(matched), matchedTotal, err)
+	// I5：基线是 utf8mb4_bin，大小写必须靠 LOWER + Go 侧折叠才无关；正文是小写的
+	// "P08T32 high case"，三种大小写的关键词必须都命中同一条。
+	for _, keyword := range []string{"high case", "HIGH CASE", "HiGh CaSe"} {
+		matched, matchedTotal, err := d.ListFindingsPage(FindingFilter{VulnClass: vc, Query: keyword}, 1, 10)
+		if err != nil || matchedTotal != 1 || len(matched) != 1 {
+			t.Fatalf("case-insensitive query %q: len=%d total=%d err=%v, want 1/1", keyword, len(matched), matchedTotal, err)
+		}
 	}
 
 	// 状态筛选
@@ -851,6 +1111,16 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 		t.Fatalf("SetFindingSeverity: n=%d err=%v", n, err)
 	}
 
+	// I5：大小写折叠只作用于字母，LIKE 元字符必须仍按字面匹配 —— 名字里带 "%_" 的
+	// 这条是唯一能被查询 "%_" 命中的行（ids[0] 已被改成 vc+"-moved"，不在本筛选内）。
+	if _, err := d.Exec(`UPDATE findings SET name = ? WHERE id = ?`, "字面 %_ 标记", ids[2]); err != nil {
+		t.Fatalf("seed literal-wildcard name: %v", err)
+	}
+	literal, literalTotal, err := d.ListFindingsPage(FindingFilter{VulnClass: vc, Query: "%_"}, 1, 10)
+	if err != nil || literalTotal != 1 || len(literal) != 1 || literal[0].ID != ids[2] {
+		t.Fatalf("query wildcards must stay literal: len=%d total=%d err=%v", len(literal), literalTotal, err)
+	}
+
 	// 导出去向：按 ids 精确导出必须走参数化 IN (?, ?, …)
 	Exported, err := d.ListFindingsForExport(FindingFilter{}, ids)
 	if err != nil || len(Exported) != len(ids) {
@@ -871,10 +1141,11 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFindings_DeleteFindingUnbindsEvidenceAndRetests 覆盖删除时的显式解除：
-// finding_traffic_bindings 必须整行删除（finding_id 是 NOT NULL 列，没有"置空"
-// 这条退路），仍未收尾的复测必须被封成终态（否则 active_finding_id 生成列会让
-// 前端永久显示"复测中"），而承载复测的 conversation 仍保留（历史不随漏洞删除）。
+// TestFindings_DeleteFindingUnbindsEvidenceAndRetests 覆盖删除时的显式解除（I2）：
+// finding_traffic_bindings 与 finding_retests 都必须整行删除 —— 两张子表的 finding_id
+// 都是 NOT NULL，没有"置空"这条退路；只把活跃复测封成 stopped 会让 completed/failed
+// 的历史连同指向已删漏洞的 finding_id 永久悬挂在库里。承载复测的 conversation 独立
+// 保留（历史会话不随漏洞删除）。
 func TestFindings_DeleteFindingUnbindsEvidenceAndRetests(t *testing.T) {
 	dsn := os.Getenv("ARTEX_TIDB_DSN")
 	if dsn == "" {
@@ -894,53 +1165,267 @@ func TestFindings_DeleteFindingUnbindsEvidenceAndRetests(t *testing.T) {
 	if err != nil || findingID <= 0 {
 		t.Fatalf("AddFinding: id=%d err=%v", findingID, err)
 	}
+	// M1：按主键登记的 cleanup 在创建成功后**立即**注册（证据与复测的 seed helper 也
+	// 各自登记自己那一份），因此 seed 半途失败同样不会漏清理。
+	task32TrackFinding(t, d, findingID)
 
 	snapshotID := task32BindEvidence(t, d, findingID)
-	convID := task32SeedRetest(t, d, findingID, "running", "", "复测摘要", "复测证据")
-	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM finding_traffic_bindings WHERE snapshot_id = ?`, snapshotID)
-		_, _ = d.Exec(`DELETE FROM traffic_evidence_snapshots WHERE id = ?`, snapshotID)
-		_, _ = d.Exec(`DELETE FROM findings WHERE id = ?`, findingID)
-	})
+	// active 与 terminal 两类复测历史都要被解除：前者证明没有留下"复测中"，后者才
+	// 证明删除真的解除了关联，而不是只改了活跃那几条的状态。
+	runningConv := task32SeedRetest(t, d, findingID, "running", "", "复测摘要", "复测证据")
+	completedConv := task32SeedRetest(t, d, findingID, "completed", "fixed", "已完成", "已完成证据")
 
 	if n, err := d.DeleteFinding(findingID); err != nil || n != 1 {
 		t.Fatalf("DeleteFinding: n=%d err=%v", n, err)
 	}
 
-	var bindings int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM finding_traffic_bindings WHERE finding_id = ?`, findingID).Scan(&bindings); err != nil {
-		t.Fatalf("count bindings failed: %v", err)
-	}
-	if bindings != 0 {
+	if bindings := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings WHERE finding_id = ?`, findingID); bindings != 0 {
 		t.Errorf("evidence bindings after delete = %d, want 0", bindings)
 	}
-
-	var sealed, unfinished int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM finding_retests WHERE conversation_id = ?`, convID).Scan(&sealed); err != nil {
-		t.Fatalf("count sealed retests failed: %v", err)
+	if dangling := task32Count(t, d, `SELECT COUNT(*) FROM finding_retests WHERE finding_id = ?`, findingID); dangling != 0 {
+		t.Errorf("retest rows still owned by the deleted finding = %d, want 0 (dangling finding_id)", dangling)
 	}
-	if err := d.QueryRow(`SELECT COUNT(*) FROM finding_retests WHERE conversation_id = ? AND status IN ('pending','running')`, convID).Scan(&unfinished); err != nil {
-		t.Fatalf("count unfinished retests failed: %v", err)
+	if bound := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings WHERE snapshot_id = ?`, snapshotID); bound != 0 {
+		t.Errorf("snapshot still bound after delete = %d, want 0", bound)
 	}
-	if sealed != 1 || unfinished != 0 {
-		t.Errorf("retest linkage after delete: rows=%d unfinished=%d, want 1/0", sealed, unfinished)
+	for _, conversationID := range []int64{runningConv, completedConv} {
+		if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_retests WHERE conversation_id = ?`, conversationID); left != 0 {
+			t.Errorf("retest rows of conversation %d after delete = %d, want 0", conversationID, left)
+		}
+		if kept := task32Count(t, d, `SELECT COUNT(*) FROM conversations WHERE id = ?`, conversationID); kept != 1 {
+			t.Errorf("retest conversation %d must survive finding deletion, got %d", conversationID, kept)
+		}
 	}
 	active, err := d.ListActiveFindingRetests(context.Background())
 	if err != nil {
 		t.Fatalf("ListActiveFindingRetests failed: %v", err)
 	}
 	for _, item := range active {
-		if item.ConversationID == convID || item.FindingID == findingID {
+		if item.ConversationID == runningConv || item.FindingID == findingID {
 			t.Errorf("deleted finding still owns an active retest: %+v", item)
 		}
 	}
+}
 
-	var conversations int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM conversations WHERE id = ?`, convID).Scan(&conversations); err != nil {
-		t.Fatalf("count conversations failed: %v", err)
+// TestFindings_DeleteFindingsByTaskRemovesEveryChildRow 覆盖任务级批量删除的解除
+// 完整性：该任务名下每条漏洞的证据绑定与复测子行（active + terminal）都必须归零。
+func TestFindings_DeleteFindingsByTaskRemovesEveryChildRow(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
 	}
-	if conversations != 1 {
-		t.Errorf("retest conversation must survive finding deletion, got %d", conversations)
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+	task, err := d.CreateTask("P08T32 批量删除", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	defer func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("delete task: %v", err)
+		}
+	}()
+
+	vc := fmt.Sprintf("P08T32 batch %d", time.Now().UnixNano())
+	var ids []int64
+	for i := range 3 {
+		findingID, err := d.AddFinding(task.ID, 0, vc, fmt.Sprintf("批量删除 %d", i), SeverityHigh, "摘要", "证据", "worker", nil)
+		if err != nil || findingID <= 0 {
+			t.Fatalf("AddFinding[%d]: id=%d err=%v", i, findingID, err)
+		}
+		ids = append(ids, findingID)
+		task32TrackFinding(t, d, findingID)
+		task32BindEvidence(t, d, findingID)
+		// 一半挂 active 复测、一半挂 terminal 复测，两类都必须随漏洞消失。
+		task32SeedRetest(t, d, findingID, []string{"running", "completed", "stopped"}[i], "", "摘要", "证据")
+	}
+
+	deleted, err := d.DeleteFindingsByTask(task.ID)
+	if err != nil {
+		t.Fatalf("DeleteFindingsByTask: %v", err)
+	}
+	if deleted != int64(len(ids)) {
+		t.Errorf("DeleteFindingsByTask rows = %d, want %d", deleted, len(ids))
+	}
+	for _, findingID := range ids {
+		if left := task32Count(t, d, `SELECT COUNT(*) FROM findings WHERE id = ?`, findingID); left != 0 {
+			t.Errorf("finding %d survived the task cascade", findingID)
+		}
+		if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings WHERE finding_id = ?`, findingID); left != 0 {
+			t.Errorf("bindings owned by %d after task delete = %d, want 0", findingID, left)
+		}
+		if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_retests WHERE finding_id = ?`, findingID); left != 0 {
+			t.Errorf("retests owned by %d after task delete = %d, want 0", findingID, left)
+		}
+	}
+	// 幂等：再删一次是 0 行，不是错误。
+	if deleted, err := d.DeleteFindingsByTask(task.ID); err != nil || deleted != 0 {
+		t.Errorf("re-delete: want (0,nil), got (%d,%v)", deleted, err)
+	}
+}
+
+// TestFindings_DeleteFindingsByTaskRollsBackOnLockFailure 钉死 I3 的原子性：父任务
+// 锁（归档状态门禁）失败时整笔事务必须回滚，绝不能出现"绑定已删、漏洞还在"的半成品。
+func TestFindings_DeleteFindingsByTaskRollsBackOnLockFailure(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+	task, err := d.CreateTask("P08T32 回滚", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	// 先注册删任务、后注册"撤销删除标记"：t.Cleanup 是 LIFO，恢复 deleted_at 一定先于
+	// DeleteTask 执行，否则会在一个已打删除标记的任务上去删任务。
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("delete task: %v", err)
+		}
+	})
+
+	findingID, err := d.AddFinding(task.ID, 0, fmt.Sprintf("P08T32 rb %d", time.Now().UnixNano()), "回滚样本", SeverityHigh, "摘要", "证据", "worker", nil)
+	if err != nil || findingID <= 0 {
+		t.Fatalf("AddFinding: id=%d err=%v", findingID, err)
+	}
+	task32TrackFinding(t, d, findingID)
+	task32BindEvidence(t, d, findingID)
+	task32SeedRetest(t, d, findingID, "running", "", "摘要", "证据")
+
+	// 让父任务锁先失败（deleted_at 非空 → LockTaskEvidenceTx → ErrTaskArchiveState）。
+	if _, err := d.Exec(`UPDATE tasks SET deleted_at = CURRENT_TIMESTAMP(3) WHERE id = ?`, task.ID); err != nil {
+		t.Fatalf("mark task deleted: %v", err)
+	}
+	t.Cleanup(func() {
+		task32MustExec(t, d, `UPDATE tasks SET deleted_at = NULL WHERE id = ?`, task.ID)
+	})
+
+	if _, err := d.DeleteFindingsByTask(task.ID); !errors.Is(err, ErrTaskArchiveState) {
+		t.Fatalf("DeleteFindingsByTask on a deleting task: want ErrTaskArchiveState, got %v", err)
+	}
+	// 失败之后每一条子行与父行都必须原封不动：三条独立自动提交语句做不到这点。
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings WHERE finding_id = ?`, findingID); left != 1 {
+		t.Errorf("bindings after a rolled-back task delete = %d, want 1 (nothing may be removed)", left)
+	}
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_retests WHERE finding_id = ?`, findingID); left != 1 {
+		t.Errorf("retests after a rolled-back task delete = %d, want 1 (nothing may be removed)", left)
+	}
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM findings WHERE id = ?`, findingID); left != 1 {
+		t.Errorf("finding after a rolled-back task delete = %d, want 1", left)
+	}
+}
+
+// TestFindings_DeleteFindingsByTaskSerializesEvidenceWriters 钉死 I3 的并发窗口：
+// 批量删除与"检查漏洞存在 → 追加绑定"共用同一把证据写者门禁，因此删除一旦提交，
+// 任何后来者都不可能在已删漏洞上再挂出一条绑定。
+func TestFindings_DeleteFindingsByTaskSerializesEvidenceWriters(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+	task, err := d.CreateTask("P08T32 并发绑定", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	defer func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("delete task: %v", err)
+		}
+	}()
+	findingID, err := d.AddFinding(task.ID, 0, fmt.Sprintf("P08T32 race %d", time.Now().UnixNano()), "并发样本", SeverityHigh, "摘要", "证据", "worker", nil)
+	if err != nil || findingID <= 0 {
+		t.Fatalf("AddFinding: id=%d err=%v", findingID, err)
+	}
+	task32TrackFinding(t, d, findingID)
+	// 并发写者会不断造出新的内容寻址快照；测试结束按来源标记整批清掉，不给基线库
+	// 留下无主快照（M1 的零残留同样覆盖证据快照）。
+	t.Cleanup(func() {
+		task32MustExec(t, d, `DELETE FROM finding_traffic_bindings WHERE snapshot_id IN (SELECT id FROM traffic_evidence_snapshots WHERE source_traffic_id LIKE ?)`, "p08-t32-race-%")
+		task32MustExec(t, d, `DELETE FROM traffic_evidence_snapshots WHERE source_traffic_id LIKE ?`, "p08-t32-race-%")
+	})
+
+	var (
+		wg        sync.WaitGroup
+		stop      = make(chan struct{})
+		failures  = make(chan error, 8)
+		attempts  atomic.Int64
+		committed atomic.Int64
+	)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				err := d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
+					// 与删除共用证据门禁，因此这段"存在性检查 + 追加绑定"整体串行。
+					var live int
+					if err := tx.QueryRow(`SELECT COUNT(*) FROM findings WHERE id = ?`, findingID).Scan(&live); err != nil {
+						return err
+					}
+					if live == 0 {
+						return nil
+					}
+					if err := AddFindingTrafficTx(tx, findingID, []PreparedTrafficEvidence{{
+						Ref:      TrafficRef{TrafficID: fmt.Sprintf("race-%d", attempts.Add(1)), Role: "supporting"},
+						Snapshot: task32EvidenceSnapshot(fmt.Sprintf("p08-t32-race-%d-%d", findingID, attempts.Load())),
+					}}); err != nil {
+						return err
+					}
+					committed.Add(1)
+					return nil
+				})
+				if err != nil {
+					select {
+					case failures <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	if _, err := d.DeleteFindingsByTask(task.ID); err != nil {
+		close(stop)
+		wg.Wait()
+		t.Fatalf("DeleteFindingsByTask: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Errorf("concurrent evidence writer failed: %v", failure)
+	}
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings WHERE finding_id = ?`, findingID); left != 0 {
+		t.Errorf("bindings created against the deleted finding = %d, want 0", left)
 	}
 }
 
@@ -965,9 +1450,7 @@ func TestFindings_RetestResultIdenticalRetry(t *testing.T) {
 	if err != nil || findingID <= 0 {
 		t.Fatalf("AddFinding: id=%d err=%v", findingID, err)
 	}
-	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM findings WHERE id = ?`, findingID)
-	})
+	task32TrackFinding(t, d, findingID)
 
 	convID := task32SeedRetest(t, d, findingID, "running", "reproduced", "同样的摘要", "同样的证据")
 
@@ -989,11 +1472,185 @@ func TestFindings_RetestResultIdenticalRetry(t *testing.T) {
 	}
 }
 
-// task32BindEvidence 给漏洞绑一条流量证据快照，返回 snapshot id。
-func task32BindEvidence(t *testing.T, d *DB, findingID int64) string {
+// TestFindings_CreateFindingRetestWritesStrictDefaults 是真机侧的 I1 验收：发起复测
+// 时每条 NOT NULL 文本列都必须带上应用层默认值，否则严格 TiDB 直接 1364，复测根本
+// 发不起来（Light 的 fixture 补齐掩盖不了产品 INSERT 缺列）。
+func TestFindings_CreateFindingRetestWritesStrictDefaults(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+	findingID, err := d.AddFinding(0, 0, fmt.Sprintf("P08T32 strict %d", time.Now().UnixNano()), "严格默认值", SeverityHigh, "摘要", "证据", "worker", nil)
+	if err != nil || findingID <= 0 {
+		t.Fatalf("AddFinding: id=%d err=%v", findingID, err)
+	}
+	task32TrackFinding(t, d, findingID)
+
+	retest, conversation, created, err := d.CreateFindingRetest(context.Background(), findingID, "补充说明")
+	if err != nil {
+		t.Fatalf("CreateFindingRetest: %v", err)
+	}
+	if !created || retest == nil || conversation == nil {
+		t.Fatalf("CreateFindingRetest must dispatch a fresh run, got created=%v retest=%+v", created, retest)
+	}
+	var status, notes, verdict, summary, evidence, failure string
+	if err := d.QueryRow(`SELECT status, notes, verdict, summary, evidence, error FROM finding_retests WHERE id = ?`, retest.ID).
+		Scan(&status, &notes, &verdict, &summary, &evidence, &failure); err != nil {
+		t.Fatalf("read back retest defaults: %v", err)
+	}
+	if status != "pending" {
+		t.Errorf("new retest status = %q, want pending", status)
+	}
+	if notes != "补充说明" {
+		t.Errorf("new retest notes = %q, want the trimmed input", notes)
+	}
+	if verdict != "" || summary != "" || evidence != "" || failure != "" {
+		t.Errorf("new retest conclusion columns must start empty, got verdict=%q summary=%q evidence=%q error=%q", verdict, summary, evidence, failure)
+	}
+}
+
+// TestFindings_RetestSnapshotKeepsIDsAndTextTypes 是真机侧的 I6 验收：快照里的资产
+// id 不能被 float64 舍入，普通 TEXT 列（evidence/summary/notes）即使正文是 JSON 也
+// 必须仍是字符串。
+func TestFindings_RetestSnapshotKeepsIDsAndTextTypes(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+	const hugeID = 9007199254740993 // 2^53 + 1：float64 会把它舍成 …992
+	findingID, err := d.AddFinding(0, 0, fmt.Sprintf("P08T32 snap %d", time.Now().UnixNano()), "快照保真", SeverityHigh,
+		`{"note":"summary 正文长得像 JSON"}`, `{"payload":[{"huge":9007199254740993}]}`, "worker", []int64{hugeID})
+	if err != nil || findingID <= 0 {
+		t.Fatalf("AddFinding: id=%d err=%v", findingID, err)
+	}
+	task32TrackFinding(t, d, findingID)
+
+	retest, _, created, err := d.CreateFindingRetest(context.Background(), findingID, "")
+	if err != nil || !created || retest == nil {
+		t.Fatalf("CreateFindingRetest: created=%v err=%v", created, err)
+	}
+	var raw []byte
+	if err := d.QueryRow(`SELECT snapshot FROM finding_retests WHERE id = ?`, retest.ID).Scan(&raw); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "9007199254740993") || strings.Contains(text, "9007199254740992") {
+		t.Errorf("64-bit ids were rounded inside the snapshot: %s", text)
+	}
+	// 回读也必须 UseNumber：拿默认 interface{} 解码去断言，测试自己就先丢了精度。
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	var doc struct {
+		Finding map[string]any `json:"finding"`
+	}
+	if err := decoder.Decode(&doc); err != nil {
+		t.Fatalf("snapshot is not valid json: %v (%s)", err, text)
+	}
+	// 普通 TEXT 列（evidence/summary）正文恰好是 JSON 也必须保持字符串。
+	if evidence, ok := doc.Finding["evidence"].(string); !ok || !strings.Contains(evidence, "payload") {
+		t.Errorf("ordinary TEXT evidence must stay a string in the snapshot, got %T %v", doc.Finding["evidence"], doc.Finding["evidence"])
+	}
+	if _, ok := doc.Finding["summary"].(string); !ok {
+		t.Errorf("ordinary TEXT summary must stay a string, got %T", doc.Finding["summary"])
+	}
+	// JSON 载荷列（asset_ids）解回数组，且元素仍是那个 64 位整数本身。
+	ids, ok := doc.Finding["asset_ids"].([]any)
+	if !ok || len(ids) != 1 {
+		t.Fatalf("json asset_ids must decode into an array, got %T %v", doc.Finding["asset_ids"], doc.Finding["asset_ids"])
+	}
+	if number, isNumber := ids[0].(json.Number); !isNumber || number.String() != "9007199254740993" {
+		t.Errorf("asset id in the snapshot = %v (%T), want 9007199254740993", ids[0], ids[0])
+	}
+}
+
+// task32MustExec 执行一条 fixture 写语句并检查错误：cleanup 里的 `_, _ =` 会把
+// 清理失败静默吞掉，规格要求的"零残留"就只剩一句口头承诺。
+func task32MustExec(t *testing.T, d *DB, query string, args ...any) {
 	t.Helper()
+	if _, err := d.Exec(query, args...); err != nil {
+		t.Errorf("fixture exec %q failed: %v", query, err)
+	}
+}
+
+// task32Count 读一个计数，读失败直接判红（不能把"读不到"当成 0）。
+func task32Count(t *testing.T, d *DB, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := d.QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatalf("count via %q failed: %v", query, err)
+	}
+	return n
+}
+
+// task32TrackFinding 为一条 fixture 漏洞主键登记 cleanup：创建成功后**立即**调用，
+// 按子表 → 父表的顺序删除，逐条检查错误，且父表那条必须最多只动一行（按主键删）。
+func task32TrackFinding(t *testing.T, d *DB, findingID int64) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, query := range []string{
+			`DELETE FROM finding_traffic_bindings WHERE finding_id = ?`,
+			`DELETE FROM finding_retests WHERE finding_id = ?`,
+		} {
+			task32MustExec(t, d, query, findingID)
+		}
+		res, err := d.Exec(`DELETE FROM findings WHERE id = ?`, findingID)
+		if err != nil {
+			t.Errorf("cleanup finding %d failed: %v", findingID, err)
+			return
+		}
+		if rows, err := res.RowsAffected(); err != nil {
+			t.Errorf("cleanup finding %d rows: %v", findingID, err)
+		} else if rows > 1 {
+			t.Errorf("cleanup finding %d removed %d rows, want at most 1 (primary key)", findingID, rows)
+		}
+	})
+}
+
+// task32AssertNoFindingResidue 断言这几个 vulnclass 的 fixture 连子行一起清零。
+// 它注册在按主键 cleanup 之前（所以最后运行），是 M1 要求的终态残留核查。
+func task32AssertNoFindingResidue(t *testing.T, d *DB, vulnClasses ...string) {
+	t.Helper()
+	if len(vulnClasses) == 0 {
+		return
+	}
+	args := make([]any, len(vulnClasses))
+	for i, vulnclass := range vulnClasses {
+		args[i] = vulnclass
+	}
+	in := questionPlaceholders(len(args))
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings b JOIN findings f ON f.id = b.finding_id WHERE f.vulnclass IN (`+in+`)`, args...); left != 0 {
+		t.Errorf("residual evidence bindings = %d, want 0", left)
+	}
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_retests r JOIN findings f ON f.id = r.finding_id WHERE f.vulnclass IN (`+in+`)`, args...); left != 0 {
+		t.Errorf("residual retest rows = %d, want 0", left)
+	}
+	if left := task32Count(t, d, `SELECT COUNT(*) FROM findings WHERE vulnclass IN (`+in+`)`, args...); left != 0 {
+		t.Errorf("residual findings = %d, want 0", left)
+	}
+}
+
+// task32EvidenceSnapshot 造一条内容寻址的流量证据快照（正文与 id 一致）。
+func task32EvidenceSnapshot(sourceTrafficID string) TrafficEvidenceSnapshot {
 	snapshot := TrafficEvidenceSnapshot{
-		SourceTrafficID: fmt.Sprintf("p08-t32-%d", time.Now().UnixNano()),
+		SourceTrafficID: sourceTrafficID,
 		CapturedAt:      time.Now().Unix(),
 		URL:             "https://p08-t32.example.test/api/vuln",
 		Method:          "GET",
@@ -1004,6 +1661,14 @@ func task32BindEvidence(t *testing.T, d *DB, findingID int64) string {
 		RespLen:         2048,
 	}
 	snapshot.ID = TrafficSnapshotID(snapshot)
+	return snapshot
+}
+
+// task32BindEvidence 给漏洞绑一条流量证据快照，返回 snapshot id。绑定成功后立即登记
+// 按主键（snapshot id）的 cleanup，因此 seed 之后任何一步 Fatal 都不会漏清理。
+func task32BindEvidence(t *testing.T, d *DB, findingID int64) string {
+	t.Helper()
+	snapshot := task32EvidenceSnapshot(fmt.Sprintf("p08-t32-%d", time.Now().UnixNano()))
 	if err := d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
 		if err := InsertEvidenceSnapshotTx(tx, snapshot); err != nil {
 			return err
@@ -1015,10 +1680,18 @@ func task32BindEvidence(t *testing.T, d *DB, findingID int64) string {
 	}); err != nil {
 		t.Fatalf("bind evidence: %v", err)
 	}
+	t.Cleanup(func() {
+		task32MustExec(t, d, `DELETE FROM finding_traffic_bindings WHERE snapshot_id = ?`, snapshot.ID)
+		task32MustExec(t, d, `DELETE FROM traffic_evidence_snapshots WHERE id = ?`, snapshot.ID)
+	})
 	return snapshot.ID
 }
 
 // task32SeedRetest 直接落一条复测记录（含其 conversation），返回 conversation id。
+//
+// 与产品代码同一严格口径：finding_retests 的每条 MEDIUMTEXT NOT NULL 列都必须显式
+// 给值（TiDB 严格模式下 TEXT 没有 DEFAULT 可补），notes/error 也不能省。
+// conversation 与复测子行在各自创建成功后立即按主键登记 cleanup。
 func task32SeedRetest(t *testing.T, d *DB, findingID int64, status, verdict, summary, evidence string) int64 {
 	t.Helper()
 	res, err := d.Exec(`INSERT INTO conversations(agent_key, title) VALUES(?, ?)`, FindingRetestAgentKey, "P08 Task 3.2 复测")
@@ -1030,14 +1703,142 @@ func task32SeedRetest(t *testing.T, d *DB, findingID int64, status, verdict, sum
 		t.Fatalf("seed conversation LastInsertId: id=%d err=%v", convID, err)
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM finding_retests WHERE conversation_id = ?`, convID)
-		_, _ = d.Exec(`DELETE FROM conversations WHERE id = ?`, convID)
+		task32MustExec(t, d, `DELETE FROM finding_retests WHERE conversation_id = ?`, convID)
+		if res, err := d.Exec(`DELETE FROM conversations WHERE id = ?`, convID); err != nil {
+			t.Errorf("cleanup conversation %d failed: %v", convID, err)
+		} else if rows, err := res.RowsAffected(); err == nil && rows > 1 {
+			t.Errorf("cleanup conversation %d removed %d rows, want at most 1", convID, rows)
+		}
 	})
-	if _, err := d.Exec(`INSERT INTO finding_retests(finding_id, conversation_id, status, verdict, summary, evidence, snapshot)
-VALUES(?, ?, ?, ?, ?, ?, CAST(? AS JSON))`, findingID, convID, status, verdict, summary, evidence, "{}"); err != nil {
+	if _, err := d.Exec(`INSERT INTO finding_retests(finding_id, conversation_id, status, notes, verdict, summary, evidence, error, snapshot)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, findingID, convID, status, "", verdict, summary, evidence, "", "{}"); err != nil {
 		t.Fatalf("seed retest: %v", err)
 	}
 	return convID
+}
+
+// task32IsDeadlock 认出数据库返回的死锁中止（TiDB/MySQL 的 1213）。
+func task32IsDeadlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "deadlock") || strings.Contains(text, "1213")
+}
+
+// TestFindings_FollowUpIntentVersusDeleteHasNoDeadlock 是真机侧的 I4 验收：follow-up
+// 派生（曾经按 findings → tasks 逆序加锁）与任务级删除（tasks → findings）交错跑。
+// 锁序正确时最坏只是一方排队；逆序则会形成等待环，由数据库强行中止其中一方。
+func TestFindings_FollowUpIntentVersusDeleteHasNoDeadlock(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+
+	for round := range 3 {
+		task, err := d.CreateTask(fmt.Sprintf("P08T32 锁序 %d", round), "goal", nil, 0, 0)
+		if err != nil {
+			t.Fatalf("CreateTask[%d]: %v", round, err)
+		}
+		t.Cleanup(func() {
+			if err := d.DeleteTask(task.ID); err != nil {
+				t.Errorf("delete task %d: %v", task.ID, err)
+			}
+		})
+		store := d.Exploration(task.ExplorationID)
+		nodeID, err := store.AddNode(KindFinding, map[string]any{"summary": "lock order"}, 5, "confirmed", "worker", nil)
+		if err != nil {
+			t.Fatalf("AddNode[%d]: %v", round, err)
+		}
+		findingID, err := d.AddFinding(task.ID, nodeID, fmt.Sprintf("P08T32 lock %d", round), "锁序样本", SeverityHigh, "摘要", "证据", "worker", nil)
+		if err != nil || findingID <= 0 {
+			t.Fatalf("AddFinding[%d]: id=%d err=%v", round, findingID, err)
+		}
+		task32TrackFinding(t, d, findingID)
+
+		var wg sync.WaitGroup
+		results := make(chan error, 8)
+		for range 3 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range 3 {
+					if _, _, err := store.AddFindingFollowUpIntent(findingID, nodeID, "深入利用", Activity{
+						Worker: "system", Kind: "text", Summary: "锁序交错",
+					}); err != nil && !errors.Is(err, ErrFindingOriginUnavailable) {
+						results <- err
+						return
+					}
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := d.DeleteFindingsByTask(task.ID); err != nil {
+				results <- err
+			}
+		}()
+		wg.Wait()
+		close(results)
+		for failure := range results {
+			if task32IsDeadlock(failure) {
+				t.Errorf("round %d: follow-up and task delete deadlocked (reverse lock order): %v", round, failure)
+				continue
+			}
+			t.Errorf("round %d: interleaved follow-up/delete failed: %v", round, failure)
+		}
+	}
+}
+
+// TestFindings_FindingStats_EmptyBaselineIsAllZero 在**独占的干净库**上钉死空表契约：
+// 六个统计字段必须逐一是数值 0（COUNT(CASE WHEN … THEN 1 END) 的形状保证），分组视图
+// 同理。共享业务库绝不允许被清空来制造空表，所以这里要求单独指一个专用库。
+func TestFindings_FindingStats_EmptyBaselineIsAllZero(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_TIDB_EMPTY_DSN"))
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_EMPTY_DSN not set, skipping dedicated empty-database test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+	// 先证明这确实是独占空库；不是就判红，绝不去清空别人的数据。
+	if rows := task32Count(t, d, `SELECT COUNT(*) FROM findings`); rows != 0 {
+		t.Fatalf("ARTEX_TIDB_EMPTY_DSN must point at a dedicated baseline database whose findings table is empty, found %d rows", rows)
+	}
+
+	stats, err := d.FindingStats()
+	if err != nil {
+		t.Fatalf("FindingStats failed: %v", err)
+	}
+	if stats.Total != 0 || stats.Pending != 0 || stats.Critical != 0 || stats.High != 0 || stats.Medium != 0 || stats.Low != 0 {
+		t.Errorf("empty-table stats = %+v, want every one of total/pending/critical/high/medium/low to be 0", stats)
+	}
+	if stats.VulnClasses == nil || stats.Tasks == nil || len(stats.VulnClasses) != 0 || len(stats.Tasks) != 0 {
+		t.Errorf("empty-table slices = %+v, want non-nil empty slices", stats)
+	}
+	groups, groupTotal, findingTotal, err := d.ListFindingGroups(FindingFilter{}, 1, 10)
+	if err != nil {
+		t.Fatalf("ListFindingGroups failed: %v", err)
+	}
+	if groupTotal != 0 || findingTotal != 0 || len(groups) != 0 {
+		t.Errorf("empty-table groups = %+v groups=%d findings=%d, want none", groups, groupTotal, findingTotal)
+	}
 }
 
 // TestFindings_QuestionPlaceholdersShape 钉死动态占位符的形状：长度随输入变化，
@@ -1152,22 +1953,65 @@ func TestFindings_ArchiveTimestampParsesArchivedShapes(t *testing.T) {
 	}
 }
 
-// TestFindings_SnapshotValueKeepsJSONDocuments 覆盖复测快照的值归一：JSON 列要解回
-// 结构（否则快照里是转义字符串），普通文本与 NULL 原样保留。
+// TestFindings_SnapshotValueKeepsJSONDocuments 覆盖复测快照的值归一（I6）：只有
+// schema 声明为 JSON 载荷（TJSON）的列才解回结构，普通文本列一律保持字符串；解析
+// JSON 载荷必须保住 64 位整数精度。类型判据来自声明，绝不来自文本外观。
 func TestFindings_SnapshotValueKeepsJSONDocuments(t *testing.T) {
-	if got := snapshotValue([]byte(`[1,2]`)); !strings.Contains(fmt.Sprint(got), "1 2") && fmt.Sprint(got) != "[1 2]" {
+	// JSON 载荷列：对象/数组解回结构（否则快照里多一层转义字符串）。
+	if got := snapshotValue([]byte(`[1,2]`), true); fmt.Sprint(got) != "[1 2]" {
 		t.Errorf("json array column should decode into a slice, got %#v", got)
 	}
-	if got := snapshotValue([]byte(`{"k":"v"}`)); fmt.Sprint(got) != "map[k:v]" {
+	if got := snapshotValue([]byte(`{"k":"v"}`), true); fmt.Sprint(got) != "map[k:v]" {
 		t.Errorf("json object column should decode into a map, got %#v", got)
 	}
-	if got := snapshotValue([]byte(`plain text`)); got != "plain text" {
-		t.Errorf("non-json bytes should stay a string, got %#v", got)
+	// 嵌套结构 + > 2^53 的资产 id：默认 interface{} 解码会把数字过一遍 float64，
+	// 9007199254740993 会被舍成 9007199254740992；UseNumber 必须逐字保住。
+	nested := `{"asset_ids":[9007199254740993,{"inner":[9007199254740993,1.5]}],"n":0}`
+	got := snapshotValue([]byte(nested), true)
+	if _, ok := got.(map[string]any); !ok {
+		t.Fatalf("nested json should stay a map, got %#v", got)
 	}
-	if got := snapshotValue(nil); got != nil {
+	if raw, err := json.Marshal(got); err != nil || string(raw) != nested {
+		t.Errorf("64-bit ids must survive decode/encode: got %s err=%v, want %s", raw, err, nested)
+	}
+	// 普通 TEXT 列：正文恰好是一整篇 JSON 也保持字符串文本（旧实现按外观改类型）。
+	for _, text := range []string{`{"k":"v"}`, `[1,2]`, `plain text`, `123`} {
+		if got := snapshotValue([]byte(text), false); got != text {
+			t.Errorf("ordinary text column changed type: got %#v, want the string %q", got, text)
+		}
+	}
+	// JSON 载荷列里的脏数据（解不出来）原样带出，既不吞值也不改型。
+	if got := snapshotValue([]byte(`{broken`), true); got != "{broken" {
+		t.Errorf("unparsable json payload should stay verbatim, got %#v", got)
+	}
+	if got := snapshotValue(nil, true); got != nil {
 		t.Errorf("nil should stay nil, got %#v", got)
 	}
-	if got := snapshotValue(42); got != 42 {
+	if got := snapshotValue(42, true); got != 42 {
 		t.Errorf("non-bytes values should pass through, got %#v", got)
+	}
+}
+
+// TestFindings_JSONPayloadColumnsComeFromCatalog 钉死 I6 的类型判据：JSON 载荷列
+// 必须来自基线 schema 目录（TJSON），不是文本猜测，也不是 driver 的列类型 ——
+// TJSON 在 DDL 层渲染成 MEDIUMTEXT，driver 眼里它和 evidence 没有区别。
+func TestFindings_JSONPayloadColumnsComeFromCatalog(t *testing.T) {
+	for _, tc := range []struct {
+		table, column string
+		want          bool
+	}{
+		{"findings", "asset_ids", true},
+		{"findings", "report", false},
+		{"findings", "evidence", false},
+		{"finding_retests", "snapshot", true},
+		{"finding_retests", "summary", false},
+		{"finding_retests", "evidence", false},
+		{"finding_retests", "notes", false},
+		{"no_such_table", "asset_ids", false},
+		{"findings", "no_such_column", false},
+	} {
+		if got := jsonPayloadColumn(tc.table, tc.column); got != tc.want {
+			t.Errorf("jsonPayloadColumn(%q, %q) = %v, want %v", tc.table, tc.column, got, tc.want)
+		}
 	}
 }

@@ -111,9 +111,15 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 		nid = &nodeID
 	}
 	// TiDB 没有 INSERT … RETURNING：自增主键一律经 LastInsertId() 取回。
-	res, err := d.Exec(`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON))
+	//
+	// status / report 必须显式写值：这两列在基线里是 TextN（MEDIUMTEXT NOT NULL），
+	// 而 TiDB 8.5 严格模式禁止 TEXT/JSON 列声明 DEFAULT（见 schema.TextN 契约与
+	// generator.rejectsColumnDefault），声明期默认值只是元数据、不进入 DDL。省略
+	// 列名不会补上 'pending'/'' —— 而是 STRICT_TRANS_TABLES 直接报 1364
+	// （ErrNoDefaultForField 'findings.status'），新增漏洞整条失败。
+	res, err := d.Exec(`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, status, report)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), FindingPending, "")
 	if err != nil {
 		return 0, err
 	}
@@ -248,16 +254,19 @@ func (f FindingFilter) where() (string, []any) {
 	}
 	if query := strings.TrimSpace(f.Query); query != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
-		// TiDB 的列默认排序规则是 *_ci(大小写不敏感),LIKE 即等价于 PG 的 ILIKE;
-		// ESCAPE 里的反斜杠在 MySQL 方言下必须写两枚。
+		// 基线表是 COLLATE=utf8mb4_bin（见 schema/generator.go），裸 LIKE 在二进制
+		// 比较序下**大小写敏感**，直接替换掉 PG 的 ILIKE 会让「SQL Injection」再也
+		// 搜不到「sql injection」。列侧LOWER(…) 折叠 + 参数侧在 Go 里同步
+		// strings.ToLower(…)，两侧都落到小写后再按二进制比较，等价原 ILIKE 语义；
+		// LIKE 元字符的转义与参数化一律保持不变。
 		like := `(
-			COALESCE(f.name, '') LIKE ? ESCAPE '\\' OR
-			f.vulnclass LIKE ? ESCAPE '\\' OR
-			f.summary LIKE ? ESCAPE '\\' OR
-			f.evidence LIKE ? ESCAPE '\\' OR
-			COALESCE(f.report, '') LIKE ? ESCAPE '\\'
+			LOWER(COALESCE(f.name, '')) LIKE ? ESCAPE '\\' OR
+			LOWER(f.vulnclass) LIKE ? ESCAPE '\\' OR
+			LOWER(f.summary) LIKE ? ESCAPE '\\' OR
+			LOWER(f.evidence) LIKE ? ESCAPE '\\' OR
+			LOWER(COALESCE(f.report, '')) LIKE ? ESCAPE '\\'
 		)`
-		pattern := "%" + escaped + "%"
+		pattern := strings.ToLower("%" + escaped + "%")
 		for range 5 {
 			args = append(args, pattern)
 		}
@@ -414,17 +423,15 @@ var ErrFindingOriginUnavailable = errors.New("finding origin is no longer availa
 // The returned activity is the committed row and can be broadcast as-is without
 // calling AppendActivity again.
 func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int64, description string, audit Activity) (int64, Activity, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, Activity{}, err
-	}
-	defer tx.Rollback()
-
-	// TiDB 的 SELECT … FOR UPDATE 只吃单表点/范围读（PG 的 JOIN + FOR SHARE OF
-	// 不被支持），因此按 findings → tasks → exploration_nodes 的固定表序逐行加锁，
-	// 校验条件与原 JOIN 完全一致：同一探索、节点确属该漏洞、kind='finding'。
+	// 先**不加锁**读出这条漏洞的归属，只为拿到要按什么顺序去锁谁。
+	//
+	// 顺序问题不能省：全局锁序是 tasks=1 → exploration_nodes=7 → findings=9，而旧实现
+	// 在事务里先 findings FOR UPDATE 再 tasks FOR UPDATE，与删除路径（先锁 task 再锁
+	// finding，见 LockFindingEvidenceTx）刚好逆序，两个事务交错时必然形成等待环，
+	// 由数据库强行中止一方。这里普通读只是定位（读到的值在持锁后一律重验），
+	// 真正的排他锁严格按全局顺序一把把地取。
 	var linkedNodeID, linkedTaskID sql.NullInt64
-	if err := tx.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ? FOR UPDATE`, findingID).Scan(&linkedNodeID, &linkedTaskID); err != nil {
+	if err := s.db.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ?`, findingID).Scan(&linkedNodeID, &linkedTaskID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, Activity{}, ErrFindingOriginUnavailable
 		}
@@ -433,24 +440,52 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	if !linkedNodeID.Valid || !linkedTaskID.Valid || linkedNodeID.Int64 != findingNodeID {
 		return 0, Activity{}, ErrFindingOriginUnavailable
 	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, Activity{}, err
+	}
+	defer tx.Rollback()
+
+	// TiDB 的 SELECT … FOR UPDATE 只吃单表点/范围读（PG 的 JOIN + FOR SHARE OF
+	// 不被支持），因此按全局锁序逐表逐行加锁：tasks → exploration_nodes → findings，
+	// 每一把锁拿到后立刻重验（父任务未删除、节点确属本探索且 kind='finding'、
+	// 漏洞仍挂在这个节点上），条件与原来的 JOIN 逐条对齐。
 	var taskExplorationID int64
-	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id = ? FOR UPDATE`, linkedTaskID.Int64).Scan(&taskExplorationID); err != nil {
+	var taskDeletedAt sql.NullTime
+	if err := tx.QueryRow(`SELECT exploration_id, deleted_at FROM tasks WHERE id = ? FOR UPDATE`, linkedTaskID.Int64).Scan(&taskExplorationID, &taskDeletedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, Activity{}, ErrFindingOriginUnavailable
 		}
 		return 0, Activity{}, err
+	}
+	if taskDeletedAt.Valid {
+		// 任务已打上删除标记：它正在被归档/级联清理，此时从它下面派生新意图会留下
+		// 一段永远无人执行的孤儿图。
+		return 0, Activity{}, ErrFindingOriginUnavailable
 	}
 	if taskExplorationID != s.expID {
 		return 0, Activity{}, ErrFindingOriginUnavailable
 	}
 	var nodeKind string
-	if err := tx.QueryRow(`SELECT kind FROM exploration_nodes WHERE id = ? FOR UPDATE`, findingNodeID).Scan(&nodeKind); err != nil {
+	var nodeExplorationID int64
+	if err := tx.QueryRow(`SELECT kind, exploration_id FROM exploration_nodes WHERE id = ? FOR UPDATE`, findingNodeID).Scan(&nodeKind, &nodeExplorationID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, Activity{}, ErrFindingOriginUnavailable
 		}
 		return 0, Activity{}, err
 	}
-	if nodeKind != KindFinding {
+	if nodeKind != KindFinding || nodeExplorationID != s.expID {
+		return 0, Activity{}, ErrFindingOriginUnavailable
+	}
+	var heldNodeID, heldTaskID sql.NullInt64
+	if err := tx.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ? FOR UPDATE`, findingID).Scan(&heldNodeID, &heldTaskID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, Activity{}, ErrFindingOriginUnavailable
+		}
+		return 0, Activity{}, err
+	}
+	if !heldNodeID.Valid || heldNodeID.Int64 != findingNodeID || !heldTaskID.Valid || heldTaskID.Int64 != linkedTaskID.Int64 {
 		return 0, Activity{}, ErrFindingOriginUnavailable
 	}
 	liveNodeID := findingNodeID
@@ -751,8 +786,11 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 // finding_traffic_bindings → finding_retests → exploration_*）：
 //   - finding_traffic_bindings 整行删除（finding_id 是 NOT NULL 列，没有置空这条路），
 //     快照文件由证据存储的 GC 负责；
-//   - 尚未收尾的复测封成终态：active_finding_id 是 IF(status IN ('pending','running'),
-//     finding_id, NULL) 的生成列，漏封会让前端永久显示「复测中」，并让后续复测被去重吞掉；
+//   - finding_retests 整行删除（旧库该引用本就是 ON DELETE CASCADE，新基线 finding_id
+//     是 NOT NULL，同样没有置空退路）。只把 pending/running 封成 stopped 等于让
+//     completed/failed/stopped 的历史连同指向已删漏洞的 finding_id 一起永久留在库里，
+//     那是悬挂引用，不是「解除关联」；
+//   - 承载复测的 conversation 独立存在，不随漏洞删除（历史会话仍可回看）；
 //   - 节点的边与锚点显式删除、activity 的 node_id 置空（保留活动流水）。
 //
 // Returns rows affected (0 = no finding with that id)。
@@ -774,9 +812,9 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 		if _, err := tx.Exec(`DELETE FROM finding_traffic_bindings WHERE finding_id = ?`, id); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE finding_retests
-			SET status='stopped', error='漏洞已删除，复测随之终止', finished_at=CURRENT_TIMESTAMP(3)
-			WHERE finding_id = ? AND status IN ('pending','running')`, id); err != nil {
+		// 复测子行整行删除：pending/running 之外还有 completed/failed/stopped 的历史，
+		// 它们同样挂在被删的 finding_id 上。conversation 不在这儿，独立保留。
+		if _, err := tx.Exec(`DELETE FROM finding_retests WHERE finding_id = ?`, id); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DELETE FROM findings WHERE id = ?`, id); err != nil {
@@ -814,24 +852,82 @@ func detachExplorationNodeTx(tx *sql.Tx, nodeID int64) error {
 // exploration finding nodes are cascade-deleted separately when the task's
 // exploration subgraph is dropped. Returns rows deleted.
 //
-// 与 DeleteFinding 同一口径：没有外键级联，证据绑定与未收尾的复测必须在删
-// findings 行之前先解除，否则会留下指向已删漏洞的绑定与永久「复测中」的记录。
+// 与 DeleteFinding 同一口径：没有外键级联，证据绑定与**全部**复测子行必须在删
+// findings 行之前先解除，否则会留下指向已删漏洞的绑定与复测（旧库这两张子表都是
+// ON DELETE CASCADE）。
+//
+// 原子性与锁协议：整段跑在 WithEvidenceTx 里 —— 那把 'evidence' 锚点行锁正是所有
+// 证据写者（AddFindingTrafficTx / EditFindingTraffic / RecordFinding /
+// SetFindingReport）与 DeleteFinding 共用的写者门禁，成员定位、父任务锁、子表清理
+// 与父表删除同处一个事务，中途任何一步失败整笔回滚，不存在「绑定已删、漏洞还在」
+// 的半成品，也不存在别的写者在两条语句之间塞进新子行的窗口。
+// 加锁顺序遵循全局锁序（tasks=1 先于 findings=9）：先父任务、再漏洞成员行。
 func (d *DB) DeleteFindingsByTask(taskID int64) (int64, error) {
-	if _, err := d.Exec(`DELETE FROM finding_traffic_bindings
-		WHERE finding_id IN (SELECT id FROM findings WHERE task_id = ?)`, taskID); err != nil {
-		return 0, err
-	}
-	if _, err := d.Exec(`UPDATE finding_retests
-		SET status='stopped', error='漏洞已删除，复测随之终止', finished_at=CURRENT_TIMESTAMP(3)
-		WHERE status IN ('pending','running')
-		  AND finding_id IN (SELECT id FROM findings WHERE task_id = ?)`, taskID); err != nil {
-		return 0, err
-	}
-	res, err := d.Exec(`DELETE FROM findings WHERE task_id = ?`, taskID)
+	var deleted int64
+	err := d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
+		// 1) 普通读定位成员：空集合直接返回，不去抢父任务锁（与改造前的无副作用一致）。
+		ids, err := taskFindingIDsTx(tx, taskID, false)
+		if err != nil || len(ids) == 0 {
+			return err
+		}
+		// 2) 父任务锁 + 归档状态门禁：与单条删除（LockFindingEvidenceTx）完全同一协议。
+		if err := LockTaskEvidenceTx(tx, taskID); err != nil {
+			return err
+		}
+		// 3) 持锁后按主键升序重取成员（当前读）：上一步的普通读只是快照读，
+		//    锁隙期被改动的成员必须以这里为准；返回的集合就是本次要删的全集。
+		ids, err = taskFindingIDsTx(tx, taskID, true)
+		if err != nil || len(ids) == 0 {
+			deleted = 0
+			return err
+		}
+		// 4) 子表 → 父表，逐张按同一批 finding id 清理，任何一步失败整笔回滚。
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			args[i] = id
+		}
+		for _, statement := range []string{
+			`DELETE FROM finding_traffic_bindings WHERE finding_id IN (` + questionPlaceholders(len(ids)) + `)`,
+			`DELETE FROM finding_retests WHERE finding_id IN (` + questionPlaceholders(len(ids)) + `)`,
+		} {
+			if _, err := tx.Exec(statement, args...); err != nil {
+				return err
+			}
+		}
+		res, err := tx.Exec(`DELETE FROM findings WHERE task_id = ?`, taskID)
+		if err != nil {
+			return err
+		}
+		deleted, err = res.RowsAffected()
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return deleted, nil
+}
+
+// taskFindingIDsTx 读出某个任务名下的 finding 主键（升序）。forUpdate=true 时是
+// 持锁当前读：既拿到最新成员集合，也顺带把这些行按主键顺序锁住。
+func taskFindingIDsTx(tx *sql.Tx, taskID int64, forUpdate bool) ([]int64, error) {
+	query := `SELECT id FROM findings WHERE task_id = ? ORDER BY id`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	rows, err := tx.Query(query, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // SetFindingStatus updates one finding's triage state. Returns 1 when the finding

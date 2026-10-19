@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/db/schema"
 )
 
 const FindingRetestAgentKey = "retester"
@@ -89,12 +92,12 @@ type retestSnapshot struct {
 
 // buildRetestSnapshot 读出复测所需的全部上下文并编成 JSON 文档。
 func buildRetestSnapshot(ctx context.Context, tx *sql.Tx, findingID int64) ([]byte, error) {
-	finding, err := queryRowMap(ctx, tx, `SELECT f.* FROM findings f WHERE f.id = ?`, findingID)
+	finding, err := queryRowMap(ctx, tx, "findings", `SELECT f.* FROM findings f WHERE f.id = ?`, findingID)
 	if err != nil {
 		return nil, err
 	}
 	// 原条件 f.asset_ids @> to_jsonb(ARRAY[a.id]) 等价于「JSON 数组里含该资产 id」。
-	assets, err := queryRowMaps(ctx, tx, `SELECT a.* FROM assets a
+	assets, err := queryRowMaps(ctx, tx, "assets", `SELECT a.* FROM assets a
 JOIN findings f ON f.id = ? AND JSON_CONTAINS(COALESCE(f.asset_ids, '[]'), CAST(a.id AS JSON))`, findingID)
 	if err != nil {
 		return nil, err
@@ -106,7 +109,7 @@ JOIN findings f ON f.id = ? AND JSON_CONTAINS(COALESCE(f.asset_ids, '[]'), CAST(
 	}
 	constraints := []map[string]any{}
 	if taskID != nil {
-		constraints, err = queryRowMaps(ctx, tx, `SELECT c.* FROM task_constraints c
+		constraints, err = queryRowMaps(ctx, tx, "task_constraints", `SELECT c.* FROM task_constraints c
 JOIN tasks t ON t.exploration_id = c.exploration_id WHERE t.id = ?`, taskID)
 		if err != nil {
 			return nil, err
@@ -124,7 +127,10 @@ JOIN tasks t ON t.exploration_id = c.exploration_id WHERE t.id = ?`, taskID)
 
 // queryRowMaps 把任意 SELECT 的每一行读成「列名 → 值」映射：快照要的是整行原样，
 // 不列列清单，schema 演进时不会漏列。
-func queryRowMaps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]map[string]any, error) {
+//
+// table 是这条查询的**权威表名**（三份快照查询都是 `SELECT x.* FROM <table> x`），
+// 用来判定哪些列是 JSON 载荷：快照里的值类型必须由声明决定，绝不能再按文本外观猜。
+func queryRowMaps(ctx context.Context, tx *sql.Tx, table, query string, args ...any) ([]map[string]any, error) {
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -146,7 +152,7 @@ func queryRowMaps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 		}
 		row := make(map[string]any, len(columns))
 		for i, column := range columns {
-			row[column] = snapshotValue(raw[i])
+			row[column] = snapshotValue(raw[i], jsonPayloadColumn(table, column))
 		}
 		out = append(out, row)
 	}
@@ -154,29 +160,78 @@ func queryRowMaps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 }
 
 // queryRowMap 取首行；无行返回 nil（调用方按缺失处理）。
-func queryRowMap(ctx context.Context, tx *sql.Tx, query string, args ...any) (map[string]any, error) {
-	rows, err := queryRowMaps(ctx, tx, query, args...)
+func queryRowMap(ctx context.Context, tx *sql.Tx, table, query string, args ...any) (map[string]any, error) {
+	rows, err := queryRowMaps(ctx, tx, table, query, args...)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
 	return rows[0], nil
 }
 
-// snapshotValue 归一 driver 返回值：[]byte 里是 JSON 对象/数组时解回结构（否则
-// 快照里会多一层转义字符串），其余文本按原样进 JSON。
-func snapshotValue(value any) any {
-	typed, ok := value.([]byte)
+// jsonPayloadColumns 是「哪张表的哪一列是 JSON 载荷」的权威视图，取自基线 schema
+// 目录里 Type == schema.TJSON 的列。
+//
+// 为什么只能问 schema、不能问 driver，也不能看文本：TJSON 在 DDL 渲染层落成的物理
+// 类型就是 MEDIUMTEXT（见 schema/generator.go 的 renderColumnFor 与 rejectsColumnDefault），
+// 所以 go-sql-driver 报回来的 DatabaseTypeName 与 evidence/summary 这些普通 TEXT
+// 完全一样；而"看起来像 JSON 的正文"更是会把一段本就是 JSON 的普通证据文本改掉类型。
+// 声明（catalog）是唯一还留着"这列是 JSON 载荷"这一信息的地方。
+var jsonPayloadColumns = buildJSONPayloadColumns()
+
+func buildJSONPayloadColumns() map[string]map[string]bool {
+	out := make(map[string]map[string]bool, 64)
+	for _, table := range schema.AllTables() {
+		var set map[string]bool
+		for _, column := range table.Columns {
+			if column.Type == schema.TJSON {
+				if set == nil {
+					set = map[string]bool{}
+				}
+				set[column.Name] = true
+			}
+		}
+		if set != nil {
+			out[table.Name] = set
+		}
+	}
+	return out
+}
+
+// jsonPayloadColumn reports whether a column is declared as a JSON payload (TJSON)
+// on that table in the baseline catalog. Unknown table/column → false（普通文本口径，
+// 最多少解一层结构，绝不会把文本改成对象）。
+func jsonPayloadColumn(table, column string) bool {
+	return jsonPayloadColumns[table][column]
+}
+
+// snapshotValue 归一 driver 返回值：只有 schema 声明为 JSON 载荷（TJSON）的列才解回
+// 结构（否则快照里会多一层转义字符串），其余文本一律按原样字符串进 JSON。
+//
+// 解析 JSON 载荷必须走 Decoder.UseNumber()：默认的 interface{} 解码把所有 JSON 数字
+// 都过一遍 float64，再 Marshal 出来，资产 id 这类 > 2^53 的 64 位整数会被静默舍入
+// （9007199254740993 → 9007199254740992）。json.Number 是原样文本，Marshal 时按字面
+// 量落回，精度不丢。
+func snapshotValue(value any, jsonPayload bool) any {
+	raw, ok := value.([]byte)
 	if !ok {
 		return value
 	}
-	var doc any
-	if err := json.Unmarshal(typed, &doc); err == nil {
-		switch doc.(type) {
-		case map[string]any, []any:
-			return doc
-		}
+	if !jsonPayload {
+		// 普通 TEXT/BLOB 列：哪怕正文恰好是一整篇 JSON，也保持字符串文本
+		// （PG 的 to_jsonb(row) 同样保留它的字符串类型，不会按内容改判）。
+		return string(raw)
 	}
-	return string(typed)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var doc any
+	if err := decoder.Decode(&doc); err != nil {
+		return string(raw) // 脏数据兜底：解不出来就原样带出，不吞值也不改型
+	}
+	switch doc.(type) {
+	case map[string]any, []any:
+		return doc
+	}
+	return string(raw)
 }
 
 // CreateFindingRetest atomically snapshots the source, creates its conversation
@@ -226,8 +281,12 @@ FROM findings f WHERE f.id = ? FOR UPDATE`, findingID).Scan(&title)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	retestRes, err := tx.ExecContext(ctx, `INSERT INTO finding_retests(finding_id,conversation_id,notes,snapshot) VALUES (?, ?, ?, ?)`,
-		findingID, c.ID, strings.TrimSpace(notes), string(snapshot))
+	// 每一条 finding_retests 的 MEDIUMTEXT NOT NULL 列都要显式给值：TiDB 8.5 严格
+	// 模式禁止 TEXT/JSON 列声明 DEFAULT（schema.TextN/JSONNN 的声明期默认值不进
+	// DDL），省略列名等于让 INSERT 直接报 1364。status 从 'pending' 起步，
+	// verdict/summary/evidence/error 以空串占位，由 Start/Record/Finish 三段推进。
+	retestRes, err := tx.ExecContext(ctx, `INSERT INTO finding_retests(finding_id,conversation_id,status,notes,verdict,summary,evidence,error,snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		findingID, c.ID, "pending", strings.TrimSpace(notes), "", "", "", "", string(snapshot))
 	if err != nil {
 		return nil, nil, false, err
 	}

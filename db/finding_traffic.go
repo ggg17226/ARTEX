@@ -441,8 +441,11 @@ VALUES(?, 'finding', ?, 9, 'confirmed', ?)`, in.ExplorationID, string(payload), 
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	findingRes, err := tx.Exec(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF(?, 0),?, ?, ?, ?, ?, ?, ?, ?)`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw))
+	// status / report 与 AddFinding 同口径：MEDIUMTEXT NOT NULL 在 TiDB 严格模式
+	// 下没有 DEFAULT 可用（声明期默认值不进 DDL），省略列名只会让整条 INSERT 报
+	// 1364，应用层默认值必须写进语句里。
+	findingRes, err := tx.Exec(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,status,report)
+VALUES(NULLIF(?, 0),?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), FindingPending, "")
 	if err != nil {
 		return nil, err
 	}
