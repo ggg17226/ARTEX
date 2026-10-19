@@ -76,6 +76,25 @@ func ValidSeverity(s string) bool {
 	return false
 }
 
+// questionPlaceholders 生成 n 个 `?` 占位符并以 ", " 连接（TiDB 没有 PG 的 $n
+// 下标占位符）：任何长度随输入变化的 IN (…) / JSON 谓词列表都必须从这里拼，
+// 值本身始终走绑定参数，绝不做字符串内插。
+func questionPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
+}
+
+// jsonLiteral 把值编成 JSON 文档字面量，供 `CAST(? AS JSON)` 写入 JSON 列。
+func jsonLiteral(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(raw)
+}
+
 // AddFinding inserts a finding into the standalone findings table. taskID and
 // nodeID may be 0 (stored as NULL). name may be "" (frontend falls back to
 // vulnclass). Returns the new finding id.
@@ -91,13 +110,21 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if nodeID > 0 {
 		nid = &nodeID
 	}
-	var id int64
-	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
-	).Scan(&id)
-	return id, err
+	// TiDB 没有 INSERT … RETURNING：自增主键一律经 LastInsertId() 取回。
+	res, err := d.Exec(`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON))
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("AddFinding: LastInsertId after INSERT: %w", err)
+	}
+	if id < 1 {
+		return 0, fmt.Errorf("AddFinding: auto-increment id %d out of range", id)
+	}
+	return id, nil
 }
 
 // findingSelectCols is the column list (with task_description join) every finding
@@ -138,7 +165,7 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
 		ORDER BY f.created_at DESC
-		LIMIT $1`, limit)
+		LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +209,7 @@ func (f FindingFilter) where() (string, []any) {
 			return
 		}
 		args = append(args, val)
-		conds = append(conds, fmt.Sprintf("f.%s = $%d", col, len(args)))
+		conds = append(conds, "f."+col+" = ?")
 	}
 	add("severity", f.Severity)
 	add("status", f.Status)
@@ -192,9 +219,11 @@ func (f FindingFilter) where() (string, []any) {
 		conds = append(conds, "(f.task_id IS NULL OR t.id IS NULL)")
 	} else if tid, err := strconv.ParseInt(f.TaskID, 10, 64); err == nil && tid > 0 {
 		args = append(args, tid)
-		conds = append(conds, fmt.Sprintf("f.task_id = $%d", len(args)))
+		conds = append(conds, "f.task_id = ?")
 	}
-	// 资产筛选:asset_ids 是 jsonb 数组,@> ANY(...) 能走 idx_findings_asset_ids。
+	// 资产筛选:asset_ids 是 JSON 数组列。TiDB 没有 jsonb 的 @> 算子,改用
+	// JSON_CONTAINS(target, CAST(id AS JSON));它吃不到 GIN 索引,但资产树的 id
+	// 集合来自同一次构树(有界),逐个 OR 的开销可控。
 	switch {
 	case f.assetMiss:
 		conds = append(conds, "FALSE")
@@ -203,27 +232,36 @@ func (f FindingFilter) where() (string, []any) {
 		// (资产已被删除)。两类都进资产树的未关联桶,这里必须同样收下,否则桶上
 		// 的计数会大于点开后能查到的条数。
 		conds = append(conds, `(
-			jsonb_array_length(COALESCE(f.asset_ids, '[]'::jsonb)) = 0
+			COALESCE(JSON_LENGTH(f.asset_ids), 0) = 0
 			OR NOT EXISTS (
-				SELECT 1 FROM jsonb_array_elements_text(f.asset_ids) e(v)
-				JOIN assets a ON a.id = e.v::bigint
+				SELECT 1 FROM assets a
+				WHERE JSON_CONTAINS(f.asset_ids, CAST(a.id AS JSON))
 			)
 		)`)
 	case len(f.assetIDs) > 0:
-		args = append(args, assetIDContainments(f.assetIDs))
-		conds = append(conds, fmt.Sprintf("f.asset_ids @> ANY($%d::jsonb[])", len(args)))
+		ors := make([]string, 0, len(f.assetIDs))
+		for _, id := range f.assetIDs {
+			ors = append(ors, `JSON_CONTAINS(COALESCE(f.asset_ids, '[]'), CAST(? AS JSON))`)
+			args = append(args, id)
+		}
+		conds = append(conds, "("+strings.Join(ors, " OR ")+")")
 	}
 	if query := strings.TrimSpace(f.Query); query != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
-		args = append(args, "%"+escaped+"%")
-		placeholder := fmt.Sprintf("$%d", len(args))
-		conds = append(conds, fmt.Sprintf(`(
-			COALESCE(f.name, '') ILIKE %s ESCAPE '\' OR
-			f.vulnclass ILIKE %s ESCAPE '\' OR
-			f.summary ILIKE %s ESCAPE '\' OR
-			f.evidence ILIKE %s ESCAPE '\' OR
-			COALESCE(f.report, '') ILIKE %s ESCAPE '\'
-		)`, placeholder, placeholder, placeholder, placeholder, placeholder))
+		// TiDB 的列默认排序规则是 *_ci(大小写不敏感),LIKE 即等价于 PG 的 ILIKE;
+		// ESCAPE 里的反斜杠在 MySQL 方言下必须写两枚。
+		like := `(
+			COALESCE(f.name, '') LIKE ? ESCAPE '\\' OR
+			f.vulnclass LIKE ? ESCAPE '\\' OR
+			f.summary LIKE ? ESCAPE '\\' OR
+			f.evidence LIKE ? ESCAPE '\\' OR
+			COALESCE(f.report, '') LIKE ? ESCAPE '\\'
+		)`
+		pattern := "%" + escaped + "%"
+		for range 5 {
+			args = append(args, pattern)
+		}
+		conds = append(conds, like)
 	}
 	if len(conds) == 0 {
 		return "", args
@@ -267,7 +305,7 @@ func (d *DB) ListFindingsPage(f FindingFilter, page, pageSize int) ([]*DBFinding
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id%s
 		ORDER BY %s
-		LIMIT $%d OFFSET $%d`, findingSelectCols, where, order, len(args)+1, len(args)+2)
+		LIMIT ? OFFSET ?`, findingSelectCols, where, order)
 	rows, err := d.Query(q, pageArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -324,9 +362,10 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 		return []FindingGroup{}, groupTotal, findingTotal, nil
 	}
 
-	order := "MAX(f.created_at) DESC, t.id DESC NULLS LAST"
+	// MySQL/TiDB 把 NULL 排在最小端:DESC 时天然落在最后,正是 PG NULLS LAST 的语义。
+	order := "MAX(f.created_at) DESC, t.id DESC"
 	if f.Sort == "severity" {
-		order = `MAX(CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) DESC, MAX(f.created_at) DESC, t.id DESC NULLS LAST`
+		order = `MAX(CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) DESC, MAX(f.created_at) DESC, t.id DESC`
 	}
 	pageArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 	query := fmt.Sprintf(`SELECT t.id, COALESCE(t.name,''), COALESCE(t.description,''), COALESCE(
@@ -337,12 +376,12 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 			ELSE t.status
 		END, ''),
 		COUNT(*),
-		COUNT(*) FILTER (WHERE f.severity='critical'),
-		COUNT(*) FILTER (WHERE f.severity='high'),
-		COUNT(*) FILTER (WHERE f.severity='medium'),
-		COUNT(*) FILTER (WHERE f.severity='low'),
+		COUNT(CASE WHEN f.severity='critical' THEN 1 END),
+		COUNT(CASE WHEN f.severity='high' THEN 1 END),
+		COUNT(CASE WHEN f.severity='medium' THEN 1 END),
+		COUNT(CASE WHEN f.severity='low' THEN 1 END),
 		MAX(f.created_at)%s
-		ORDER BY %s LIMIT $%d OFFSET $%d`, grouped, order, len(args)+1, len(args)+2)
+		ORDER BY %s LIMIT ? OFFSET ?`, grouped, order)
 	rows, err := d.Query(query, pageArgs...)
 	if err != nil {
 		return nil, 0, 0, err
@@ -381,22 +420,43 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	}
 	defer tx.Rollback()
 
-	var liveNodeID int64
-	err = tx.QueryRow(`SELECT n.id
-		FROM findings f
-		JOIN tasks t ON t.id=f.task_id
-		JOIN exploration_nodes n ON n.id=f.node_id AND n.exploration_id=t.exploration_id
-		WHERE f.id=$1 AND f.node_id=$2 AND t.exploration_id=$3 AND n.kind='finding'
-		FOR SHARE OF f, t, n`, findingID, findingNodeID, s.expID).Scan(&liveNodeID)
-	if err == sql.ErrNoRows {
-		return 0, Activity{}, ErrFindingOriginUnavailable
-	}
-	if err != nil {
+	// TiDB 的 SELECT … FOR UPDATE 只吃单表点/范围读（PG 的 JOIN + FOR SHARE OF
+	// 不被支持），因此按 findings → tasks → exploration_nodes 的固定表序逐行加锁，
+	// 校验条件与原 JOIN 完全一致：同一探索、节点确属该漏洞、kind='finding'。
+	var linkedNodeID, linkedTaskID sql.NullInt64
+	if err := tx.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ? FOR UPDATE`, findingID).Scan(&linkedNodeID, &linkedTaskID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, Activity{}, ErrFindingOriginUnavailable
+		}
 		return 0, Activity{}, err
 	}
+	if !linkedNodeID.Valid || !linkedTaskID.Valid || linkedNodeID.Int64 != findingNodeID {
+		return 0, Activity{}, ErrFindingOriginUnavailable
+	}
+	var taskExplorationID int64
+	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id = ? FOR UPDATE`, linkedTaskID.Int64).Scan(&taskExplorationID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, Activity{}, ErrFindingOriginUnavailable
+		}
+		return 0, Activity{}, err
+	}
+	if taskExplorationID != s.expID {
+		return 0, Activity{}, ErrFindingOriginUnavailable
+	}
+	var nodeKind string
+	if err := tx.QueryRow(`SELECT kind FROM exploration_nodes WHERE id = ? FOR UPDATE`, findingNodeID).Scan(&nodeKind); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, Activity{}, ErrFindingOriginUnavailable
+		}
+		return 0, Activity{}, err
+	}
+	if nodeKind != KindFinding {
+		return 0, Activity{}, ErrFindingOriginUnavailable
+	}
+	liveNodeID := findingNodeID
 
 	anchors := []int64{}
-	anchorRows, err := tx.Query(`SELECT asset_id FROM exploration_anchors WHERE node_id=$1 ORDER BY asset_id`, liveNodeID)
+	anchorRows, err := tx.Query(`SELECT asset_id FROM exploration_anchors WHERE node_id = ? ORDER BY asset_id`, liveNodeID)
 	if err != nil {
 		return 0, Activity{}, err
 	}
@@ -428,18 +488,28 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	if err != nil {
 		return 0, Activity{}, err
 	}
-	var intentID int64
-	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
-		VALUES ($1,'intent',$2,10,'open','human') RETURNING id`, s.expID, raw).Scan(&intentID); err != nil {
+	// 自增主键经 LastInsertId 取回（TiDB 没有 RETURNING）。
+	nodeRes, err := tx.Exec(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
+		VALUES (?, 'intent', ?, 10, 'open', 'human')`, s.expID, string(raw))
+	if err != nil {
 		return 0, Activity{}, err
 	}
-	if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id)
-		SELECT $1, asset_id FROM exploration_anchors WHERE node_id=$2
-		ON CONFLICT DO NOTHING`, intentID, liveNodeID); err != nil {
+	intentID, err := nodeRes.LastInsertId()
+	if err != nil {
+		return 0, Activity{}, fmt.Errorf("exploration_nodes: LastInsertId after INSERT: %w", err)
+	}
+	if intentID < 1 {
+		return 0, Activity{}, fmt.Errorf("exploration_nodes: auto-increment id %d out of range", intentID)
+	}
+	// 锚点唯一键 uq_exploration_anchors(node_id,asset_id)：从来源节点复制锚点时重复
+	// 是常态，PG 的 ON CONFLICT DO NOTHING 在这里对应 INSERT IGNORE（被静默的只有
+	// 这一条唯一键，其余列都是 NOT NULL，真正的写入错误照样抛出）。
+	if _, err := tx.Exec(`INSERT IGNORE INTO exploration_anchors(node_id,asset_id)
+		SELECT ?, asset_id FROM exploration_anchors WHERE node_id = ?`, intentID, liveNodeID); err != nil {
 		return 0, Activity{}, err
 	}
 	if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
-		VALUES ($1,$2,$3,$4)`, s.expID, liveNodeID, RelDerivedFrom, intentID); err != nil {
+		VALUES (?, ?, ?, ?)`, s.expID, liveNodeID, RelDerivedFrom, intentID); err != nil {
 		return 0, Activity{}, err
 	}
 
@@ -453,12 +523,24 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
-	if err := tx.QueryRow(`
+	// TiDB 没有 RETURNING：自增 id 走 LastInsertId，created_at 由列的
+	// CURRENT_TIMESTAMP(3) 默认值盖章后再按主键回读，Go 端绝不自造时间戳。
+	activityRes, err := tx.Exec(`
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
-VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14)
-RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8Clean(audit.Kind), utf8Clean(audit.Tool), utf8Clean(audit.ToolUseID), audit.IsError,
-		utf8Clean(audit.Summary), utf8Clean(audit.Detail), metadata, audit.InputTokens, audit.OutputTokens, audit.CacheReadTokens, audit.CacheWriteTokens).
-		Scan(&audit.ID, &audit.CreatedAt); err != nil {
+VALUES (?,?,NULLIF(?, ''),NULLIF(?, ''),NULLIF(?, ''),NULLIF(?, ''),?,NULLIF(?, ''),NULLIF(?, ''),?,?,?,?,?)`,
+		s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8Clean(audit.Kind), utf8Clean(audit.Tool), utf8Clean(audit.ToolUseID), audit.IsError,
+		utf8Clean(audit.Summary), utf8Clean(audit.Detail), metadata, audit.InputTokens, audit.OutputTokens, audit.CacheReadTokens, audit.CacheWriteTokens)
+	if err != nil {
+		return 0, Activity{}, err
+	}
+	audit.ID, err = activityRes.LastInsertId()
+	if err != nil {
+		return 0, Activity{}, fmt.Errorf("activity: LastInsertId after INSERT: %w", err)
+	}
+	if audit.ID < 1 {
+		return 0, Activity{}, fmt.Errorf("activity: auto-increment id %d out of range", audit.ID)
+	}
+	if err := tx.QueryRow(`SELECT created_at FROM activity WHERE id = ?`, audit.ID).Scan(&audit.CreatedAt); err != nil {
 		return 0, Activity{}, err
 	}
 	audit.Metadata = metadata
@@ -479,15 +561,13 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 	var q string
 	var args []any
 	if len(ids) > 0 {
-		ph := make([]string, len(ids))
-		for i, id := range ids {
-			ph[i] = fmt.Sprintf("$%d", i+1)
+		for _, id := range ids {
 			args = append(args, id)
 		}
 		q = `SELECT ` + cols + `
 			FROM findings f
 			LEFT JOIN tasks t ON f.task_id = t.id
-			WHERE f.id IN (` + strings.Join(ph, ",") + `)
+			WHERE f.id IN (` + questionPlaceholders(len(ids)) + `)
 			` + order
 	} else {
 		scoped, err := d.applyAssetScope(f)
@@ -559,13 +639,16 @@ type FindingTaskOption struct {
 // set of distinct vuln classes.
 func (d *DB) FindingStats() (*FindingStats, error) {
 	st := &FindingStats{VulnClasses: []string{}, Tasks: []FindingTaskOption{}}
+	// 分桶必须是 COUNT(CASE WHEN … THEN 1 END):TiDB 没有 PG 的聚合 FILTER 子句,
+	// 而 SUM/COUNT 的 CASE 形状在无匹配行(含整张表为空)时恒为数值 0,不会像
+	// 裸聚合那样把 NULL 灌进 Scan。
 	err := d.QueryRow(`SELECT
 		COUNT(*),
-		COUNT(*) FILTER (WHERE status = 'pending'),
-		COUNT(*) FILTER (WHERE severity = 'critical'),
-		COUNT(*) FILTER (WHERE severity = 'high'),
-		COUNT(*) FILTER (WHERE severity = 'medium'),
-		COUNT(*) FILTER (WHERE severity = 'low')
+		COUNT(CASE WHEN status = 'pending' THEN 1 END),
+		COUNT(CASE WHEN severity = 'critical' THEN 1 END),
+		COUNT(CASE WHEN severity = 'high' THEN 1 END),
+		COUNT(CASE WHEN severity = 'medium' THEN 1 END),
+		COUNT(CASE WHEN severity = 'low' THEN 1 END)
 		FROM findings`).Scan(&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low)
 	if err != nil {
 		return nil, err
@@ -646,7 +729,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
-		WHERE f.id = $1`, id).Scan(
+		WHERE f.id = ?`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
 		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
@@ -662,9 +745,17 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 
 // DeleteFinding removes a finding entirely: the standalone findings row and its
 // originating exploration node (kind='finding'), so it disappears from the findings
-// list, the per-task 发现 Tab, and the exploration graph alike. Deleting the node
-// cascades its edges + node_assets and nulls any activity referencing it. Returns
-// rows affected (0 = no finding with that id).
+// list, the per-task 发现 Tab, and the exploration graph alike.
+//
+// 新库没有外键，级联全部要靠这里显式做（同一个证据事务内、按锁序 findings →
+// finding_traffic_bindings → finding_retests → exploration_*）：
+//   - finding_traffic_bindings 整行删除（finding_id 是 NOT NULL 列，没有置空这条路），
+//     快照文件由证据存储的 GC 负责；
+//   - 尚未收尾的复测封成终态：active_finding_id 是 IF(status IN ('pending','running'),
+//     finding_id, NULL) 的生成列，漏封会让前端永久显示「复测中」，并让后续复测被去重吞掉；
+//   - 节点的边与锚点显式删除、activity 的 node_id 置空（保留活动流水）。
+//
+// Returns rows affected (0 = no finding with that id)。
 func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	err = d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
 		if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
@@ -674,11 +765,28 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 			return err
 		}
 		var nodeID sql.NullInt64
-		if err := tx.QueryRow(`DELETE FROM findings WHERE id=$1 RETURNING node_id`, id).Scan(&nodeID); err != nil {
+		if err := tx.QueryRow(`SELECT node_id FROM findings WHERE id = ?`, id).Scan(&nodeID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM finding_traffic_bindings WHERE finding_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE finding_retests
+			SET status='stopped', error='漏洞已删除，复测随之终止', finished_at=CURRENT_TIMESTAMP(3)
+			WHERE finding_id = ? AND status IN ('pending','running')`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM findings WHERE id = ?`, id); err != nil {
 			return err
 		}
 		if nodeID.Valid {
-			if _, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding'`, nodeID.Int64); err != nil {
+			if err := detachExplorationNodeTx(tx, nodeID.Int64); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id = ? AND kind='finding'`, nodeID.Int64); err != nil {
 				return err
 			}
 		}
@@ -688,28 +796,66 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	return
 }
 
+// detachExplorationNodeTx 摘掉一个节点的全部弱关联：边（任一端）、资产锚点，并把
+// 引用它的 activity.node_id 置空。没有外键级联，删除节点前必须先走这一步，否则
+// 库里会留下指向已消失节点的悬挂边与活动。
+func detachExplorationNodeTx(tx *sql.Tx, nodeID int64) error {
+	if _, err := tx.Exec(`DELETE FROM exploration_edges WHERE src_id = ? OR dst_id = ?`, nodeID, nodeID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM exploration_anchors WHERE node_id = ?`, nodeID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`UPDATE activity SET node_id = NULL WHERE node_id = ?`, nodeID)
+	return err
+}
+
 // DeleteFindingsByTask removes all findings rows of a task. The originating
 // exploration finding nodes are cascade-deleted separately when the task's
 // exploration subgraph is dropped. Returns rows deleted.
+//
+// 与 DeleteFinding 同一口径：没有外键级联，证据绑定与未收尾的复测必须在删
+// findings 行之前先解除，否则会留下指向已删漏洞的绑定与永久「复测中」的记录。
 func (d *DB) DeleteFindingsByTask(taskID int64) (int64, error) {
-	res, err := d.Exec(`DELETE FROM findings WHERE task_id=$1`, taskID)
+	if _, err := d.Exec(`DELETE FROM finding_traffic_bindings
+		WHERE finding_id IN (SELECT id FROM findings WHERE task_id = ?)`, taskID); err != nil {
+		return 0, err
+	}
+	if _, err := d.Exec(`UPDATE finding_retests
+		SET status='stopped', error='漏洞已删除，复测随之终止', finished_at=CURRENT_TIMESTAMP(3)
+		WHERE status IN ('pending','running')
+		  AND finding_id IN (SELECT id FROM findings WHERE task_id = ?)`, taskID); err != nil {
+		return 0, err
+	}
+	res, err := d.Exec(`DELETE FROM findings WHERE task_id = ?`, taskID)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// SetFindingStatus updates one finding's triage state. Returns rows affected.
+// SetFindingStatus updates one finding's triage state. Returns 1 when the finding
+// exists and 0 when it does not.
 //
 // 底层 setter：只改状态、不登记推送事件。生产代码改状态请走
 // SetFindingStatusWithNotify —— 直接调本函数会让「状态变更推送」静默失效。
 // 保留它是为了让不关心通知的用例（参数校验、复测流程）能单独驱动状态。
+//
+// 存在性判定不能拿 RowsAffected：MySQL/TiDB 只把「值真的变了」的行计入 affected，
+// 把一个已经是 fixed 的漏洞再设成 fixed 会返回 0，上层会误读成「漏洞不存在」。
+// 因此写入后按主键回查一次（同库同表，无跨表锁序问题）。
 func (d *DB) SetFindingStatus(id int64, status string) (int64, error) {
-	res, err := d.Exec(`UPDATE findings SET status=$1 WHERE id=$2`, status, id)
-	if err != nil {
+	if _, err := d.Exec(`UPDATE findings SET status = ? WHERE id = ?`, status, id); err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	var found int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM findings WHERE id = ?`, id).Scan(&found); err != nil {
+		return 0, err
+	}
+	if found == 0 {
+		return 0, nil
+	}
+	return 1, nil
 }
 
 // SetFindingReportByNodeID sets the Markdown report on the standalone finding row
@@ -722,22 +868,29 @@ func (d *DB) SetFindingReportByNodeID(nodeID int64, report string) (int64, error
 // setFindingCol updates one text column on the standalone finding row AND mirrors
 // the new value into the originating exploration node's payload under jsonKey, so the
 // per-task 发现 Tab (which reads the node payload, not this table) stays in sync.
-// Returns rows affected (0 when no finding has that id); the node sync is best-effort.
-// col and jsonKey MUST be trusted constants (they are interpolated into SQL) — never
-// pass user input.
+// Returns 1 when a finding with that id exists (0 when it does not); the node sync
+// is best-effort. col and jsonKey MUST be trusted constants (they are interpolated
+// into SQL) — never pass user input.
+//
+// PG 用 `UPDATE … RETURNING node_id` 一次拿回归属节点；TiDB 没有 RETURNING，改成
+// 「先写、后按主键回读」，顺带把「值未变更 → RowsAffected=0」的陷阱彻底绕开。
+// 节点侧的 jsonb_set 对应 JSON_SET，写入值必须是 JSON 文档字面量（字符串要带引号）。
 func (d *DB) setFindingCol(id int64, col, jsonKey, val string) (int64, error) {
-	var nodeID *int64
-	err := d.QueryRow(`UPDATE findings SET `+col+`=$1 WHERE id=$2 RETURNING node_id`, val, id).Scan(&nodeID)
+	if _, err := d.Exec(`UPDATE findings SET `+col+` = ? WHERE id = ?`, val, id); err != nil {
+		return 0, err
+	}
+	var nodeID sql.NullInt64
+	err := d.QueryRow(`SELECT node_id FROM findings WHERE id = ?`, id).Scan(&nodeID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	if nodeID != nil {
+	if nodeID.Valid {
 		_, _ = d.Exec(`UPDATE exploration_nodes
-			SET payload = jsonb_set(payload, '{`+jsonKey+`}', to_jsonb($1::text))
-			WHERE id = $2`, val, *nodeID)
+			SET payload = JSON_SET(COALESCE(payload, '{}'), '$.`+jsonKey+`', CAST(? AS JSON))
+			WHERE id = ?`, jsonLiteral(val), nodeID.Int64)
 	}
 	return 1, nil
 }
@@ -785,7 +938,7 @@ func (d *DB) FindingMetaByNodeID(taskID int64) (map[int64]FindingMeta, error) {
 		return out, nil
 	}
 	rows, err := d.Query(`SELECT node_id, id, COALESCE(status,'pending'), asset_ids, (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=findings.id) FROM findings
-		WHERE task_id=$1 AND node_id IS NOT NULL`, taskID)
+		WHERE task_id=? AND node_id IS NOT NULL`, taskID)
 	if err != nil {
 		return out, err
 	}

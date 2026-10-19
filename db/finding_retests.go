@@ -76,6 +76,109 @@ func scanRetest(row interface{ Scan(...any) error }) (*FindingRetest, error) {
 	return r, err
 }
 
+// retestSnapshot 是复测上下文快照的形状：漏洞整行 + 关联资产行 + 任务约束行。
+//
+// 迁移前由 PG 的 jsonb_build_object / to_jsonb / jsonb_agg 在服务端一次拼出；
+// TiDB 没有这组函数，改为在 Go 端读三份行、用 encoding/json 组装，键名与历史
+// 归档里的快照逐字一致（finding / assets / constraints，空集恒为 []）。
+type retestSnapshot struct {
+	Finding     map[string]any   `json:"finding"`
+	Assets      []map[string]any `json:"assets"`
+	Constraints []map[string]any `json:"constraints"`
+}
+
+// buildRetestSnapshot 读出复测所需的全部上下文并编成 JSON 文档。
+func buildRetestSnapshot(ctx context.Context, tx *sql.Tx, findingID int64) ([]byte, error) {
+	finding, err := queryRowMap(ctx, tx, `SELECT f.* FROM findings f WHERE f.id = ?`, findingID)
+	if err != nil {
+		return nil, err
+	}
+	// 原条件 f.asset_ids @> to_jsonb(ARRAY[a.id]) 等价于「JSON 数组里含该资产 id」。
+	assets, err := queryRowMaps(ctx, tx, `SELECT a.* FROM assets a
+JOIN findings f ON f.id = ? AND JSON_CONTAINS(COALESCE(f.asset_ids, '[]'), CAST(a.id AS JSON))`, findingID)
+	if err != nil {
+		return nil, err
+	}
+	var taskID any
+	err = tx.QueryRowContext(ctx, `SELECT task_id FROM findings WHERE id = ?`, findingID).Scan(&taskID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	constraints := []map[string]any{}
+	if taskID != nil {
+		constraints, err = queryRowMaps(ctx, tx, `SELECT c.* FROM task_constraints c
+JOIN tasks t ON t.exploration_id = c.exploration_id WHERE t.id = ?`, taskID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if assets == nil {
+		assets = []map[string]any{}
+	}
+	raw, err := json.Marshal(retestSnapshot{Finding: finding, Assets: assets, Constraints: constraints})
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// queryRowMaps 把任意 SELECT 的每一行读成「列名 → 值」映射：快照要的是整行原样，
+// 不列列清单，schema 演进时不会漏列。
+func queryRowMaps(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]map[string]any, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, 8)
+	for rows.Next() {
+		raw := make([]any, len(columns))
+		targets := make([]any, len(columns))
+		for i := range raw {
+			targets[i] = &raw[i]
+		}
+		if err := rows.Scan(targets...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(columns))
+		for i, column := range columns {
+			row[column] = snapshotValue(raw[i])
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// queryRowMap 取首行；无行返回 nil（调用方按缺失处理）。
+func queryRowMap(ctx context.Context, tx *sql.Tx, query string, args ...any) (map[string]any, error) {
+	rows, err := queryRowMaps(ctx, tx, query, args...)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+// snapshotValue 归一 driver 返回值：[]byte 里是 JSON 对象/数组时解回结构（否则
+// 快照里会多一层转义字符串），其余文本按原样进 JSON。
+func snapshotValue(value any) any {
+	typed, ok := value.([]byte)
+	if !ok {
+		return value
+	}
+	var doc any
+	if err := json.Unmarshal(typed, &doc); err == nil {
+		switch doc.(type) {
+		case map[string]any, []any:
+			return doc
+		}
+	}
+	return string(typed)
+}
+
 // CreateFindingRetest atomically snapshots the source, creates its conversation
 // and persists the first message. A finding row lock deduplicates simultaneous
 // clicks across clients; an existing active run is returned without dispatching.
@@ -85,17 +188,14 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 		return nil, nil, false, err
 	}
 	defer tx.Rollback()
+	// 锁住来源漏洞：单表点查加锁（TiDB 没有 PG 的 FOR UPDATE OF 行锁定子句）。
 	var title string
-	var snapshot []byte
-	err = tx.QueryRowContext(ctx, `SELECT COALESCE(NULLIF(f.name,''), NULLIF(f.vulnclass,''), '未分类'),
-	jsonb_build_object('finding', to_jsonb(f),
-	 'assets', COALESCE((SELECT jsonb_agg(to_jsonb(a)) FROM assets a WHERE f.asset_ids @> to_jsonb(ARRAY[a.id])), '[]'::jsonb),
-	 'constraints', COALESCE((SELECT jsonb_agg(to_jsonb(c)) FROM task_constraints c JOIN tasks t ON t.exploration_id=c.exploration_id WHERE t.id=f.task_id), '[]'::jsonb))
-	FROM findings f WHERE f.id=$1 FOR UPDATE OF f`, findingID).Scan(&title, &snapshot)
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(NULLIF(f.name,''), NULLIF(f.vulnclass,''), '未分类')
+FROM findings f WHERE f.id = ? FOR UPDATE`, findingID).Scan(&title)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	r, err := scanRetest(tx.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE finding_id=$1 AND status IN ('pending','running')`, findingID))
+	r, err := scanRetest(tx.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE finding_id = ? AND status IN ('pending','running')`, findingID))
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -106,18 +206,44 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 	if runes := []rune(title); len(runes) > 100 {
 		title = string(runes[:100])
 	}
-	c, err := scanConv(tx.QueryRowContext(ctx, `INSERT INTO conversations(agent_key,title) VALUES ($1,$2) RETURNING `+convCols,
-		FindingRetestAgentKey, fmt.Sprintf("复测 #%d · %s", findingID, title)))
+	snapshot, err := buildRetestSnapshot(ctx, tx, findingID)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	r, err = scanRetest(tx.QueryRowContext(ctx, `INSERT INTO finding_retests(finding_id,conversation_id,notes,snapshot) VALUES ($1,$2,$3,$4) RETURNING `+retestCols,
-		findingID, c.ID, strings.TrimSpace(notes), snapshot))
+	convRes, err := tx.ExecContext(ctx, `INSERT INTO conversations(agent_key,title) VALUES (?, ?)`,
+		FindingRetestAgentKey, fmt.Sprintf("复测 #%d · %s", findingID, title))
+	if err != nil {
+		return nil, nil, false, err
+	}
+	convID, err := convRes.LastInsertId()
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("conversations: LastInsertId after INSERT: %w", err)
+	}
+	if convID < 1 {
+		return nil, nil, false, fmt.Errorf("conversations: auto-increment id %d out of range", convID)
+	}
+	c, err := scanConv(tx.QueryRowContext(ctx, `SELECT `+convCols+` FROM conversations WHERE id = ?`, convID))
+	if err != nil {
+		return nil, nil, false, err
+	}
+	retestRes, err := tx.ExecContext(ctx, `INSERT INTO finding_retests(finding_id,conversation_id,notes,snapshot) VALUES (?, ?, ?, ?)`,
+		findingID, c.ID, strings.TrimSpace(notes), string(snapshot))
+	if err != nil {
+		return nil, nil, false, err
+	}
+	retestID, err := retestRes.LastInsertId()
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("finding_retests: LastInsertId after INSERT: %w", err)
+	}
+	if retestID < 1 {
+		return nil, nil, false, fmt.Errorf("finding_retests: auto-increment id %d out of range", retestID)
+	}
+	r, err = scanRetest(tx.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE id = ?`, retestID))
 	if err != nil {
 		return nil, nil, false, err
 	}
 	msg := r.InitialMessage()
-	_, err = tx.ExecContext(ctx, `INSERT INTO conversation_activities(conversation_id,worker,kind,summary,detail) VALUES ($1,$2,'user',$3,$4)`,
+	_, err = tx.ExecContext(ctx, `INSERT INTO conversation_activities(conversation_id,worker,kind,summary,detail) VALUES (?, ?, 'user', ?, ?)`,
 		c.ID, FindingRetestAgentKey, fmt.Sprintf("请复测漏洞 #%d", findingID), msg)
 	if err != nil {
 		return nil, nil, false, err
@@ -137,7 +263,7 @@ func (r *FindingRetest) InitialMessage() string {
 }
 
 func (d *DB) ListFindingRetests(findingID int64) ([]*FindingRetest, error) {
-	rows, err := d.Query(`SELECT `+retestCols+` FROM finding_retests WHERE finding_id=$1 ORDER BY id DESC`, findingID)
+	rows, err := d.Query(`SELECT `+retestCols+` FROM finding_retests WHERE finding_id = ? ORDER BY id DESC`, findingID)
 	if err != nil {
 		return nil, err
 	}
@@ -154,11 +280,11 @@ func (d *DB) ListFindingRetests(findingID int64) ([]*FindingRetest, error) {
 }
 
 func (d *DB) FindingRetestForConversation(ctx context.Context, conversationID int64) (*FindingRetest, error) {
-	r, err := scanRetest(d.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE conversation_id=$1`, conversationID))
+	r, err := scanRetest(d.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE conversation_id = ?`, conversationID))
 	if err != nil || r == nil {
 		return r, err
 	}
-	err = d.QueryRowContext(ctx, `SELECT snapshot FROM finding_retests WHERE id=$1`, r.ID).Scan(&r.Snapshot)
+	err = d.QueryRowContext(ctx, `SELECT snapshot FROM finding_retests WHERE id = ?`, r.ID).Scan(&r.Snapshot)
 	return r, err
 }
 
@@ -169,13 +295,15 @@ func (d *DB) FindingRetestForConversation(ctx context.Context, conversationID in
 // every later 发起复测 is deduped against a run that is not happening, with only
 // a process restart (RecoverFindingRetests) able to clear it.
 func (d *DB) FailPendingRetestForConversation(conversationID int64, reason string) error {
-	_, err := d.Exec(`UPDATE finding_retests SET status='failed', error=$2, finished_at=now()
-		WHERE conversation_id=$1 AND status IN ('pending','running')`, conversationID, reason)
+	_, err := d.Exec(`UPDATE finding_retests SET status='failed', error=?, finished_at=CURRENT_TIMESTAMP(3)
+		WHERE conversation_id = ? AND status IN ('pending','running')`, reason, conversationID)
 	return err
 }
 
 func (d *DB) StartFindingRetest(ctx context.Context, id int64) (bool, error) {
-	res, err := d.ExecContext(ctx, `UPDATE finding_retests SET status='running', started_at=now() WHERE id=$1 AND status='pending'`, id)
+	// pending → running 一定改变列值，这里的 RowsAffected 可信（不存在"值未变更
+	// 返回 0 行"的歧义），n==1 即抢占成功。
+	res, err := d.ExecContext(ctx, `UPDATE finding_retests SET status='running', started_at=CURRENT_TIMESTAMP(3) WHERE id = ? AND status='pending'`, id)
 	if err != nil {
 		return false, err
 	}
@@ -196,17 +324,37 @@ func (d *DB) RecordFindingRetestResult(ctx context.Context, conversationID int64
 	if len(summary) > 16000 || len(evidence) > 128000 {
 		return errors.New("复测结论过长（summary ≤ 16KB，evidence ≤ 128KB）")
 	}
-	res, err := d.ExecContext(ctx, `UPDATE finding_retests SET verdict=$2,summary=$3,evidence=$4
-	WHERE conversation_id=$1 AND status='running' AND (verdict='' OR (verdict=$2 AND summary=$3 AND evidence=$4))`, conversationID, verdict, summary, evidence)
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, err := res.RowsAffected(); err != nil {
-		return err
-	} else if n == 0 {
+	defer tx.Rollback()
+
+	// 先锁后回查，绝不拿 RowsAffected 当存在性判据（M29）：MySQL/TiDB 的 affected
+	// 只统计「值真的变了」的行，把同一条结论重复提交一遍会命中 0 行，原实现据此
+	// 抛 ErrRetestNotRunning，Agent 的幂等重试被误判成「复测已结束」。
+	var retestID int64
+	var current, currentSummary, currentEvidence string
+	err = tx.QueryRowContext(ctx, `SELECT id, verdict, summary, evidence FROM finding_retests
+WHERE conversation_id = ? AND status = 'running' FOR UPDATE`, conversationID).Scan(&retestID, &current, &currentSummary, &currentEvidence)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrRetestNotRunning
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if current != "" {
+		// 已有结论：逐字相同才是安全重放（幂等成功），换了文案/判词都算二次改判。
+		if current == verdict && currentSummary == summary && currentEvidence == evidence {
+			return tx.Commit()
+		}
+		return ErrRetestNotRunning
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE finding_retests SET verdict = ?, summary = ?, evidence = ? WHERE id = ?`,
+		verdict, summary, evidence, retestID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // FinishFindingRetest seals the result. Cancellation/failure takes precedence
@@ -222,23 +370,45 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 	}
 	defer tx.Rollback()
 	// Lock the finding before the retest, matching creation and cascading deletion.
+	// TiDB 的 SELECT … FOR UPDATE 只吃单表点查，PG 的 `WHERE id=(SELECT …) FOR UPDATE OF f`
+	// 拆成「普通读定位 → 主键加锁」两步，锁序仍是 findings → finding_retests。
+	var linkedFinding sql.NullInt64
+	if err := tx.QueryRow(`SELECT finding_id FROM finding_retests WHERE id = ?`, id).Scan(&linkedFinding); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // Retest already deleted.
+		}
+		return err
+	}
+	if !linkedFinding.Valid {
+		return nil
+	}
 	var findingID int64
-	err = tx.QueryRow(`SELECT f.id FROM findings f WHERE f.id=(SELECT finding_id FROM finding_retests WHERE id=$1) FOR UPDATE OF f`, id).Scan(&findingID)
+	if err := tx.QueryRow(`SELECT id FROM findings WHERE id = ? FOR UPDATE`, linkedFinding.Int64).Scan(&findingID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // Finding already deleted.
+		}
+		return err
+	}
+
+	// UPDATE … RETURNING 不存在：先锁住这条复测，回查它当前是否还在收尾窗口内，
+	// 再由 Go 端算出终态并写入。回查（而不是 affected 行数）才是判定依据。
+	var currentStatus, verdict string
+	err = tx.QueryRow(`SELECT status, verdict FROM finding_retests WHERE id = ? FOR UPDATE`, id).Scan(&currentStatus, &verdict)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil // Finding/retest already deleted.
+		return nil // Retest already deleted.
 	}
 	if err != nil {
 		return err
 	}
-	var finalStatus, verdict string
-	err = tx.QueryRow(`UPDATE finding_retests SET
-	status=CASE WHEN $2='completed' AND verdict='' THEN 'failed' ELSE $2 END,
-	error=CASE WHEN $2='completed' AND verdict='' THEN 'Agent 未保存复测结论，请查看会话后重新复测' ELSE $3 END,
-	finished_at=now() WHERE id=$1 AND status IN ('pending','running') RETURNING status,verdict`, id, status, reason).Scan(&finalStatus, &verdict)
-	if errors.Is(err, sql.ErrNoRows) {
+	if currentStatus != "pending" && currentStatus != "running" {
 		return nil // A replay must not overwrite a later manual triage decision.
 	}
-	if err != nil {
+	finalStatus, finalError := status, reason
+	if status == "completed" && verdict == "" {
+		finalStatus, finalError = "failed", "Agent 未保存复测结论，请查看会话后重新复测"
+	}
+	if _, err := tx.Exec(`UPDATE finding_retests SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
+		finalStatus, finalError, id); err != nil {
 		return err
 	}
 	if finalStatus == "completed" && verdict == "fixed" {
@@ -259,6 +429,6 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 }
 
 func (d *DB) RecoverFindingRetests() error {
-	_, err := d.Exec(`UPDATE finding_retests SET status='stopped', error='服务重启，复测已中断，请重新发起', finished_at=now() WHERE status IN ('pending','running')`)
+	_, err := d.Exec(`UPDATE finding_retests SET status='stopped', error='服务重启，复测已中断，请重新发起', finished_at=CURRENT_TIMESTAMP(3) WHERE status IN ('pending','running')`)
 	return err
 }

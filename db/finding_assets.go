@@ -143,8 +143,10 @@ func (d *DB) buildFindingAssetTree(f FindingFilter, maxNodes int) (*FindingAsset
 	f.assetIDs, f.assetNone, f.assetMiss = nil, false, false
 	where, args := f.where()
 
+	// asset_ids 是 JSON 列：取文本形态交给 Go 侧 json.Unmarshal（PG 的 ::text 转换
+	// 在 TiDB 上是 CAST(… AS CHAR)，NULL 行仍由 COALESCE 兜住）。
 	rows, err := d.Query(`SELECT COALESCE(f.severity,''), f.created_at,
-       COALESCE(f.asset_ids::text,'[]')
+       COALESCE(CAST(f.asset_ids AS CHAR), '[]')
 FROM findings f LEFT JOIN tasks t ON f.task_id = t.id`+where, args...)
 	if err != nil {
 		return nil, err
@@ -258,7 +260,12 @@ func (d *DB) loadFindingAssetRows(ids map[int64]bool) (map[int64]*assetRow, erro
 	for id := range ids {
 		idList = append(idList, id)
 	}
-	rows, err := d.Query(`SELECT `+findingAssetSelectCols+` FROM assets a WHERE a.id = ANY($1::bigint[])`, idList)
+	// TiDB 没有 `= ANY(bigint[])`：批量 id 一律展开成参数化的 IN (?, ?, …)。
+	args := make([]any, 0, len(idList))
+	for _, id := range idList {
+		args = append(args, id)
+	}
+	rows, err := d.Query(`SELECT `+findingAssetSelectCols+` FROM assets a WHERE a.id IN (`+questionPlaceholders(len(args))+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -389,13 +396,27 @@ func isIPLiteral(host string) bool {
 }
 
 // loadAssetsByHost 按宿主标识批量补齐资产行,返回本轮新增的行数。
+//
+// 方言：`= ANY(text[])` 是 PG 的数组谓词，TiDB 上没有对应物，一律展开成参数化的
+// `IN (?, ?, …)`。一个目标类型可能要同时匹配 domain 与 ip 两列，每列各带一份占位符
+// 与一份参数副本（值重复绑定，绝不把用户输入拼进 SQL）。targetType 是调用方常量。
 func (d *DB) loadAssetsByHost(want missingHosts, byID map[int64]*assetRow) (int, error) {
 	added := 0
-	load := func(q string, arg []string) error {
-		if len(arg) == 0 {
+	load := func(targetType string, columns []string, values []string) error {
+		if len(values) == 0 {
 			return nil
 		}
-		rows, err := d.Query(q, arg)
+		placeholders := questionPlaceholders(len(values))
+		ors := make([]string, 0, len(columns))
+		args := make([]any, 0, len(columns)*len(values))
+		for _, column := range columns {
+			ors = append(ors, "a."+column+" IN ("+placeholders+")")
+			for _, value := range values {
+				args = append(args, value)
+			}
+		}
+		rows, err := d.Query(`SELECT `+findingAssetSelectCols+` FROM assets a
+WHERE a.type='`+targetType+`' AND (`+strings.Join(ors, " OR ")+`)`, args...)
 		if err != nil {
 			return err
 		}
@@ -412,20 +433,16 @@ func (d *DB) loadAssetsByHost(want missingHosts, byID map[int64]*assetRow) (int,
 		}
 		return nil
 	}
-	if err := load(`SELECT `+findingAssetSelectCols+` FROM assets a
-WHERE a.type='service' AND (a.domain = ANY($1::text[]) OR a.ip = ANY($1::text[]))`, want.services); err != nil {
+	if err := load("service", []string{"domain", "ip"}, want.services); err != nil {
 		return 0, err
 	}
-	if err := load(`SELECT `+findingAssetSelectCols+` FROM assets a
-WHERE a.type='subdomain' AND a.domain = ANY($1::text[])`, want.domains); err != nil {
+	if err := load("subdomain", []string{"domain"}, want.domains); err != nil {
 		return 0, err
 	}
-	if err := load(`SELECT `+findingAssetSelectCols+` FROM assets a
-WHERE a.type='ip' AND a.ip = ANY($1::text[])`, want.ips); err != nil {
+	if err := load("ip", []string{"ip"}, want.ips); err != nil {
 		return 0, err
 	}
-	if err := load(`SELECT `+findingAssetSelectCols+` FROM assets a
-WHERE a.type='root_domain' AND a.domain = ANY($1::text[])`, want.roots); err != nil {
+	if err := load("root_domain", []string{"domain"}, want.roots); err != nil {
 		return 0, err
 	}
 	return added, nil
@@ -536,7 +553,11 @@ func (d *DB) attachCompanyNodes(nodes map[string]*FindingAssetNode, parentOf map
 	for id := range want {
 		ids = append(ids, id)
 	}
-	rows, err := d.Query(`SELECT id, COALESCE(name,'') FROM companies WHERE id = ANY($1::bigint[])`, ids)
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	rows, err := d.Query(`SELECT id, COALESCE(name,'') FROM companies WHERE id IN (`+questionPlaceholders(len(args))+`)`, args...)
 	if err != nil {
 		return err
 	}
@@ -666,14 +687,4 @@ func (d *DB) applyAssetScope(f FindingFilter) (FindingFilter, error) {
 		f.assetMiss = true
 	}
 	return f, nil
-}
-
-// assetIDContainments 把资产 id 变成 jsonb 包含判断的右操作数集合,配合
-// idx_findings_asset_ids(GIN jsonb_path_ops)使用。
-func assetIDContainments(ids []int64) []string {
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, "["+strconv.FormatInt(id, 10)+"]")
-	}
-	return out
 }
