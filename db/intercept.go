@@ -3,6 +3,8 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -113,17 +115,69 @@ func (d *DB) getInterceptRule(id int64) (InterceptRule, error) {
 	return scanInterceptRule(d.QueryRow(`SELECT `+interceptRuleCols+` FROM intercept_rules WHERE id=?`, id))
 }
 
+// ErrInterceptRuleNotFound 表示按 id 指定的 intercept_rules 行不存在。
+// 审批写入侧（CreateInterceptPending / CreateDecidedIntercept）拿它区分"父规则已被
+// 删除"与真实数据库错误；此时不再写悬空 rule_id，而是降级成无父规则的记录。
+var ErrInterceptRuleNotFound = errors.New("intercept rule not found")
+
+// lockInterceptRuleForReference 锁定并校验 intercept_rules 父行（M23 / 审查 F5）。
+//
+// 基线不带外键，"删除规则"与"写审批记录"之间没有任何数据库约束兜底：审批写入方必须
+// 与 DeleteInterceptRule 抢同一把父行锁，才能在同一事务里断言"这一条规则现在还在"。
+// 规则行很少成为热点（每次命中工具规则才写一条审批），这把行锁的等待代价可以接受。
+func lockInterceptRuleForReference(tx *sql.Tx, ruleID int64) error {
+	var id int64
+	err := tx.QueryRow(`SELECT id FROM intercept_rules WHERE id=? FOR UPDATE`, ruleID).Scan(&id)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: %d", ErrInterceptRuleNotFound, ruleID)
+	}
+	return err
+}
+
+// resolveInterceptRuleParent 在写入方的事务里判定 rule_id 这一列最终写什么：
+//   - ruleID == 0：本来就是无父规则（LLM 兜底判定）→ (nil, 0)；
+//   - 父规则存活：写 ruleID，decision_source 仍记 'rule'；
+//   - 父规则已被删除（陈旧请求）：写 NULL，并按"无规则"重算 decision_source，
+//     与 DeleteInterceptRule 的 SET NULL 语义一致 —— 审计记录要留下，但绝不能
+//     留下指向不存在规则的悬空引用让前端误判"规则还在"。
+func resolveInterceptRuleParent(tx *sql.Tx, ruleID int64) (*int64, int64, error) {
+	if ruleID == 0 {
+		return nil, 0, nil
+	}
+	if err := lockInterceptRuleForReference(tx, ruleID); err != nil {
+		if errors.Is(err, ErrInterceptRuleNotFound) {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	id := ruleID
+	return &id, id, nil
+}
+
 // DeleteInterceptRule removes a rule.
 //
 // 旧库里 intercept_pending.rule_id 通过 ON DELETE SET NULL 与规则脱钩；基线不带
 // 外键，必须显式把待审/已审记录的 rule_id 置空，否则审批行会挂在一条已经不存在的
 // 规则上（decision_source 仍写着 rule，前端会误判规则还在）。
+//
+// 并发协议（F5）：先锁规则行，再做置空 + 删除。审批写入方（CreateInterceptPending /
+// CreateDecidedIntercept）在同一把锁后面校验父行存活，所以删除提交之后不会有新的
+// 审批行带着已删除的 rule_id 插进来。规则本就不存在时保持幂等（等价 DELETE 0 行）。
 func (d *DB) DeleteInterceptRule(id int64) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var lockedID int64
+	switch err := tx.QueryRow(`SELECT id FROM intercept_rules WHERE id=? FOR UPDATE`, id).Scan(&lockedID); err {
+	case nil:
+	case sql.ErrNoRows:
+		// 幂等：规则本来就不存在（重复删除），保持旧的 "DELETE 0 行" 语义。
+		return tx.Commit()
+	default:
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE intercept_pending SET rule_id=NULL WHERE rule_id=?`, id); err != nil {
 		return err
 	}
@@ -146,6 +200,9 @@ const interceptPendingInsertCols = `rule_id, conversation_id, task_id, agent_nam
 // CreateInterceptPending inserts a pending approval record and returns its ID.
 // convID == 0 → conversation_id stored as NULL (background task).
 // taskID == "" → task_id stored as NULL.
+//
+// ruleID != 0 时先在同一事务里锁定并校验父规则（F5）：父规则已被删除就把 rule_id
+// 降级成 NULL，绝不写悬空引用。
 func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, toolName string, input []byte, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
@@ -159,19 +216,29 @@ func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, too
 	if taskID != "" {
 		taskIDPtr = &taskID
 	}
-	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
-	var ruleIDPtr *int64
-	if ruleID != 0 {
-		ruleIDPtr = &ruleID
-	}
-	res, err := d.Exec(`
-INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
-VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(ruleID, reason), firstAudit(audits))
+	tx, err := d.Begin()
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	defer tx.Rollback()
+	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
+	// ruleID != 0 但父规则已消失 → 同样写 NULL，decision_source 随之退回 model/unknown。
+	ruleIDPtr, sourceRuleID, err := resolveInterceptRuleParent(tx, ruleID)
+	if err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`
+INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
+VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`,
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(sourceRuleID, reason), firstAudit(audits))
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 // DecideInterceptPending updates a pending record's status (allowed/denied/timeout).
@@ -187,6 +254,8 @@ func (d *DB) DecideInterceptPending(id int64, status string) error {
 // (status = 'allowed' | 'denied'), decided_at stamped now. Used to log allow/deny
 // rule matches for observability — they don't block and need no user action, so unlike
 // CreateInterceptPending (which starts 'pending') this records the outcome directly.
+//
+// 父规则协议与 CreateInterceptPending 完全一致（锁定 + 存活校验 + 缺失降级为 NULL）。
 func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, toolName string, input []byte, status, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
@@ -200,19 +269,28 @@ func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, too
 	if taskID != "" {
 		taskIDPtr = &taskID
 	}
-	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
-	var ruleIDPtr *int64
-	if ruleID != 0 {
-		ruleIDPtr = &ruleID
-	}
-	res, err := d.Exec(`
-INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(3), ?, ?)`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits))
+	tx, err := d.Begin()
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	defer tx.Rollback()
+	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
+	ruleIDPtr, sourceRuleID, err := resolveInterceptRuleParent(tx, ruleID)
+	if err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`
+INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(3), ?, ?)`,
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(sourceRuleID, reason), firstAudit(audits))
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source`

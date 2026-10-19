@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/Autumn-27/artex/db/schema"
+	"github.com/Autumn-27/artex/db/tidb"
 )
 
 // ---------- canonical identity 写入辅助（M08）----------
@@ -44,6 +46,45 @@ func skillVisibilityIdentity(agentID int64, skillName string) (payload []byte, h
 // mcp_tool_name 取基线默认值 ""（与列默认严格一致，否则身份与库内行不自洽）。
 func agentVisibilityIdentity(agentID int64, kind string, resourceID int64) (payload []byte, hash []byte) {
 	return canonicalIdentityPair(schema.AgentVisibilityIdentity(uint64(agentID), kind, uint64(resourceID), ""))
+}
+
+// ---------- 共享父行锁协议（M23 / 审查 F5）----------
+//
+// 基线不带外键，"先清子表、再删父表"只覆盖了顺序删除；并发下的保证必须来自**父子
+// 两端共用的同一把行锁**：
+//
+//	写者　　：锁父行（FOR UPDATE）→ 校验父行存活 → 才允许写子表；
+//	删除者：锁父行（FOR UPDATE）→ 清子表 → 删父行。
+//
+// 两侧都在碰任何子表行**之前**拿到父行锁，因此"父对象刚被删除、请求还在路上"这种
+// 陈旧写入要么在锁上等待、要么醒来发现父行消失而整体失败，不会再留下指向不存在父行
+// 的孤儿子行；固定"先父后子"的顺序也让删除者与写者之间形成不了锁序倒置。
+var (
+	ErrAgentNotFound     = errors.New("agent not found")
+	ErrMCPServerNotFound = errors.New("MCP server not found")
+)
+
+// lockAgentForReference 锁定并校验 agent 父行。调用方必须已开启事务，且在它返回
+// 之前不得写 agent_prompts / agent_prompt_vars / agent_visibility /
+// agent_skill_visibility。
+func lockAgentForReference(tx *sql.Tx, agentID int64) error {
+	var id int64
+	err := tx.QueryRow(`SELECT id FROM agents WHERE id=? FOR UPDATE`, agentID).Scan(&id)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: %d", ErrAgentNotFound, agentID)
+	}
+	return err
+}
+
+// lockMCPServerForReference 同上，父行是 mcp_servers：mcp_tools_cache 的写者
+// （SaveMCPTools）与 agent_visibility 的 mcp 侧写者都必须先持有它。
+func lockMCPServerForReference(tx *sql.Tx, serverID int64) error {
+	var id int64
+	err := tx.QueryRow(`SELECT id FROM mcp_servers WHERE id=? FOR UPDATE`, serverID).Scan(&id)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: %d", ErrMCPServerNotFound, serverID)
+	}
+	return err
 }
 
 // ---------- LLM profiles ----------
@@ -258,6 +299,29 @@ func (d *DB) DeleteProfileContext(ctx context.Context, id int64) error {
 	return fmt.Errorf("%w: profile %d", ErrLLMProfileReferencesChanged, id)
 }
 
+// 三条"引用了本 profile 的行"查询。初扫（加锁）与 profile 锁到手后的漂移复查共用
+// 它们：同一谓词、同一 ORDER BY、同一 FOR UPDATE，保证两次的锁集合可直接比较。
+const (
+	profileTaskRefsForUpdate = `SELECT t.id
+FROM tasks t
+WHERE t.llm_profile_id=?
+   OR t.active_llm_profile_id=?
+   OR EXISTS (
+       SELECT 1 FROM task_llm_profiles x
+       WHERE x.task_id=t.id AND x.profile_id=?
+   )
+ORDER BY t.id
+FOR UPDATE`
+	profileAgentRefsForUpdate = `SELECT id FROM agents
+WHERE llm_profile_id=?
+ORDER BY id
+FOR UPDATE`
+	profileConversationRefsForUpdate = `SELECT id FROM conversations
+WHERE llm_profile_id=?
+ORDER BY id
+FOR UPDATE`
+)
+
 func (d *DB) deleteProfile(ctx context.Context, id int64) (bool, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
@@ -273,30 +337,18 @@ func (d *DB) deleteProfile(ctx context.Context, id int64) (bool, error) {
 	//
 	// TiDB 没有 `FOR UPDATE OF tbl`（PG 方言）：这里只 SELECT tasks 主键，加锁范围
 	// 就是 t 本身；EXISTS 子查询走一致性读，不额外持有 task_llm_profiles 行锁。
-	lockedTasks, err := lockProfileReferenceRows(ctx, tx, `SELECT t.id
-FROM tasks t
-WHERE t.llm_profile_id=?
-   OR t.active_llm_profile_id=?
-   OR EXISTS (
-       SELECT 1 FROM task_llm_profiles x
-       WHERE x.task_id=t.id AND x.profile_id=?
-   )
-ORDER BY t.id
-FOR UPDATE`, id, id, id)
+	//
+	// 三条查询与下面的"漂移复查"共用同一组常量：同一个谓词、同一个取锁顺序，
+	// 差别只在读的时刻（见 profileReferenceDrifted）。
+	lockedTasks, err := lockProfileReferenceRows(ctx, tx, profileTaskRefsForUpdate, id, id, id)
 	if err != nil {
 		return false, err
 	}
-	lockedAgents, err := lockProfileReferenceRows(ctx, tx, `SELECT id FROM agents
-WHERE llm_profile_id=?
-ORDER BY id
-FOR UPDATE`, id)
+	lockedAgents, err := lockProfileReferenceRows(ctx, tx, profileAgentRefsForUpdate, id)
 	if err != nil {
 		return false, err
 	}
-	lockedConversations, err := lockProfileReferenceRows(ctx, tx, `SELECT id FROM conversations
-WHERE llm_profile_id=?
-ORDER BY id
-FOR UPDATE`, id)
+	lockedConversations, err := lockProfileReferenceRows(ctx, tx, profileConversationRefsForUpdate, id)
 	if err != nil {
 		return false, err
 	}
@@ -317,65 +369,31 @@ FOR UPDATE`, id)
 		position  int
 		wasActive bool
 	}
-	// A task may have committed a new reference after the first statement took
-	// its snapshot but before this transaction acquired the profile lock. The
-	// profile lock now prevents further references; retry if that committed task
-	// was not part of the task-first lock set. Never acquire a new task lock while
-	// holding the profile lock, because that would recreate the inversion.
-	rows, err := tx.QueryContext(ctx, `SELECT ref_kind, ref_id FROM (
-	SELECT 'task' AS ref_kind, t.id AS ref_id
-FROM tasks t
-WHERE t.llm_profile_id=?
-   OR t.active_llm_profile_id=?
-   OR EXISTS (
-       SELECT 1 FROM task_llm_profiles x
-       WHERE x.task_id=t.id AND x.profile_id=?
-   )
-	UNION ALL
-	SELECT 'agent', a.id FROM agents a WHERE a.llm_profile_id=?
-	UNION ALL
-	SELECT 'conversation', c.id FROM conversations c WHERE c.llm_profile_id=?
-) refs
-ORDER BY ref_kind, ref_id`, id, id, id, id, id)
-	if err != nil {
-		return false, err
-	}
-	for rows.Next() {
-		var (
-			kind  string
-			rowID int64
-		)
-		if err := rows.Scan(&kind, &rowID); err != nil {
-			rows.Close()
-			return false, err
-		}
-		locked := false
-		switch kind {
-		case "task":
-			_, locked = lockedTasks[rowID]
-		case "agent":
-			_, locked = lockedAgents[rowID]
-		case "conversation":
-			_, locked = lockedConversations[rowID]
-		}
-		if !locked {
-			rows.Close()
-			return true, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return false, err
-	}
-	if err := rows.Close(); err != nil {
-		return false, err
+
+	// 初扫之后、profile 锁到手之前，别的事务仍可能把某个 task/agent/conversation
+	// 绑到本 profile 并提交。这条漂移必须**当前读**才看得见：TiDB 默认
+	// REPEATABLE-READ，普通 SELECT 读的是事务起点的快照（官方
+	// 《TiDB Pessimistic Transaction Mode / Behaviors》：只有 SELECT … FOR UPDATE
+	// 与 DML 是 current read），用普通 SELECT 复查等于什么都没查。而函数后面的范围
+	// DELETE/UPDATE 恰恰是当前读，会把这条新引用顺手清掉，却不会为它跑
+	// successor/cursor/revision —— 任务游标就这样丢了（审查 F4 的第 3、4 步）。
+	//
+	// 复查因此复用与初扫完全相同的三条 FOR UPDATE 语句：读的是最新已提交集合，取锁
+	// 顺序也仍是 task → agent → conversation。一旦发现当前集合里有任何一行不在初扫
+	// 的锁集合中，就整体回滚重试，绝不带着"锁序外的新行"继续往下改（不做逆序补锁）。
+	if drifted, err := profileReferenceDrifted(ctx, tx, id, lockedTasks, lockedAgents, lockedConversations); err != nil || drifted {
+		return drifted, err
 	}
 
-	rows, err = tx.QueryContext(ctx, `SELECT x.task_id, x.position, COALESCE(t.active_llm_profile_id=?, FALSE)
+	// 同样是当前读：受影响链和 active 游标都可能在我们等待 task 行锁期间被改写过，
+	// 快照读会拿到"等待开始前"的旧游标位置，successor 就会选错（F4 的双连接场景）。
+	// FOR UPDATE 在这里只补锁 task_llm_profiles 链行；tasks 行本来就在锁集合里。
+	rows, err := tx.QueryContext(ctx, `SELECT x.task_id, x.position, COALESCE(t.active_llm_profile_id=?, FALSE)
 FROM task_llm_profiles x
 JOIN tasks t ON t.id=x.task_id
 WHERE x.profile_id=?
-ORDER BY x.task_id`, id, id)
+ORDER BY x.task_id
+FOR UPDATE`, id, id)
 	if err != nil {
 		return false, err
 	}
@@ -410,10 +428,12 @@ ORDER BY x.task_id`, id, id)
 		}
 		var next int64
 		// `position` 是 MySQL 保留字（POSITION()），列名一律反引号。
+		// FOR UPDATE：当前读 + 锁住候选 successor 行，避免"等锁期间链被改写"后
+		// 把游标切到一个已经不存在 / 已经不是 ready 的位置。
 		err := tx.QueryRowContext(ctx, `SELECT profile_id FROM task_llm_profiles
 WHERE task_id=? AND `+"`position`"+`>? AND status='ready'
 ORDER BY `+"`position`"+`
-LIMIT 1`, task.id, task.position).Scan(&next)
+LIMIT 1 FOR UPDATE`, task.id, task.position).Scan(&next)
 		if err != nil && err != sql.ErrNoRows {
 			return false, err
 		}
@@ -483,6 +503,41 @@ func lockProfileReferenceRows(ctx context.Context, tx *sql.Tx, query string, arg
 	return locked, nil
 }
 
+// profileReferenceDrifted 在 profile 行锁到手之后，用**当前读**（FOR UPDATE）重取
+// 三类引用行，并检查它们是否全部落在初扫已经锁住的集合里。返回 true 表示引用集合
+// 已经漂移：调用方必须整体回滚重试，不能继续往下改，也不能就地补锁后接着走。
+//
+// 为什么必须加锁读：TiDB 默认 REPEATABLE-READ，普通 SELECT 是事务起点快照读，看不见
+// 初扫之后提交的绑定；而删除/置空的 DML 是当前读，两者一起用就会"漏判新引用、却把
+// 它的链删掉"。锁等待 / 死锁说明集合正被并发写者改动，同样按漂移处理，交给
+// DeleteProfileContext 的有界重试环。
+func profileReferenceDrifted(ctx context.Context, tx *sql.Tx, profileID int64, tasks, agents, conversations map[int64]struct{}) (bool, error) {
+	// 顺序保持 task → agent → conversation，与初扫一致，不额外触碰其它表。
+	for _, scan := range []struct {
+		locked map[int64]struct{}
+		query  string
+		args   []any
+	}{
+		{tasks, profileTaskRefsForUpdate, []any{profileID, profileID, profileID}},
+		{agents, profileAgentRefsForUpdate, []any{profileID}},
+		{conversations, profileConversationRefsForUpdate, []any{profileID}},
+	} {
+		current, err := lockProfileReferenceRows(ctx, tx, scan.query, scan.args...)
+		if err != nil {
+			if tidb.IsRetryable(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		for rowID := range current {
+			if _, ok := scan.locked[rowID]; !ok {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // SetActiveProfile makes one profile the global default (single-default invariant).
 func (d *DB) SetActiveProfile(id int64) error {
 	tx, err := d.Begin()
@@ -532,7 +587,14 @@ type Agent struct {
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+// agentCols 是 agents 表的共享读取列清单（ListAgents / GetAgentByKey /
+// CreateAgent 回读都走它）。
+//
+// `key` 是 MySQL/TiDB 保留字：WHERE 与 INSERT 侧一直都有反引号，唯独清单里的裸
+// `key` 会生成 `SELECT id,key,name,…`，在 TiDB 上是语法错误——列表/单条查询直接
+// 报错，CreateAgent 更是 INSERT 已提交、回读失败（行已存在却返回错误）。清单是
+// 唯一的拼串入口，所以转义只在这里做一次。
+const agentCols = "id,`key`,name," + `COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
@@ -575,8 +637,11 @@ func (d *DB) GetAgentByKey(key string) (*Agent, error) {
 
 // AgentBindingCounts returns per-agent binding counts in a few grouped queries
 // (NO N+1): visible MCP servers and skills keyed by agent id, and bound tools
-// keyed by agent key (tools.agents is a JSONB array of agent keys). Missing keys
+// keyed by agent key (tools.agents is a JSON array of agent keys). Missing keys
 // mean zero. Used to show "MCP N · Skill N · 工具 N" on the agent cards.
+//
+// 工具计数不能在 SQL 里展开 JSON 数组（TiDB 8.5 不支持 JSON_TABLE，见下面的注释），
+// 所以 tools 侧是"一条全表查询 + Go 内存聚合"，仍然只有三条 SQL，没有 N+1。
 func (d *DB) AgentBindingCounts() (mcp map[int64]int, skill map[int64]int, tools map[string]int, err error) {
 	mcp, skill, tools = map[int64]int{}, map[int64]int{}, map[string]int{}
 	byID := func(q string, into map[int64]int) error {
@@ -601,25 +666,34 @@ func (d *DB) AgentBindingCounts() (mcp map[int64]int, skill map[int64]int, tools
 	if err = byID(`SELECT agent_id, count(*) FROM agent_skill_visibility WHERE enabled GROUP BY agent_id`, skill); err != nil {
 		return
 	}
-	// tools.agents 是 JSON 数组（原 PG JSONB）：jsonb_array_elements_text 的等价
-	// 原语是 JSON_TABLE('$[*]')；GROUP BY 与 SELECT 列一致，满足 ONLY_FULL_GROUP_BY。
-	rows, e := d.Query(`SELECT jt.agent_key, COUNT(*) AS bound
-FROM tools t,
-JSON_TABLE(t.agents, '$[*]' COLUMNS (agent_key VARCHAR(255) PATH '$')) AS jt
-GROUP BY jt.agent_key`)
+	// tools.agents 是 JSON 数组（原 PG JSONB）。TiDB 8.5 明确**不支持** JSON_TABLE()
+	// ——官方 release-8.5《JSON Functions》把它列在 Unsupported functions 里，
+	// 用它只会得到 "Unsupported function JSON_TABLE"。这里只把数组原样读回来，
+	// 展开与计数放到 Go 内存里做，语义与原来的 JSON_TABLE + GROUP BY 一致：
+	// 数组里每个元素各计一次（同一行内的重复元素重复计数），NULL 与空数组不贡献
+	// 计数，没出现的 agent key 仍按"缺失即 0"处理。
+	rows, e := d.Query(`SELECT agents FROM tools WHERE agents IS NOT NULL`)
 	if e != nil {
 		err = e
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var k string
-		var n int
-		if e := rows.Scan(&k, &n); e != nil {
+		var raw []byte
+		if e := rows.Scan(&raw); e != nil {
 			err = e
 			return
 		}
-		tools[k] = n
+		var keys []string
+		if e := json.Unmarshal(raw, &keys); e != nil {
+			// 显式报错而不是静默跳过：调用方是 best-effort overlay，静默只会把
+			// "统计坏了"伪装成"这个 agent 一个工具都没绑"。
+			err = fmt.Errorf("decode tools.agents JSON array: %w", e)
+			return
+		}
+		for _, k := range keys {
+			tools[k]++
+		}
 	}
 	err = rows.Err()
 	return
@@ -665,14 +739,23 @@ func (d *DB) UpdateAgentMeta(key, name, description string) error {
 // 旧库里 agent_prompts / agent_prompt_vars / agent_visibility /
 // agent_skill_visibility 靠 ON DELETE CASCADE 随父行消失；基线不再带外键，
 // 这些子行必须在同一事务里显式删除，否则会留下指向不存在 agent 的孤儿。
+//
+// 并发协议（F5）：父行用 FOR UPDATE 锁定后才清子表。SavePrompt /
+// SetAgentSkillVisibility / SetAgentVisibilityKind 等子写者都在各自事务里先锁同一条
+// agents 行再写子表，所以"删除已提交、陈旧写入才到"的窗口被这把锁关掉——写者醒来
+// 发现父行消失（ErrAgentNotFound）整体失败，不会插回孤儿。
 func (d *DB) DeleteAgent(key string) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// 父锁必须先于任何子表 DELETE：SavePrompt / SetAgentSkillVisibility /
+	// SetAgentVisibilityKind 这些子写者都在各自事务里先锁同一行 agents 再写子表，
+	// 于是"删除已完成、陈旧写入还在路上"的窗口被这把锁关掉（写者要么排队等我们提交，
+	// 醒来发现父行消失而整体失败）。
 	var agentID int64
-	err = tx.QueryRow(`SELECT id FROM agents WHERE `+"`key`"+`=? AND builtin=FALSE`, key).Scan(&agentID)
+	err = tx.QueryRow(`SELECT id FROM agents WHERE `+"`key`"+`=? AND builtin=FALSE FOR UPDATE`, key).Scan(&agentID)
 	if err == sql.ErrNoRows {
 		// 内置 agent 或未知 key：保持旧的 "DELETE 影响 0 行" 语义。
 		return tx.Commit()
@@ -736,14 +819,21 @@ func (d *DB) SetAgentLLMProfile(key string, id *int64) error {
 
 // lockLLMProfileForReference makes the profile side of the shared lock-order
 // protocol explicit. Callers must already own the referencing child row.
+//
+// 为什么是 FOR UPDATE 而不是 FOR SHARE：TiDB 默认压根没有"共享行锁"这一层——
+// 官方 release-8.5《TiDB System Variables》里 tidb_enable_shared_lock_promotion
+// 默认 OFF，打开是把共享锁**升级成排他锁**；另一个 noop 兼容开关则是直接把锁忽略
+// 成不加锁。也就是说 FOR SHARE 既不提供"与 FOR UPDATE 互斥、又允许并发绑定"的
+// 契约，也不是可验收的等价改写（R4 审计 K 项同样禁止这么糊过去）。绑定侧因此统一
+// 取 TiDB 真正支持的 FOR UPDATE：与 DeleteProfile 的 profile 行锁天然互斥，引用
+// 集合在删除事务持锁期间不可能再增长。代价是"并发绑定同一个 profile"会串行化——
+// 这是配置页的人工写入频率，换来的是删除/绑定互斥这件事有数据库保证。
 func lockLLMProfileForReference(tx *sql.Tx, profileID *int64) error {
 	if profileID == nil {
 		return nil
 	}
 	var lockedID int64
-	// PG 的 FOR KEY SHARE（FK 检查用的最弱行锁）在 TiDB 侧对应 FOR SHARE：
-	// 与 DeleteProfile 的 FOR UPDATE 互斥，但允许并发重绑同一 profile。
-	if err := tx.QueryRow(`SELECT id FROM llm_profiles WHERE id=? FOR SHARE`, *profileID).Scan(&lockedID); err != nil {
+	if err := tx.QueryRow(`SELECT id FROM llm_profiles WHERE id=? FOR UPDATE`, *profileID).Scan(&lockedID); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrLLMProfileNotFound
 		}
@@ -876,12 +966,18 @@ func (d *DB) ResetPromptToDefault(agentID int64, tmpl string) (int, error) {
 }
 
 // SavePrompt appends a new version and points current_prompt_id at it.
+//
+// 先锁 agent 父行并校验存活（F5）：DeleteAgent 走同一把锁，父行已消失时这里返回
+// ErrAgentNotFound，不会留下指向不存在 agent 的 agent_prompts 行。
 func (d *DB) SavePrompt(agentID int64, template, note, by string) (int, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err := lockAgentForReference(tx, agentID); err != nil {
+		return 0, err
+	}
 	var ver int
 	if err := tx.QueryRow(`SELECT COALESCE(max(version),0)+1 FROM agent_prompts WHERE agent_id=?`, agentID).Scan(&ver); err != nil {
 		return 0, err
@@ -1017,12 +1113,20 @@ func (d *DB) MCPToolsDetailed(serverID int64) ([]MCPTool, error) {
 }
 
 // SaveMCPTools replaces the cached tool list for a server (called after discovery).
+//
+// MCP 发现是异步的：用户完全可能在 discovery 进行中途删掉 server。子写者必须先持有
+// 父行锁并校验存活，否则 DeleteMCP 提交后这里仍会插出一份挂在已删除 server 上的缓存
+// （基线没有外键兜底）。父行已消失 → ErrMCPServerNotFound，调用方（发现流程）记日志
+// 丢弃这次结果即可。
 func (d *DB) SaveMCPTools(serverID int64, tools []MCPTool) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockMCPServerForReference(tx, serverID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM mcp_tools_cache WHERE server_id=?`, serverID); err != nil {
 		return err
 	}
@@ -1064,12 +1168,24 @@ func (d *DB) SaveMCP(m *MCPServer) (int64, error) {
 //
 // mcp_tools_cache 在旧库里靠 ON DELETE CASCADE 随父行消失；基线没有外键，
 // 这里必须显式删掉，否则缓存会挂在一条已经不存在的 server 上。
+//
+// 并发协议（F5）：先锁 mcp_servers 父行，再清子表。SaveMCPTools 与 agent_visibility
+// 的 mcp 侧写者走的是同一把父行锁，所以"清完子表 → 删父行"这中间不可能有陈旧写入
+// 把缓存重新插回来。父行本就不存在时保持旧的幂等语义（等价 DELETE 影响 0 行）。
 func (d *DB) DeleteMCP(id int64) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var locked int64
+	switch err := tx.QueryRow(`SELECT id FROM mcp_servers WHERE id=? FOR UPDATE`, id).Scan(&locked); err {
+	case nil:
+	case sql.ErrNoRows:
+		return tx.Commit()
+	default:
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM mcp_tools_cache WHERE server_id=?`, id); err != nil {
 		return err
 	}
@@ -1127,6 +1243,10 @@ func (d *DB) SetAgentSkillVisibility(agentID int64, names []string) error {
 		return err
 	}
 	defer tx.Rollback()
+	// 子写者的父锁：见 lockAgentForReference 的协议说明。
+	if err := lockAgentForReference(tx, agentID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM agent_skill_visibility WHERE agent_id=?`, agentID); err != nil {
 		return err
 	}
@@ -1150,13 +1270,24 @@ func skillVisibilityArgs(agentID int64, skillName string) []any {
 }
 
 // ToggleSkillVisibility sets one (agent, skill_name) visibility on/off.
+// 与批量版一样先锁 agent 父行，否则"agent 已删除 + 前端陈旧 toggle 请求"会插回孤儿行。
 func (d *DB) ToggleSkillVisibility(agentID int64, skillName string, on bool) error {
-	if on {
-		_, err := d.Exec(skillVisibilityUpsertSQL, skillVisibilityArgs(agentID, skillName)...)
+	tx, err := d.Begin()
+	if err != nil {
 		return err
 	}
-	_, err := d.Exec(`DELETE FROM agent_skill_visibility WHERE agent_id=? AND skill_name=?`, agentID, skillName)
-	return err
+	defer tx.Rollback()
+	if err := lockAgentForReference(tx, agentID); err != nil {
+		return err
+	}
+	if on {
+		if _, err := tx.Exec(skillVisibilityUpsertSQL, skillVisibilityArgs(agentID, skillName)...); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(`DELETE FROM agent_skill_visibility WHERE agent_id=? AND skill_name=?`, agentID, skillName); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteSkillVisibility removes all visibility rows for a skill (called on skill delete).
@@ -1206,12 +1337,23 @@ func (d *DB) ResourceAgents(kind string, resourceID int64) ([]int64, error) {
 // SetAgentVisibilityKind replaces the full set of visible resources of a kind for
 // an agent (agent-side bulk write). Bidirectional with the resource-side view —
 // both read/write the same agent_visibility rows.
+//
+// 父锁顺序固定 agents → mcp_servers → 子表行：先锁 agent，再按 id 升序锁本批 mcp
+// 资源，**全部父锁到手之后**才开始写 agent_visibility。这样本函数在排队等父锁时不
+// 持有任何子表行锁，DeleteMCP（锁 mcp_servers → 清子表）与 DeleteAgent（锁 agents →
+// 清子表）都构造不出环；同批内升序取锁也排除了两个并发写者反序抢同一组 MCP 的死锁。
 func (d *DB) SetAgentVisibilityKind(agentID int64, kind string, resourceIDs []int64) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockAgentForReference(tx, agentID); err != nil {
+		return err
+	}
+	if err := lockMCPResourceParents(tx, kind, resourceIDs); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM agent_visibility WHERE agent_id=? AND resource_kind=?`, agentID, kind); err != nil {
 		return err
 	}
@@ -1221,6 +1363,26 @@ func (d *DB) SetAgentVisibilityKind(agentID int64, kind string, resourceIDs []in
 		}
 	}
 	return tx.Commit()
+}
+
+// visibilityKindMCP 是 agent_visibility.resource_kind 里唯一带数据库父表
+// （mcp_servers）的取值，写者必须先持有它的行锁。
+const visibilityKindMCP = "mcp"
+
+// lockMCPResourceParents 按 id 升序锁定 resource_kind='mcp' 的资源父行；必须在
+// 写入任何 agent_visibility 行之前调用（协议见 SetAgentVisibilityKind）。
+func lockMCPResourceParents(tx *sql.Tx, kind string, resourceIDs []int64) error {
+	if kind != visibilityKindMCP {
+		return nil
+	}
+	ids := append([]int64(nil), resourceIDs...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, rid := range ids {
+		if err := lockMCPServerForReference(tx, rid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // agentVisibilityUpsertSQL 依赖 uq_agent_visibility_identity（4 元组 hash）判定冲突。
@@ -1236,11 +1398,25 @@ func agentVisibilityArgs(agentID int64, kind string, resourceID int64) []any {
 }
 
 // ToggleVisibility sets one (agent, kind, resource) visibility on/off (idempotent).
+// 与批量版共用同一套父锁协议（agents → mcp_servers → 子表行）。
 func (d *DB) ToggleVisibility(agentID int64, kind string, resourceID int64, on bool) error {
-	if on {
-		_, err := d.Exec(agentVisibilityUpsertSQL, agentVisibilityArgs(agentID, kind, resourceID)...)
+	tx, err := d.Begin()
+	if err != nil {
 		return err
 	}
-	_, err := d.Exec(`DELETE FROM agent_visibility WHERE agent_id=? AND resource_kind=? AND resource_id=?`, agentID, kind, resourceID)
-	return err
+	defer tx.Rollback()
+	if err := lockAgentForReference(tx, agentID); err != nil {
+		return err
+	}
+	if err := lockMCPResourceParents(tx, kind, []int64{resourceID}); err != nil {
+		return err
+	}
+	if on {
+		if _, err := tx.Exec(agentVisibilityUpsertSQL, agentVisibilityArgs(agentID, kind, resourceID)...); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(`DELETE FROM agent_visibility WHERE agent_id=? AND resource_kind=? AND resource_id=?`, agentID, kind, resourceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

@@ -22,7 +22,11 @@ func TestPoolProfilesOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open TiDB failed: %v", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
 
 	mk := func(name string, priority int, exclude bool, key string) int64 {
 		id, err := d.SaveProfile(&LLMProfile{
@@ -32,7 +36,18 @@ func TestPoolProfilesOrder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=?`, id) })
+		t.Cleanup(func() {
+			if _, err := d.Exec(`DELETE FROM llm_profiles WHERE id=?`, id); err != nil {
+				t.Errorf("cleanup profile %d failed: %v", id, err)
+			}
+			var count int
+			if err := d.QueryRow(`SELECT count(*) FROM llm_profiles WHERE id=?`, id).Scan(&count); err != nil {
+				t.Errorf("query residual profile %d failed: %v", id, err)
+			}
+			if count != 0 {
+				t.Errorf("profile %d residual found after cleanup", id)
+			}
+		})
 		return id
 	}
 	lo := mk("t-pool-lo", 1, false, "k1")

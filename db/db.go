@@ -167,11 +167,15 @@ func (d *DB) seedBuiltins() error {
 	// Default-on interactive_shell for the runtime agents (planner/worker/mainagent/auto)
 	// ONCE — respects a later user toggle-off (guarded by a settings flag). goals(one-shot
 	// decomposer) stays off.
-	if v, _, _ := d.GetSetting("interactive_shell_default_v1"); v != "true" {
+	if v, ok, err := d.GetSetting("interactive_shell_default_v1"); err != nil {
+		return fmt.Errorf("read interactive_shell_default_v1 setting: %w", err)
+	} else if !ok || v != "true" {
 		if _, err := d.Exec(`UPDATE agents SET interactive_shell = TRUE WHERE ` + "`key`" + ` IN ('planner','worker','mainagent','auto')`); err != nil {
 			return fmt.Errorf("seed interactive_shell defaults: %w", err)
 		}
-		_ = d.SetSetting("interactive_shell_default_v1", "true")
+		if err := d.SetSetting("interactive_shell_default_v1", "true"); err != nil {
+			return fmt.Errorf("record interactive_shell_default_v1 setting: %w", err)
+		}
 	}
 	// Seed the built-in browser (Playwright) MCP once — DISABLED by default (用户
 	// 需要时自行启用), no proxy by default. The traffic-capture toggle injects/strips
@@ -263,7 +267,9 @@ WHERE NOT EXISTS (SELECT 1 FROM mcp_servers WHERE name_hash = ?)`,
 // 多行），所以"只 seed 一次"由 settings 开关 + 按 (kind, pattern) 的存在性判定
 // 共同保证：开关行万一丢了（比如上次启动 seed 到一半崩溃），也不会插出重复规则。
 func (d *DB) seedDefaultAssetInterceptRules() error {
-	if v, _, _ := d.GetSetting("asset_intercept_default_rules_v1"); v == "done" {
+	if v, ok, err := d.GetSetting("asset_intercept_default_rules_v1"); err != nil {
+		return fmt.Errorf("read asset_intercept_default_rules_v1 setting: %w", err)
+	} else if ok && v == "done" {
 		return nil
 	}
 	rules := []struct {
@@ -381,7 +387,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 // first startup. The seed is gated by a settings flag so user edits (disable,
 // delete, re-order) are never overwritten on subsequent restarts.
 func (d *DB) seedDefaultInterceptRules() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v1"); v == "done" {
+	if v, ok, err := d.GetSetting("intercept_default_rules_v1"); err != nil {
+		return fmt.Errorf("read intercept_default_rules_v1 setting: %w", err)
+	} else if ok && v == "done" {
 		return nil
 	}
 	rules := []interceptRuleSeed{
@@ -596,7 +604,9 @@ func (d *DB) seedDefaultInterceptRules() error {
 // curl/wget/nc pipe pattern mis-fires on legitimate CTF/pentest reverse-shell and
 // data-transfer pipes); enable it manually when exfil gating is actually wanted.
 func (d *DB) seedDefaultInterceptRulesV2() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v2"); v == "done" {
+	if v, ok, err := d.GetSetting("intercept_default_rules_v2"); err != nil {
+		return fmt.Errorf("read intercept_default_rules_v2 setting: %w", err)
+	} else if ok && v == "done" {
 		return nil
 	}
 	rules := []interceptRuleSeed{
@@ -643,7 +653,9 @@ func (d *DB) seedDefaultInterceptRulesV2() error {
 const deleteEndpointPathPattern = `(?i)/(?:(?:delete|remove|unlink|erase|destroy)[-\w]*|del)(?:[/?#"'\s]|$)`
 
 func (d *DB) seedDefaultInterceptRulesV3() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v3"); v == "done" {
+	if v, ok, err := d.GetSetting("intercept_default_rules_v3"); err != nil {
+		return fmt.Errorf("read intercept_default_rules_v3 setting: %w", err)
+	} else if ok && v == "done" {
 		return nil
 	}
 	const name = "[内置] 删除类接口路径"
