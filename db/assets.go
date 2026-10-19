@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -566,6 +567,11 @@ func parseTaskIDArray(raw string) ([]int64, error) {
 	var items []any
 	if err := dec.Decode(&items); err != nil {
 		return nil, fmt.Errorf("assets: task_ids is not a JSON array (%q): %w", raw, err)
+	}
+	// 严格校验完整 JSON 输入：确保首个合法 JSON 值之后不存在任何多余的非空白内容或连续第二个值（RR1）
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("assets: task_ids contains trailing garbage or multiple JSON values (%q)", raw)
 	}
 	out := make([]int64, 0, len(items))
 	for i, item := range items {

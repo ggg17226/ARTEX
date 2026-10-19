@@ -3199,6 +3199,10 @@ func TestAssets_TaskIDsPreserveInt64Precision(t *testing.T) {
 			{name: "int64 overflow", raw: "[9223372036854775808]", wantErr: true},
 			{name: "null element", raw: "[null]", wantErr: true},
 			{name: "text element", raw: `["abc"]`, wantErr: true},
+			{name: "multiple json values", raw: `[9007199254740993] [17]`, wantErr: true},
+			{name: "trailing garbage", raw: `[]garbage`, wantErr: true},
+			{name: "null with trailing value", raw: `null [9007199254740993]`, wantErr: true},
+			{name: "valid array with trailing spaces", raw: " [9007199254740993] \n\t ", wantErr: false},
 		} {
 			_, err := assetUnionTaskIDs(tc.raw, nil)
 			if tc.wantErr && err == nil {
