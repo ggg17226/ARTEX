@@ -612,12 +612,17 @@ func (s *AssetStore) QueryDSLInScope(dsl, typ string, taskID int64, limit, offse
 	if err != nil {
 		return nil, err
 	}
-	// scopeTargetCTE 的入参在 SQL 文本最前面，所以 args 先放 taskID，再接 DSL 参数。
+	// scopeTargetCTE 的入参在 SQL 文本最前面：先绑定 CTE（context_tasks 两处 task_id
+	// + 网段区间参数），再接 DSL 参数。
+	cte, cteArgs, err := s.scopeTargetCTEFor(taskID)
+	if err != nil {
+		return nil, err
+	}
 	where, dslArgs, err := buildDSLWhereBase(node, 1)
 	if err != nil {
 		return nil, err
 	}
-	args := []any{taskID}
+	args := append([]any{}, cteArgs...)
 	args = append(args, dslArgs...)
 	if typ != "" {
 		args = append(args, typ)
@@ -625,7 +630,7 @@ func (s *AssetStore) QueryDSLInScope(dsl, typ string, taskID int64, limit, offse
 	}
 	where += " AND id IN (SELECT id FROM target)"
 	args = append(args, limit, offset)
-	q := `WITH ` + scopeTargetCTE + ` ` + assetSelectCols + " WHERE " + where +
+	q := `WITH ` + cte + ` ` + assetSelectCols + " WHERE " + where +
 		" ORDER BY last_seen DESC, id DESC LIMIT ? OFFSET ?"
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -653,8 +658,11 @@ func (s *AssetStore) GetByIDsInScope(taskID int64, ids []int64) ([]*Asset, error
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, taskID) // scopeTargetCTE 先绑定 taskID
+	cte, cteArgs, err := s.scopeTargetCTEFor(taskID)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]any{}, cteArgs...) // scopeTargetCTE 先绑定 context_tasks 与网段区间
 	placeholders := make([]string, len(ids))
 	for i := range ids {
 		placeholders[i] = "?"
@@ -662,7 +670,7 @@ func (s *AssetStore) GetByIDsInScope(taskID int64, ids []int64) ([]*Asset, error
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	q := `WITH ` + scopeTargetCTE + ` ` + assetSelectCols +
+	q := `WITH ` + cte + ` ` + assetSelectCols +
 		" WHERE id IN (" + strings.Join(placeholders, ",") + ")" +
 		" AND id IN (SELECT id FROM target) ORDER BY last_seen DESC, id DESC"
 	rows, err := s.db.Query(q, args...)

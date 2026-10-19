@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/db/lockorder"
 )
 
 var ErrDanglingReferenceRemaining = errors.New("cascade_executor: dangling reference remaining after cascade execution")
@@ -45,204 +48,435 @@ func newAudit(kind string, id uint64) *CascadeExecutionAudit {
 	}
 }
 
-// ExecuteTaskCascade 在事务内按逆拓扑序执行 Task 级联清理
+// ---------------------------------------------------------------------------
+// Task 级联执行器（P08-02 Task 2.3，闭环 F03：写集收敛）
+//
+// 红线：**本执行器不写任何开放范围 DML**。每一条 UPDATE / DELETE 都必须由
+// `narrowWriter` 生成，形如
+//
+//	DELETE FROM <table> WHERE <catalog 物理 PK 列> IN (?, ?, ...)
+//	UPDATE <table> SET <col> = NULL  WHERE <catalog 物理 PK 列> IN (?, ?, ...)
+//
+// 且绑定的 PK 必须落在**本次已经悲观锁定的物理 PK 集合**内（由闭包 LockPlan 提供）。
+// 越界（例如 `UPDATE activity SET node_id = NULL WHERE node_id IN (...)` 或
+// `DELETE FROM task_asset_links WHERE task_id = ?`）会在运行期直接返回
+// ErrCascadeWriteSetEscaped —— 跨根行要么原样存活，要么先被闭包枚举 + 纳锁。
+// ---------------------------------------------------------------------------
+
+// ErrCascadeWriteSetEscaped 表示 executor 试图修改未纳入本次锁计划的物理行。
+var ErrCascadeWriteSetEscaped = errors.New("cascade_executor: DML escaped the locked physical PK set")
+
+// ErrCascadeUnknownTable 表示级联写集引用了 lockorder 目录之外的表。
+var ErrCascadeUnknownTable = errors.New("cascade_executor: table is not in the lock-order catalog")
+
+// CascadeStatementRecord 是 executor 发出的**每一条** DML 的完整事实。
+// 测试据此断言"写集收敛于已锁 PK 集合"与"跨根行未被越界改写"。
+type CascadeStatementRecord struct {
+	RootKind      string
+	RootID        uint64
+	Table         string
+	PKColumn      string
+	Verb          string // "delete" | "update"
+	Columns       []string
+	SQL           string
+	PKs           []uint64
+	FromLockedSet bool // 绑定 PK 是否全部来自已锁集合（越界即报错，正常路径恒为 true）
+
+	extraArgs []any // SET 子句绑定的值（排在 PK 列表之前）
+}
+
+// CascadeStatementHook 是交付给测试的观测钩子（默认 nil，生产零开销）。
+// 非 nil 时 executor 每发出一条 DML 前同步回调一次；回调内不得执行 SQL。
+var CascadeStatementHook func(CascadeStatementRecord)
+
+// cascadeDMLChunk 是单条 IN 列表绑定的最大物理 PK 数：既保证"绑定完整物理 PK 列表"，
+// 又避免一次语句把上万个占位符压进同一条 SQL。
+const cascadeDMLChunk = 512
+
+type cascadeExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// narrowWriter 是级联执行器的**唯一** DML 出口。
+type narrowWriter struct {
+	ctx      context.Context
+	tx       cascadeExecer
+	audit    *CascadeExecutionAudit
+	rootKind string
+	rootID   uint64
+	locked   map[string]map[uint64]struct{} // table → 已锁物理 PK 集合
+}
+
+func newNarrowWriter(ctx context.Context, tx cascadeExecer, audit *CascadeExecutionAudit, plan []lockorder.EntityKey) (*narrowWriter, error) {
+	w := &narrowWriter{
+		ctx:      ctx,
+		tx:       tx,
+		audit:    audit,
+		rootKind: audit.RootKind,
+		rootID:   audit.RootID,
+		locked:   make(map[string]map[uint64]struct{}, len(plan)),
+	}
+	for _, key := range plan {
+		meta, err := lockorder.LookupTableOrder(key.Table)
+		if err != nil {
+			return nil, err
+		}
+		if w.locked[meta.Name] == nil {
+			w.locked[meta.Name] = make(map[uint64]struct{})
+		}
+		w.locked[meta.Name][key.PK] = struct{}{}
+	}
+	return w, nil
+}
+
+// allowExtra 把"已枚举但未纳锁"的记账表写集并入收敛集合（当前只有 llm_records：
+// 持续追加的记账表若纳入成员复核，运行中的任务会永远漂移到重试耗尽）。
+func (w *narrowWriter) allowExtra(table string, pks []uint64) {
+	if w.locked[table] == nil {
+		w.locked[table] = make(map[uint64]struct{}, len(pks))
+	}
+	for _, pk := range pks {
+		w.locked[table][pk] = struct{}{}
+	}
+}
+
+// check 校验目标表在 Catalog 内，且绑定 PK 全部落在收敛集合内。
+func (w *narrowWriter) check(table string, pks []uint64) (string, error) {
+	meta, err := lockorder.LookupTableName(table)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", ErrCascadeUnknownTable, table)
+	}
+	allowed := w.locked[table]
+	for _, pk := range pks {
+		if _, ok := allowed[pk]; !ok {
+			return "", fmt.Errorf("%w: table %s pk %d is not in the locked set of %s %d",
+				ErrCascadeWriteSetEscaped, table, pk, w.rootKind, w.rootID)
+		}
+	}
+	return meta.PKColumn, nil
+}
+
+func (w *narrowWriter) emit(rec CascadeStatementRecord) error {
+	if CascadeStatementHook != nil {
+		CascadeStatementHook(rec)
+	}
+	res, err := w.tx.ExecContext(w.ctx, rec.SQL, rec.args()...)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", rec.Verb, rec.Table, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rec.Verb == "delete" {
+		w.audit.EntitiesDeleted[rec.Table] += rows
+		return nil
+	}
+	w.audit.EntitiesUpdated[rec.Table+"."+strings.Join(rec.Columns, "+")] += rows
+	return nil
+}
+
+// deleteByPK 按物理 PK 集合分片删除。
+func (w *narrowWriter) deleteByPK(table string, pks []uint64) error {
+	normalized := dedupeSortedUint64(pks)
+	if len(normalized) == 0 {
+		return nil
+	}
+	pkCol, err := w.check(table, normalized)
+	if err != nil {
+		return err
+	}
+	for _, chunk := range chunkUint64(normalized, cascadeDMLChunk) {
+		if err := w.emit(CascadeStatementRecord{
+			RootKind: w.rootKind, RootID: w.rootID,
+			Table: table, PKColumn: pkCol, Verb: "delete",
+			SQL:           "DELETE FROM " + table + " WHERE " + pkCol + " IN (" + cascadePlaceholders(len(chunk)) + ")",
+			PKs:           chunk,
+			FromLockedSet: true,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// nullifyByPK 把指定列置 NULL，且只作用于给定物理 PK 集合。
+func (w *narrowWriter) nullifyByPK(table string, columns []string, pks []uint64) error {
+	if len(columns) == 0 {
+		return errors.New("cascade_executor: nullify requires at least one column")
+	}
+	normalized := dedupeSortedUint64(pks)
+	if len(normalized) == 0 {
+		return nil
+	}
+	pkCol, err := w.check(table, normalized)
+	if err != nil {
+		return err
+	}
+	sets := make([]string, 0, len(columns))
+	for _, col := range columns {
+		if !isSafeColumnName(col) {
+			return fmt.Errorf("cascade_executor: illegal column name %q", col)
+		}
+		sets = append(sets, col+" = NULL")
+	}
+	for _, chunk := range chunkUint64(normalized, cascadeDMLChunk) {
+		if err := w.emit(CascadeStatementRecord{
+			RootKind: w.rootKind, RootID: w.rootID,
+			Table: table, PKColumn: pkCol, Verb: "update", Columns: columns,
+			SQL: "UPDATE " + table + " SET " + strings.Join(sets, ", ") +
+				" WHERE " + pkCol + " IN (" + cascadePlaceholders(len(chunk)) + ")",
+			PKs:           chunk,
+			FromLockedSet: true,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updateRowByPK 写回单行（setExpr 自带占位符，其绑定值排在 PK 之前）。
+func (w *narrowWriter) updateRowByPK(table, column, setExpr string, pk uint64, args ...any) error {
+	if !isSafeColumnName(column) {
+		return fmt.Errorf("cascade_executor: illegal column name %q", column)
+	}
+	pkCol, err := w.check(table, []uint64{pk})
+	if err != nil {
+		return err
+	}
+	return w.emit(CascadeStatementRecord{
+		RootKind: w.rootKind, RootID: w.rootID,
+		Table: table, PKColumn: pkCol, Verb: "update", Columns: []string{column},
+		SQL:           "UPDATE " + table + " SET " + setExpr + " WHERE " + pkCol + " = ?",
+		PKs:           []uint64{pk},
+		FromLockedSet: true,
+		extraArgs:     args,
+	})
+}
+
+// ExecuteTaskCascade 在事务内按逆拓扑序执行 Task 级联清理；
+// 全部 DML 收敛于闭包锁计划给出的物理 PK 集合（见文件头红线说明）。
 func ExecuteTaskCascade(ctx context.Context, tx *sql.Tx, closure *TaskCascadeClosure) (*CascadeExecutionAudit, error) {
+	return executeTaskCascade(ctx, tx, closure, func(ctx context.Context) error {
+		return AssertNoOrphansForTask(ctx, tx, closure.TaskID, closure.ExplorationID)
+	})
+}
+
+// executeTaskCascade 是执行器的可测内核：DML 经 cascadeExecer 接口下发、防悬空断言
+// 经回调注入，用例因此可以在**没有真实数据库**的情况下捕获 executor 发出的每一条
+// 语句，断言"全部 UPDATE / DELETE 都收敛在已锁物理 PK 集合内"。
+func executeTaskCascade(
+	ctx context.Context,
+	tx cascadeExecer,
+	closure *TaskCascadeClosure,
+	assertOrphans func(ctx context.Context) error,
+) (*CascadeExecutionAudit, error) {
 	if err := closure.Validate(); err != nil {
 		return nil, err
 	}
 	audit := newAudit("task", closure.TaskID)
+	plan, err := closure.LockPlan()
+	if err != nil {
+		return nil, err
+	}
+	w, err := newNarrowWriter(ctx, tx, audit, plan)
+	if err != nil {
+		return nil, err
+	}
+	// llm_records 是记账表：写集来自显式枚举，不参与成员复核。
+	w.allowExtra("llm_records", closure.LLMRecordIDs)
 
-	// Step 1: SET NULL 弱关联字段，解除外键依赖
-	// 1.1 置空 findings.node_id
-	if len(closure.NodeIDs) > 0 {
-		res, err := tx.ExecContext(ctx, `UPDATE findings SET node_id = NULL WHERE node_id IN (`+closurePlaceholders(len(closure.NodeIDs))+`)`, uint64Args(closure.NodeIDs)...)
-		if err != nil {
-			return nil, fmt.Errorf("nullify findings.node_id: %w", err)
+	// Step 1: 记账表（可选）
+	if closure.Options.DeleteLLMRecords {
+		if err := w.deleteByPK("llm_records", closure.LLMRecordIDs); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesUpdated["findings.node_id"] = rows
-	}
-	// 1.2 置空 findings.task_id
-	{
-		res, err := tx.ExecContext(ctx, `UPDATE findings SET task_id = NULL WHERE task_id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("nullify findings.task_id: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesUpdated["findings.task_id"] = rows
-	}
-	// 1.3 置空 activity.node_id
-	if len(closure.NodeIDs) > 0 {
-		res, err := tx.ExecContext(ctx, `UPDATE activity SET node_id = NULL WHERE node_id IN (`+closurePlaceholders(len(closure.NodeIDs))+`)`, uint64Args(closure.NodeIDs)...)
-		if err != nil {
-			return nil, fmt.Errorf("nullify activity.node_id: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesUpdated["activity.node_id"] = rows
-	}
-	// 1.4 置空 task_asset_links.source_node_id
-	if len(closure.NodeIDs) > 0 {
-		res, err := tx.ExecContext(ctx, `UPDATE task_asset_links SET source_node_id = NULL WHERE source_node_id IN (`+closurePlaceholders(len(closure.NodeIDs))+`)`, uint64Args(closure.NodeIDs)...)
-		if err != nil {
-			return nil, fmt.Errorf("nullify task_asset_links.source_node_id: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesUpdated["task_asset_links.source_node_id"] = rows
 	}
 
-	// Step 2: 逆拓扑删除底层叶子
-	// 2.1 side_question_requests
-	if len(closure.SideSessionKeys) > 0 {
-		res, err := tx.ExecContext(ctx, `DELETE FROM side_question_requests WHERE session_key IN (`+closurePlaceholders(len(closure.SideSessionKeys))+`)`, stringArgs(closure.SideSessionKeys)...)
-		if err != nil {
-			return nil, fmt.Errorf("delete side_question_requests: %w", err)
+	// Step 2: findings —— 整行删除，或按列置空（同行两列都要置空时只发一条语句）
+	if closure.Options.DeleteFindings {
+		if err := w.deleteByPK("findings", closure.FindingIDs); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["side_question_requests"] = rows
-	}
-	// 2.2 side_question_sessions
-	if len(closure.SideSessionKeys) > 0 {
-		res, err := tx.ExecContext(ctx, `DELETE FROM side_question_sessions WHERE session_key IN (`+closurePlaceholders(len(closure.SideSessionKeys))+`)`, stringArgs(closure.SideSessionKeys)...)
-		if err != nil {
-			return nil, fmt.Errorf("delete side_question_sessions: %w", err)
+	} else {
+		both, onlyTask, onlyNode := splitFindingNullify(closure)
+		if err := w.nullifyByPK("findings", []string{"task_id"}, onlyTask); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["side_question_sessions"] = rows
-	}
-	// 2.3 exploration_anchors
-	if len(closure.NodeIDs) > 0 {
-		res, err := tx.ExecContext(ctx, `DELETE FROM exploration_anchors WHERE node_id IN (`+closurePlaceholders(len(closure.NodeIDs))+`)`, uint64Args(closure.NodeIDs)...)
-		if err != nil {
-			return nil, fmt.Errorf("delete exploration_anchors: %w", err)
+		if err := w.nullifyByPK("findings", []string{"node_id"}, onlyNode); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["exploration_anchors"] = rows
-	}
-	// 2.4 exploration_edges
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM exploration_edges WHERE exploration_id = ?`, closure.ExplorationID)
-		if err != nil {
-			return nil, fmt.Errorf("delete exploration_edges: %w", err)
+		if err := w.nullifyByPK("findings", []string{"task_id", "node_id"}, both); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["exploration_edges"] = rows
-	}
-	// 2.5 task_constraints
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_constraints WHERE exploration_id = ?`, closure.ExplorationID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_constraints: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_constraints"] = rows
-	}
-	// 2.6 activity
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM activity WHERE exploration_id = ?`, closure.ExplorationID)
-		if err != nil {
-			return nil, fmt.Errorf("delete activity: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["activity"] = rows
-	}
-	// 2.7 main_sessions
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM main_sessions WHERE exploration_id = ?`, closure.ExplorationID)
-		if err != nil {
-			return nil, fmt.Errorf("delete main_sessions: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["main_sessions"] = rows
-	}
-	// 2.8 task_relations
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_relations WHERE task_id = ? OR source_task_id = ?`, closure.TaskID, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_relations: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_relations"] = rows
-	}
-	// 2.9 task_asset_links
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_asset_links WHERE task_id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_asset_links: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_asset_links"] = rows
-	}
-	// 2.10 task_llm_profiles
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_llm_profiles WHERE task_id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_llm_profiles: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_llm_profiles"] = rows
-	}
-	// 2.11 task_scope
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_scope WHERE task_id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_scope: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_scope"] = rows
-	}
-	// 2.12 task_intercept_rules
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_intercept_rules WHERE task_id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_intercept_rules: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_intercept_rules"] = rows
-	}
-	// 2.13 task_archives
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM task_archives WHERE task_id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete task_archives: %w", err)
-		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["task_archives"] = rows
 	}
 
-	// Step 3: 删除中间节点 exploration_nodes
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM exploration_nodes WHERE exploration_id = ?`, closure.ExplorationID)
-		if err != nil {
-			return nil, fmt.Errorf("delete exploration_nodes: %w", err)
+	// Step 3: 跨根弱关联置空（按已锁 activity.id / task_asset_links.row_id 限定）
+	if err := w.nullifyByPK("activity", []string{"node_id"}, closure.CrossRootActivityIDs); err != nil {
+		return nil, err
+	}
+	if nullifyLinks := subtractUint64(closure.CrossRootLinkIDs, closure.ForeignAssetLinkIDs); len(nullifyLinks) > 0 {
+		if err := w.nullifyByPK("task_asset_links", []string{"source_node_id"}, nullifyLinks); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["exploration_nodes"] = rows
 	}
 
-	// Step 4: 根节点删除 (tasks -> explorations)
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, closure.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("delete tasks: %w", err)
+	// Step 4: 资产双写维护 —— 共享资产只剥离本 task_id（JSON 由闭包持锁后算好）
+	for _, assetID := range closure.AssetIDsToDetach {
+		payload, ok := closure.AssetDetachJSON[assetID]
+		if !ok {
+			continue // 资产行已被并发删除：不写回，避免造出幽灵 JSON
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["tasks"] = rows
-	}
-	{
-		res, err := tx.ExecContext(ctx, `DELETE FROM explorations WHERE id = ?`, closure.ExplorationID)
-		if err != nil {
-			return nil, fmt.Errorf("delete explorations: %w", err)
+		if err := w.updateRowByPK("assets", "task_ids", "task_ids = ?", assetID, payload); err != nil {
+			return nil, err
 		}
-		rows, _ := res.RowsAffected()
-		audit.EntitiesDeleted["explorations"] = rows
 	}
 
-	// Step 5: 防悬空断言
-	if err := AssertNoOrphansForTask(ctx, tx, closure.TaskID, closure.ExplorationID); err != nil {
+	// Step 5: 跨根 link / anchor 物理清理（只含资产被物理删除的子集）
+	if err := w.deleteByPK("task_asset_links", closure.ForeignAssetLinkIDs); err != nil {
+		return nil, err
+	}
+	if err := w.deleteByPK("exploration_anchors", closure.ForeignAssetAnchorIDs); err != nil {
 		return nil, err
 	}
 
+	// Step 6: 本任务子实体逆拓扑清理
+	for _, step := range []struct {
+		table string
+		ids   []uint64
+	}{
+		{"side_question_requests", closure.SideRequestOrdinals},
+		{"side_question_sessions", closure.SideSessionRowIDs},
+		{"exploration_anchors", closure.AnchorIDs},
+		{"task_asset_links", closure.AssetLinkIDs},
+		{"activity", closure.ActivityIDs},
+		{"exploration_edges", closure.EdgeIDs},
+		{"task_constraints", closure.ConstraintIDs},
+		{"main_sessions", closure.MainSessionIDs},
+		{"task_relations", closure.RelationIDs},
+		{"task_llm_profiles", closure.LLMProfileLinkIDs},
+		{"task_scope", closure.ScopeIDs},
+		{"task_intercept_rules", closure.InterceptRuleIDs},
+		{"task_archives", closure.ArchiveIDs},
+		// Step 7: 仅本任务引用的资产物理删除（共享资产已在 Step 4 detach 并存活）
+		{"assets", closure.AssetIDsToDelete},
+		// Step 8: 中间节点与两个根
+		{"exploration_nodes", closure.NodeIDs},
+		{"tasks", []uint64{closure.TaskID}},
+		{"explorations", []uint64{closure.ExplorationID}},
+	} {
+		if err := w.deleteByPK(step.table, step.ids); err != nil {
+			return nil, err
+		}
+	}
+
+	// Step 9: 防悬空断言
+	if assertOrphans == nil {
+		assertOrphans = func(context.Context) error { return nil }
+	}
+	if err := assertOrphans(ctx); err != nil {
+		return nil, err
+	}
 	return audit, nil
+}
+
+// splitFindingNullify 把待置空的 findings 按需要置空的列分组，
+// 保证同一行只被一条 UPDATE 完整置空（两条重叠 UPDATE 的先后值不可预期）。
+func splitFindingNullify(closure *TaskCascadeClosure) (both, onlyTask, onlyNode []uint64) {
+	taskSet := make(map[uint64]struct{}, len(closure.NullifyFindingTaskIDs))
+	for _, id := range closure.NullifyFindingTaskIDs {
+		taskSet[id] = struct{}{}
+	}
+	nodeSet := make(map[uint64]struct{}, len(closure.NullifyFindingNodeIDs))
+	for _, id := range closure.NullifyFindingNodeIDs {
+		nodeSet[id] = struct{}{}
+	}
+	for id := range taskSet {
+		if _, ok := nodeSet[id]; ok {
+			both = append(both, id)
+			continue
+		}
+		onlyTask = append(onlyTask, id)
+	}
+	for id := range nodeSet {
+		if _, ok := taskSet[id]; ok {
+			continue
+		}
+		onlyNode = append(onlyNode, id)
+	}
+	return dedupeSortedUint64(both), dedupeSortedUint64(onlyTask), dedupeSortedUint64(onlyNode)
+}
+
+// subtractUint64 返回 left \ right（升序去重）。
+func subtractUint64(left, right []uint64) []uint64 {
+	if len(left) == 0 {
+		return nil
+	}
+	exclude := make(map[uint64]struct{}, len(right))
+	for _, id := range right {
+		exclude[id] = struct{}{}
+	}
+	out := make([]uint64, 0, len(left))
+	for _, id := range left {
+		if _, hit := exclude[id]; hit {
+			continue
+		}
+		out = append(out, id)
+	}
+	return dedupeSortedUint64(out)
+}
+
+func chunkUint64(ids []uint64, size int) [][]uint64 {
+	if len(ids) == 0 || size <= 0 {
+		return nil
+	}
+	out := make([][]uint64, 0, (len(ids)+size-1)/size)
+	for start := 0; start < len(ids); start += size {
+		end := start + size
+		if end > len(ids) {
+			end = len(ids)
+		}
+		cloned := make([]uint64, end-start)
+		copy(cloned, ids[start:end])
+		out = append(out, cloned)
+	}
+	return out
+}
+
+func cascadePlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, n*2-1)
+	for i := 0; i < n; i++ {
+		b[i*2] = '?'
+		if i < n-1 {
+			b[i*2+1] = ','
+		}
+	}
+	return string(b)
+}
+
+// args 拼出真正绑定的参数：先 SET 值，后物理 PK 列表。
+func (r CascadeStatementRecord) args() []any {
+	out := make([]any, 0, len(r.extraArgs)+len(r.PKs))
+	out = append(out, r.extraArgs...)
+	for _, pk := range r.PKs {
+		out = append(out, pk)
+	}
+	return out
+}
+
+func isSafeColumnName(col string) bool {
+	if col == "" {
+		return false
+	}
+	for i, r := range col {
+		if r == '_' && i > 0 {
+			continue
+		}
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // ExecuteCompanyCascade 在事务内执行 Company 级联清理

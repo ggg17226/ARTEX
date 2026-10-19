@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -140,8 +141,8 @@ SELECT t.id, t.llm_profile_id, t.active_llm_profile_id, t.llm_chain_revision,
        p.profile_id, p.position, p.status, COALESCE(p.last_error,''), p.exhausted_at
 FROM tasks t
 LEFT JOIN task_llm_profiles p ON p.task_id=t.id
-WHERE t.id=ANY($1::bigint[])
-ORDER BY t.id, p.position NULLS LAST`, ids)
+WHERE t.id IN (`+inPlaceholders(len(ids))+`)
+ORDER BY t.id, (p.position IS NULL), p.position`, int64Args(ids)...)
 	if err != nil {
 		return err
 	}
@@ -193,8 +194,8 @@ ORDER BY t.id, p.position NULLS LAST`, ids)
 	rows, err = d.Query(`
 SELECT task_id, source_task_id
 FROM task_relations
-WHERE task_id=ANY($1::bigint[])
-ORDER BY task_id, created_at, source_task_id`, ids)
+WHERE task_id IN (`+inPlaceholders(len(ids))+`)
+ORDER BY task_id, created_at, source_task_id`, int64Args(ids)...)
 	if err != nil {
 		return err
 	}
@@ -217,8 +218,8 @@ ORDER BY task_id, created_at, source_task_id`, ids)
 	rows, err = d.Query(`
 SELECT task_id, company_id
 FROM task_scope
-WHERE task_id=ANY($1::bigint[]) AND kind='company' AND company_id IS NOT NULL
-ORDER BY task_id, id`, ids)
+WHERE task_id IN (`+inPlaceholders(len(ids))+`) AND kind='company' AND company_id IS NOT NULL
+ORDER BY task_id, id`, int64Args(ids)...)
 	if err != nil {
 		return err
 	}
@@ -263,8 +264,8 @@ SELECT t.llm_profile_id, t.active_llm_profile_id, t.llm_chain_revision,
        p.profile_id, p.position, p.status, COALESCE(p.last_error,''), p.exhausted_at
 FROM tasks t
 LEFT JOIN task_llm_profiles p ON p.task_id=t.id
-WHERE t.id=$1
-ORDER BY p.position NULLS LAST`, taskID)
+WHERE t.id=?
+ORDER BY (p.position IS NULL), p.position`, taskID)
 	if err != nil {
 		return nil, nil, 0, nil, err
 	}
@@ -321,7 +322,7 @@ ORDER BY p.position NULLS LAST`, taskID)
 }
 
 func (d *DB) TaskSourceIDs(taskID int64) ([]int64, error) {
-	rows, err := d.Query(`SELECT source_task_id FROM task_relations WHERE task_id=$1 ORDER BY created_at, source_task_id`, taskID)
+	rows, err := d.Query(`SELECT source_task_id FROM task_relations WHERE task_id=? ORDER BY created_at, source_task_id`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +343,7 @@ func (d *DB) TaskSourceIDs(taskID int64) ([]int64, error) {
 func (d *DB) TaskCompanyIDs(taskID int64) ([]int64, error) {
 	rows, err := d.Query(`
 SELECT company_id FROM task_scope
-WHERE task_id=$1 AND kind='company' AND company_id IS NOT NULL
+WHERE task_id=? AND kind='company' AND company_id IS NOT NULL
 ORDER BY id`, taskID)
 	if err != nil {
 		return nil, err
@@ -364,7 +365,7 @@ func (d *DB) TaskSources(taskID int64) ([]TaskSource, error) {
 SELECT t.id, t.exploration_id, t.description, t.goal, t.status
 FROM task_relations r
 JOIN tasks t ON t.id=r.source_task_id AND t.deleted_at IS NULL
-WHERE r.task_id=$1
+WHERE r.task_id=?
 ORDER BY r.created_at, r.source_task_id`, taskID)
 	if err != nil {
 		return nil, err
@@ -383,7 +384,7 @@ ORDER BY r.created_at, r.source_task_id`, taskID)
 
 func (d *DB) TaskLLMProfiles(taskID int64) ([]TaskLLMProfile, error) {
 	rows, err := d.Query(`SELECT profile_id, position, status, COALESCE(last_error,''), exhausted_at
-FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, taskID)
+FROM task_llm_profiles WHERE task_id=? ORDER BY position`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -404,52 +405,45 @@ FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, taskID)
 // agent-binding/global fallback behavior.
 // 终态(done/failed/timeout)任务同样允许改链:任务结束后主 Agent 对话仍会走这条链,
 // 链上模型不可用时必须能换,否则已完成任务就再也没法交互了。
+// ReplaceTaskLLMProfiles 是任务子实体（LLM 链）写者：业务门禁 → 行锁父任务并核验
+// 存活 → 删旧链 → 插新链 → 移动游标。整笔事务在 TxRunner 内整体重放，绝不会出现
+// "链删了、新链没插上"的中间态被别的写者读到。
 func (d *DB) ReplaceTaskLLMProfiles(taskID int64, profileIDs []int64, activeProfileID int64) error {
-	tx, err := d.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Keep the task -> profile lock order shared by all task LLM mutations and
-	// DeleteProfile. Inserts below may take KEY SHARE locks on llm_profiles for
-	// their foreign keys, so the task row must be locked before any of them.
-	var lockedID int64
-	if err := tx.QueryRow(`SELECT id FROM tasks WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, taskID).Scan(&lockedID); err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("task %d not found", taskID)
+	err := d.runTaskChildWriter(taskID, func(ctx context.Context, tx *sql.Tx) error {
+		// Keep the task -> profile lock order shared by all task LLM mutations and
+		// DeleteProfile: the task row is already locked by the writer protocol, so
+		// the KEY SHARE locks the inserts take on llm_profiles come strictly after.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM task_llm_profiles WHERE task_id=?`, taskID); err != nil {
+			return err
 		}
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM task_llm_profiles WHERE task_id=$1`, taskID); err != nil {
-		return err
-	}
-	if err := insertTaskLLMProfiles(tx, taskID, profileIDs); err != nil {
-		return err
-	}
-	if len(profileIDs) == 0 {
-		activeProfileID = 0
-	} else if activeProfileID == 0 {
-		activeProfileID = profileIDs[0]
-	}
-	if activeProfileID > 0 {
-		found := false
-		for _, id := range profileIDs {
-			found = found || id == activeProfileID
+		if err := insertTaskLLMProfiles(tx, taskID, profileIDs); err != nil {
+			return err
 		}
-		if !found {
-			return fmt.Errorf("active LLM profile %d is not in the task chain", activeProfileID)
+		if len(profileIDs) == 0 {
+			activeProfileID = 0
+		} else if activeProfileID == 0 {
+			activeProfileID = profileIDs[0]
 		}
-	}
-	var active any
-	if activeProfileID > 0 {
-		active = activeProfileID
-	}
-	if _, err := tx.Exec(`UPDATE tasks
-SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_revision+1
-WHERE id=$1`, taskID, active); err != nil {
+		if activeProfileID > 0 {
+			found := false
+			for _, id := range profileIDs {
+				found = found || id == activeProfileID
+			}
+			if !found {
+				return fmt.Errorf("active LLM profile %d is not in the task chain", activeProfileID)
+			}
+		}
+		var active any
+		if activeProfileID > 0 {
+			active = activeProfileID
+		}
+		_, err := tx.ExecContext(ctx, `
+UPDATE tasks
+SET active_llm_profile_id=?, llm_profile_id=?, llm_chain_revision=llm_chain_revision+1, updated_at=NOW(3)
+WHERE id=?`, active, active, taskID)
 		return err
-	}
-	return tx.Commit()
+	})
+	return mapTaskWriterGone(err)
 }
 
 // MarkTaskLLMProfileQuotaExhausted advances the shared task cursor once. A late
@@ -467,81 +461,83 @@ func (d *DB) MarkTaskLLMProfileQuotaExhaustedAtRevision(taskID, profileID, revis
 
 func (d *DB) markTaskLLMProfileQuotaExhausted(taskID, profileID, revision int64, checkRevision bool, reason string) (TaskLLMTransition, error) {
 	var out TaskLLMTransition
-	tx, err := d.Begin()
-	if err != nil {
-		return out, err
-	}
-	defer tx.Rollback()
-	var (
-		active          sql.NullInt64
-		currentRevision int64
-	)
-	if err := tx.QueryRow(`SELECT active_llm_profile_id, llm_chain_revision FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&active, &currentRevision); err != nil {
-		return out, err
-	}
-	out.PreviousProfileID = profileID
-	if checkRevision && revision != currentRevision {
-		out.Stale = true
-		return out, tx.Commit()
-	}
-	var (
-		position    int
-		entryStatus string
-	)
-	if err := tx.QueryRow(`SELECT position, status FROM task_llm_profiles WHERE task_id=$1 AND profile_id=$2`, taskID, profileID).
-		Scan(&position, &entryStatus); err != nil {
-		if err == sql.ErrNoRows {
-			// The chain was edited while this request was in flight. Its provider
-			// error remains valid for the caller, but it must not mutate the new chain.
-			return out, tx.Commit()
+	err := d.runTaskChildWriter(taskID, func(ctx context.Context, tx *sql.Tx) error {
+		var (
+			active          sql.NullInt64
+			currentRevision int64
+		)
+		// 父任务行已由写者协议锁定，这里就是"锁内读"，等价于旧的 SELECT … FOR UPDATE。
+		if err := tx.QueryRow(`SELECT active_llm_profile_id, llm_chain_revision FROM tasks WHERE id=?`, taskID).Scan(&active, &currentRevision); err != nil {
+			return err
 		}
-		return out, err
-	}
-	// Once the cursor reached the end, late failures must be idempotent. This also
-	// prevents an older in-flight request from reviving a ready entry before a
-	// manually selected starting position.
-	if !active.Valid {
-		out.ChainExhausted = true
-		return out, tx.Commit()
-	}
-	reason = truncateUTF8(strings.TrimSpace(reason), 1000)
-	if entryStatus != "quota_exhausted" {
-		if _, err := tx.Exec(`UPDATE task_llm_profiles
-SET status='quota_exhausted', last_error=$3, exhausted_at=now()
-WHERE task_id=$1 AND profile_id=$2`, taskID, profileID, reason); err != nil {
-			return out, err
+		out.PreviousProfileID = profileID
+		if checkRevision && revision != currentRevision {
+			out.Stale = true
+			return nil
 		}
-	}
-	if active.Valid && active.Int64 != profileID {
-		next := active.Int64
-		out.NextProfileID = &next
-		return out, tx.Commit()
-	}
-	var next int64
-	err = tx.QueryRow(`SELECT profile_id FROM task_llm_profiles
-WHERE task_id=$1 AND position>$2 AND status='ready'
+		var (
+			position    int
+			entryStatus string
+		)
+		if err := tx.QueryRow(`SELECT position, status FROM task_llm_profiles WHERE task_id=? AND profile_id=?`, taskID, profileID).
+			Scan(&position, &entryStatus); err != nil {
+			if err == sql.ErrNoRows {
+				// The chain was edited while this request was in flight. Its provider
+				// error remains valid for the caller, but it must not mutate the new chain.
+				return nil
+			}
+			return err
+		}
+		// Once the cursor reached the end, late failures must be idempotent. This also
+		// prevents an older in-flight request from reviving a ready entry before a
+		// manually selected starting position.
+		if !active.Valid {
+			out.ChainExhausted = true
+			return nil
+		}
+		reason = truncateUTF8(strings.TrimSpace(reason), 1000)
+		if entryStatus != "quota_exhausted" {
+			if _, err := tx.Exec(`UPDATE task_llm_profiles
+SET status='quota_exhausted', last_error=?, exhausted_at=NOW(3), updated_at=NOW(3)
+WHERE task_id=? AND profile_id=?`, reason, taskID, profileID); err != nil {
+				return err
+			}
+		}
+		if active.Valid && active.Int64 != profileID {
+			next := active.Int64
+			out.NextProfileID = &next
+			return nil
+		}
+		var next int64
+		err := tx.QueryRow(`SELECT profile_id FROM task_llm_profiles
+WHERE task_id=? AND position > ? AND status='ready'
 ORDER BY position LIMIT 1`, taskID, position).Scan(&next)
-	switch err {
-	case nil:
-		out.Advanced = true
-		out.NextProfileID = &next
-		if _, err := tx.Exec(`UPDATE tasks
-				SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_revision+1
-				WHERE id=$1`, taskID, next); err != nil {
-			return out, err
+		switch err {
+		case nil:
+			out.Advanced = true
+			out.NextProfileID = &next
+			if _, err := tx.Exec(`UPDATE tasks
+				SET active_llm_profile_id=?, llm_profile_id=?, llm_chain_revision=llm_chain_revision+1, updated_at=NOW(3)
+				WHERE id=?`, next, next, taskID); err != nil {
+				return err
+			}
+		case sql.ErrNoRows:
+			out.Advanced = true
+			out.ChainExhausted = true
+			if _, err := tx.Exec(`UPDATE tasks
+				SET active_llm_profile_id=NULL, llm_profile_id=NULL, llm_chain_revision=llm_chain_revision+1, updated_at=NOW(3)
+				WHERE id=?`, taskID); err != nil {
+				return err
+			}
+		default:
+			return err
 		}
-	case sql.ErrNoRows:
-		out.Advanced = true
-		out.ChainExhausted = true
-		if _, err := tx.Exec(`UPDATE tasks
-				SET active_llm_profile_id=NULL, llm_profile_id=NULL, llm_chain_revision=llm_chain_revision+1
-				WHERE id=$1`, taskID); err != nil {
-			return out, err
-		}
-	default:
-		return out, err
+		return nil
+	})
+	if err != nil {
+		return out, mapTaskWriterGone(err)
 	}
-	return out, tx.Commit()
+	return out, nil
 }
 
 func truncateUTF8(value string, maxBytes int) string {
@@ -561,15 +557,15 @@ func truncateUTF8(value string, maxBytes int) string {
 
 func (s *ExplorationStore) SetIntentBlockedReason(id int64, reason string) error {
 	_, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='blocked', blocked_reason=NULLIF($1,''), completed_at=now()
-WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
+SET state='blocked', blocked_reason=NULLIF(?,''), completed_at=NOW(3), updated_at=NOW(3)
+WHERE id=? AND exploration_id=? AND kind='intent'`, reason, id, s.expID)
 	return err
 }
 
 func (s *ExplorationStore) ReopenIntentsByBlockedReason(reason string) (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='open', blocked_reason=NULL, completed_at=NULL
-WHERE exploration_id=$1 AND kind='intent' AND state='blocked' AND blocked_reason=$2`, s.expID, reason)
+SET state='open', blocked_reason=NULL, completed_at=NULL, updated_at=NOW(3)
+WHERE exploration_id=? AND kind='intent' AND state='blocked' AND blocked_reason=?`, s.expID, reason)
 	if err != nil {
 		return 0, err
 	}

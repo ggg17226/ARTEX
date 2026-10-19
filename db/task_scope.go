@@ -1,11 +1,15 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/Autumn-27/artex/db/schema"
 )
 
 // TaskScope is one row of a task's test scope — the coverage denominator and the
@@ -80,24 +84,40 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 	if src == "" {
 		src = "auto"
 	}
+	// task_scope 的幂等性由 uq_task_scope_identity（identity_hash BINARY(32)）表达：
+	// PG 的 `ON CONFLICT DO NOTHING` 在 TiDB 上换成
+	// `ON DUPLICATE KEY UPDATE identity = identity`（同值自赋 → affected rows = 0），
+	// 因此 rows>0 严格等价于"本次真的插入了新范围"。identity 由 schema.TaskScopeIdentity
+	// 按原 uq_task_scope_v2 的 COALESCE 口径规范化，net 落成 CIDR **文本**（新库无 cidr 类型）。
+	identity, hash := canonicalIdentityPair(schema.TaskScopeIdentity(
+		uint64(ts.TaskID), ts.Kind, ts.Domain, ts.Net, companyIDOrZero(ts.CompanyID), ts.Value))
 	query := `
-INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
-VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
-ON CONFLICT DO NOTHING`
-	var (
-		result sql.Result
-		err    error
-	)
-	if s.tx != nil {
-		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
-	} else {
-		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
-	}
+INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason, created_at, identity, identity_hash)
+VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NOW(3), ?, ?)
+ON DUPLICATE KEY UPDATE identity = identity`
+	var inserted bool
+	err := s.withTaskChildWriter(ts.TaskID, func(_ context.Context, tx *sql.Tx) error {
+		result, err := tx.ExecContext(context.Background(), query,
+			ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason, identity, hash)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		inserted = rows > 0
+		return err
+	})
 	if err != nil {
-		return false, err
+		return false, mapTaskWriterGone(err)
 	}
-	rows, err := result.RowsAffected()
-	return rows > 0, err
+	return inserted, nil
+}
+
+// companyIDOrZero 把可空 company_id 编成 identity 需要的 0 口径（与旧 COALESCE 一致）。
+func companyIDOrZero(id *int64) uint64 {
+	if id == nil || *id <= 0 {
+		return 0
+	}
+	return uint64(*id)
 }
 
 func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
@@ -227,22 +247,30 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 // DeleteTaskScope removes a single scope row by id, scoped to the given task.
 // Returns whether a row was actually deleted.
 func (s *AssetStore) DeleteTaskScope(taskID, scopeID int64) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM task_scope WHERE id=$1 AND task_id=$2`, scopeID, taskID)
+	var deleted bool
+	err := s.withTaskChildWriter(taskID, func(_ context.Context, tx *sql.Tx) error {
+		res, err := tx.Exec(`DELETE FROM task_scope WHERE id=? AND task_id=?`, scopeID, taskID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		deleted = n > 0
+		return err
+	})
 	if err != nil {
-		return false, err
+		return false, mapTaskWriterGone(err)
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	return deleted, nil
 }
 
 // ListTaskScope returns all scope rows for a task.
 func (s *AssetStore) ListTaskScope(taskID int64) ([]TaskScope, error) {
 	rows, err := s.db.Query(`
 SELECT ts.id, ts.kind, COALESCE(ts.company_id,0), COALESCE(c.name,''), COALESCE(ts.domain,''),
-       COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
+       COALESCE(ts.net,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
 FROM task_scope ts
 LEFT JOIN companies c ON c.id=ts.company_id
-WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
+WHERE ts.task_id=? ORDER BY ts.id`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -297,45 +325,147 @@ func (s *AssetStore) CoverageEnabled(taskID int64) bool {
 		return true
 	}
 	var enabled bool
-	if err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled,true) FROM tasks WHERE id=$1`, taskID).Scan(&enabled); err != nil {
+	if err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled, 1) FROM tasks WHERE id=?`, taskID).Scan(&enabled); err != nil {
 		return true
 	}
 	return enabled
 }
 
-// task_scope→assets match predicate, reused by the count / by-type / untested queries. $1=taskID.
-const covTargetCTE = `
+// ── 覆盖度范围匹配谓词（TiDB 方言）─────────────────────────────────────────
+//
+// PG 版本用 `ts.net >>= try_inet(a.ip)` + `regexp_replace(...,'[[:space:]]+',”,'g')`。
+// 新库的 task_scope.net / company_scope.net 是 **CIDR 文本**（无 inet/cidr 类型、
+// 无 >>= 与 masklen），TiDB 也没有 REGEXP_REPLACE。口径与 Task 2.1/2.2 一致：
+//   - 网段包含：Go 侧用 netip 精确算出前缀地址区间，SQL 里做
+//     INET_ATON(V4) / INET6_ATON(V6) 的**参数绑定**范围比较；非法 IP 文本 → 函数
+//     返回 NULL → 谓词为假，与旧的 try_inet() IS NULL 跳过语义一致；
+//   - ICP 归一化：lower + 去空白（空格/制表/换行/回车），对应 [[:space:]]+ 的常用子集。
+const icpNormalizeSQL = "LOWER(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(%s, ''), ' ', ''), '\t', ''), '\n', ''), '\r', ''))"
+
+// scopeNetPredicate 汇总给定任务集合的全部 ip/cidr 范围，编译成可 OR 进查询的地址区间
+// 谓词。没有任何网段时返回常量假谓词 "0"，让调用方的 UNION 分支自然为空。
+func (s *AssetStore) scopeNetPredicate(taskIDs []int64, columns []string) (string, []any, error) {
+	if len(taskIDs) == 0 || len(columns) == 0 {
+		return "0", nil, nil
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT net FROM task_scope
+WHERE kind IN ('ip','cidr') AND net IS NOT NULL AND net <> '' AND task_id IN (`+inPlaceholders(len(taskIDs))+`)`,
+		int64Args(taskIDs)...)
+	if err != nil {
+		return "", nil, err
+	}
+	var nets []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			rows.Close()
+			return "", nil, err
+		}
+		nets = append(nets, raw)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", nil, err
+	}
+	rows.Close()
+
+	var preds []string
+	var args []any
+	for _, raw := range nets {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			continue // 脏数据行跳过：与旧的 try_inet() 跳过非法值同口径
+		}
+		prefix = prefix.Masked()
+		base := prefix.Addr().Unmap()
+		bits := prefix.Bits()
+		loBytes := base.AsSlice()
+		hiBytes := make([]byte, len(loBytes))
+		copy(hiBytes, loBytes)
+		for i := bits; i < len(hiBytes)*8; i++ {
+			hiBytes[i/8] |= 1 << (7 - i%8)
+		}
+		isV4 := base.Is4()
+		for _, col := range columns {
+			if isV4 {
+				preds = append(preds, "(INET_ATON("+col+") BETWEEN ? AND ?)")
+				args = append(args, ip4ToUint32(loBytes), ip4ToUint32(hiBytes))
+				continue
+			}
+			// IPv6 区间必须显式排除 IPv4 文本：INET6_ATON 对 IPv4 返回 4 字节，
+			// 与 16 字节边界做字节序比较会误判。
+			lo := append([]byte(nil), loBytes...)
+			hi := append([]byte(nil), hiBytes...)
+			preds = append(preds, "(INSTR("+col+", ':') > 0 AND INET6_ATON("+col+") BETWEEN ? AND ?)")
+			args = append(args, lo, hi)
+		}
+	}
+	if len(preds) == 0 {
+		return "0", nil, nil
+	}
+	return "(" + strings.Join(preds, " OR ") + ")", args, nil
+}
+
+func ip4ToUint32(b []byte) uint32 {
+	if len(b) != 4 {
+		return 0
+	}
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// covTargetCTE 生成 target/tested 两段 CTE（单任务版）。占位符顺序固定为
+// [task_id, 网段区间参数…, exploration_id]，调用方按同序绑定。
+func covTargetCTE(netPred string) string {
+	return covTargetCTEWithExpID(netPred, true)
+}
+
+// covTargetCTEWithExpID 在不需要 tested 集合（无 exploration_id）时省略第二段 CTE。
+func covTargetCTEWithExpID(netPred string, withTested bool) string {
+	const label = `COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label`
+	cte := `
 target AS (
-  SELECT DISTINCT a.id, a.type,
-         COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
+  SELECT DISTINCT a.id, a.type, ` + label + `
   FROM assets a
-  JOIN task_scope ts ON ts.task_id = $1 AND (
+  JOIN task_scope ts ON ts.task_id = ? AND (
        (ts.kind='company'     AND a.company_id = ts.company_id)
     OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
     OR (ts.kind='subdomain'   AND a.domain = ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
     OR (ts.kind='icp' AND (
-         lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
-         OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
-       ))
+         ` + fmt.Sprintf(icpNormalizeSQL, "a.icp") + ` = ts.value
+         OR ` + fmt.Sprintf(icpNormalizeSQL, "a.app_icp") + ` = ts.value
+        ))
   )
-),
+  UNION
+  SELECT DISTINCT a.id, a.type, ` + label + `
+  FROM assets a
+  WHERE ` + netPred + `
+)`
+	if !withTested {
+		return cte
+	}
+	return cte + `,
 tested AS (
   SELECT DISTINCT ea.asset_id
   FROM exploration_anchors ea
   JOIN exploration_nodes en ON en.id = ea.node_id
-  WHERE en.exploration_id = $2 AND en.kind = 'fact'
+  WHERE en.exploration_id = ? AND en.kind = 'fact'
 )`
+}
 
 // TaskCoverage computes rough per-type coverage for a task. taskID indexes
 // task_scope + assets; expID indexes the fact anchors. Reference figure only.
 func (s *AssetStore) TaskCoverage(taskID, expID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
-	_ = s.db.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=$1`, taskID).Scan(&cov.ScopeRows)
-	rows, err := s.db.Query(`WITH `+covTargetCTE+`
+	_ = s.db.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=?`, taskID).Scan(&cov.ScopeRows)
+	netPred, netArgs, err := s.scopeNetPredicate([]int64{taskID}, []string{"a.ip"})
+	if err != nil {
+		return nil, err
+	}
+	args := append([]any{taskID}, append(netArgs, expID)...)
+	rows, err := s.db.Query(`WITH `+covTargetCTE(netPred)+`
 SELECT t.type, count(*) AS total,
-       count(*) FILTER (WHERE t.id IN (SELECT asset_id FROM tested)) AS tested
-FROM target t GROUP BY t.type ORDER BY t.type`, taskID, expID)
+       COALESCE(SUM(CASE WHEN t.id IN (SELECT asset_id FROM tested) THEN 1 ELSE 0 END), 0) AS tested
+FROM target t GROUP BY t.type ORDER BY t.type`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -432,14 +562,23 @@ func (s *AssetStore) BuildCoverageGraph(taskID, _ int64) (*CoverageGraphData, er
 	if taskID <= 0 {
 		return g, nil
 	}
-	rows, err := s.db.Query(`WITH `+contextCoverageCTE+`
+	ctxIDs, err := s.contextTaskIDs(taskID)
+	if err != nil {
+		return nil, err
+	}
+	netPred, netArgs, err := s.scopeNetPredicate(ctxIDs, []string{"a.ip"})
+	if err != nil {
+		return nil, err
+	}
+	graphArgs := append([]any{taskID, taskID}, netArgs...)
+	rows, err := s.db.Query(`WITH `+contextCoverageCTE(netPred)+`
 SELECT a.id, a.type, COALESCE(a.company_id,0),
        COALESCE(a.domain,''), COALESCE(a.root_domain,''), COALESCE(a.ip,''),
        COALESCE(a.url,''), COALESCE(a.port,0), COALESCE(a.service_type,''),
        COALESCE(a.app_name,''), COALESCE(a.page_title,''), COALESCE(a.status_code,0),
        (a.id IN (SELECT asset_id FROM tested)) AS tested
 FROM assets a JOIN target t ON t.id = a.id
-ORDER BY a.id`, taskID)
+ORDER BY a.id`, graphArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +657,7 @@ ORDER BY a.id`, taskID)
 	for root := range missingRoots {
 		var id, companyID int64
 		err := s.db.QueryRow(`SELECT id, COALESCE(company_id,0) FROM assets
-WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
+WHERE type='root_domain' AND domain=? LIMIT 1`, root).Scan(&id, &companyID)
 		var node CoverageGraphNode
 		if err == nil && id > 0 {
 			node = CoverageGraphNode{Key: assetKey(id), Kind: "root_domain", AssetID: id,
@@ -540,7 +679,7 @@ WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
 			continue
 		}
 		var name string
-		if err := s.db.QueryRow(`SELECT name FROM companies WHERE id=$1`, id).Scan(&name); err != nil {
+		if err := s.db.QueryRow(`SELECT name FROM companies WHERE id=?`, id).Scan(&name); err != nil {
 			continue
 		}
 		add(CoverageGraphNode{Key: key, Kind: "company", CompanyID: id,
@@ -620,21 +759,25 @@ func (s *AssetStore) ListUntestedAssets(taskID, expID int64, typ string, limit, 
 		offset = 0
 	}
 	typeFilter := ""
-	args := []any{taskID, expID}
+	netPred, netArgs, err := s.scopeNetPredicate([]int64{taskID}, []string{"a.ip"})
+	if err != nil {
+		return nil, 0, err
+	}
+	args := []any{taskID}
+	args = append(args, netArgs...)
+	args = append(args, expID)
 	if typ != "" {
-		typeFilter = " AND t.type = $3"
+		typeFilter = " AND t.type = ?"
 		args = append(args, typ)
 	}
 	var total int
-	_ = s.db.QueryRow(`WITH `+covTargetCTE+`
+	_ = s.db.QueryRow(`WITH `+covTargetCTE(netPred)+`
 SELECT count(*) FROM target t WHERE t.id NOT IN (SELECT asset_id FROM tested)`+typeFilter, args...).Scan(&total)
 	pageArgs := append(append([]any{}, args...), limit, offset)
-	limPos := strconv.Itoa(len(args) + 1)
-	offPos := strconv.Itoa(len(args) + 2)
-	rows, err := s.db.Query(`WITH `+covTargetCTE+`
+	rows, err := s.db.Query(`WITH `+covTargetCTE(netPred)+`
 SELECT t.id, t.type, t.label FROM target t
 WHERE t.id NOT IN (SELECT asset_id FROM tested)`+typeFilter+`
-ORDER BY t.id LIMIT $`+limPos+` OFFSET $`+offPos, pageArgs...)
+ORDER BY t.id LIMIT ? OFFSET ?`, pageArgs...)
 	if err != nil {
 		return nil, total, err
 	}

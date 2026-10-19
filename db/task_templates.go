@@ -9,7 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/Autumn-27/artex/db/schema"
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -155,9 +156,20 @@ func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *st
 	return patch, nkey, nil
 }
 
+// taskTemplateUniqueViolation 判定 MySQL/TiDB 1062：新库用
+// uq_task_templates_nkey_hash（nkey_identity + nkey_hash）表达"模板名唯一"，
+// PG 的 ON CONFLICT (nkey) / SQLSTATE 23505 在 TiDB 上没有对应物。
+// 判定只看**结构化错误编号**，不做错误文本匹配。
 func taskTemplateUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	var myErr *mysql.MySQLError
+	return errors.As(err, &myErr) && myErr.Number == 1062
+}
+
+// readTaskTemplate 按 id 回读一行模板（TiDB 无 RETURNING）。
+func readTaskTemplate(q interface {
+	QueryRow(query string, args ...any) *sql.Row
+}, id int64) (TaskTemplate, error) {
+	return scanTaskTemplate(q.QueryRow(`SELECT `+taskTemplateCols+` FROM task_templates WHERE id=?`, id))
 }
 
 // CreateTaskTemplate inserts one globally reusable preset.
@@ -170,14 +182,22 @@ func (d *DB) CreateTaskTemplate(in TaskTemplateInput) (*TaskTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
-	t, err := scanTaskTemplate(d.QueryRow(`
-INSERT INTO task_templates(name, nkey, description, goal, category_id, intercept_rules)
-VALUES ($1,$2,$3,$4,$5,$6)
-ON CONFLICT (nkey) DO NOTHING
-RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.CategoryID, rulesJSON))
-	if err == sql.ErrNoRows {
+	identity, hash := canonicalIdentityPair(schema.NKeyIdentity(nkey))
+	res, err := d.Exec(`
+INSERT INTO task_templates(name, nkey, nkey_identity, nkey_hash, description, goal, category_id, intercept_rules, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, NOW(3), NOW(3))`,
+		in.Name, nkey, identity, hash, in.Description, in.Goal, in.CategoryID, rulesJSON)
+	if taskTemplateUniqueViolation(err) {
 		return nil, ErrTaskTemplateNameConflict
 	}
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	t, err := readTaskTemplate(d, id)
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +224,8 @@ func (d *DB) ListTaskTemplates() ([]*TaskTemplate, error) {
 
 // GetTaskTemplate returns nil when id does not exist.
 func (d *DB) GetTaskTemplate(id int64) (*TaskTemplate, error) {
-	t, err := scanTaskTemplate(d.QueryRow(`SELECT `+taskTemplateCols+` FROM task_templates WHERE id=$1`, id))
-	if err == sql.ErrNoRows {
+	t, err := readTaskTemplate(d, id)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -237,27 +257,42 @@ func (d *DB) PatchTaskTemplate(id int64, patch TaskTemplatePatch) (*TaskTemplate
 	if err != nil {
 		return nil, err
 	}
-	t, err := scanTaskTemplate(d.QueryRow(`UPDATE task_templates
-SET name=CASE WHEN $2 THEN $3::text ELSE name END,
-    nkey=CASE WHEN $2 THEN $4::text ELSE nkey END,
-    description=CASE WHEN $5 THEN $6::text ELSE description END,
-    goal=CASE WHEN $7 THEN $8::text ELSE goal END,
-    category_id=CASE WHEN $9 THEN $10::bigint ELSE category_id END,
-    intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END
-WHERE id=$1
-RETURNING `+taskTemplateCols,
-		id,
-		patch.Name != nil, patch.Name, nkey,
-		patch.Description != nil, patch.Description,
-		patch.Goal != nil, patch.Goal,
-		patch.SetCategoryID, patch.CategoryID,
-		patch.SetInterceptRules, rulesJSON,
-	))
-	if err == sql.ErrNoRows {
-		return nil, ErrTaskTemplateNotFound
+	// 名字变了才重算 canonical identity；未变的列由 CASE 原样保留，
+	// 单条 UPDATE 完成合并，避免并发 disjoint PATCH 互相覆盖。
+	var identity, hash any
+	if nkey != nil {
+		identity, hash = canonicalIdentityPair(schema.NKeyIdentity(*nkey))
 	}
+	_, err = d.Exec(`UPDATE task_templates
+SET name = CASE WHEN ? = 1 THEN ? ELSE name END,
+    nkey = CASE WHEN ? = 1 THEN ? ELSE nkey END,
+    nkey_identity = CASE WHEN ? = 1 THEN ? ELSE nkey_identity END,
+    nkey_hash = CASE WHEN ? = 1 THEN ? ELSE nkey_hash END,
+    description = CASE WHEN ? = 1 THEN ? ELSE description END,
+    goal = CASE WHEN ? = 1 THEN ? ELSE goal END,
+    category_id = CASE WHEN ? = 1 THEN ? ELSE category_id END,
+    intercept_rules = CASE WHEN ? = 1 THEN ? ELSE intercept_rules END,
+    updated_at = NOW(3)
+WHERE id = ?`,
+		boolToInt(patch.Name != nil), patch.Name,
+		boolToInt(nkey != nil), nkey,
+		boolToInt(nkey != nil), identity,
+		boolToInt(nkey != nil), hash,
+		boolToInt(patch.Description != nil), patch.Description,
+		boolToInt(patch.Goal != nil), patch.Goal,
+		boolToInt(patch.SetCategoryID), patch.CategoryID,
+		boolToInt(patch.SetInterceptRules), rulesJSON,
+		id)
 	if taskTemplateUniqueViolation(err) {
 		return nil, ErrTaskTemplateNameConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	// 无 RETURNING：0 affected rows 既可能是"行不存在"也可能是"值没变"，必须回读判定。
+	t, err := readTaskTemplate(d, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrTaskTemplateNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -267,7 +302,7 @@ RETURNING `+taskTemplateCols,
 
 // DeleteTaskTemplate deletes one preset and reports whether it existed.
 func (d *DB) DeleteTaskTemplate(id int64) (bool, error) {
-	result, err := d.Exec(`DELETE FROM task_templates WHERE id=$1`, id)
+	result, err := d.Exec(`DELETE FROM task_templates WHERE id=?`, id)
 	if err != nil {
 		return false, err
 	}

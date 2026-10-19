@@ -1,12 +1,32 @@
 package db
 
+// =====================================================================
+// 任务注册表与任务级联删除（P08-02 Task 2.3）
+//
+// 本文件的三条硬约束：
+//  1. **没有任何表锁**：原 PG 的 `LOCK TABLE tasks/assets IN SHARE ROW EXCLUSIVE
+//     MODE` 在 TiDB 上不存在，也不需要 —— 并发正确性由
+//     `lockorder.TxRunner`（业务门禁 + 指数退避重试）+
+//     `lockorder.LockEntitiesInOrder`（`(TableOrder, PK 升序)` 行级悲观锁）+
+//     持锁成员漂移复核共同保证（M18 / M27 / M36）。
+//  2. **写者协议**：任何"向任务追加子实体"的写者都必须经 `runTaskChildWriter`
+//     —— 业务门禁 → 行锁父任务行 → 核验存活 → 才允许写子实体。正在被删除的任务
+//     绝不会被并发挂上孤儿（I1）。
+//  3. **占位符 `?`、自增主键 `LastInsertId()`**：TiDB 没有 `$n` 与 `RETURNING`。
+// =====================================================================
+
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
+	"sort"
+	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/db/lockorder"
+	"github.com/Autumn-27/artex/db/schema"
 )
 
 // Task is a row in the task registry (1:1 with an exploration).
@@ -61,9 +81,11 @@ type TaskDeleteResult struct {
 	LLMRecordsDeleted int64
 }
 
-// TaskDeletePreparation is produced inside the PostgreSQL deletion transaction
-// after asset and anchor writers have been excluded. Prepare callbacks may use
-// TrafficHosts to stage an external traffic deletion before PostgreSQL commits.
+// TaskDeletePreparation is produced inside the deletion transaction after the
+// cascade has taken every physical lock. Prepare callbacks may use TrafficHosts
+// to stage an external traffic deletion before TiDB commits; the locks (business
+// gate + row locks on the whole physical side-effect closure) stay held through
+// commit, so a host cannot become shared again after its traffic was staged.
 type TaskDeletePreparation struct {
 	ExplorationID int64
 	TrafficHosts  []string
@@ -74,6 +96,139 @@ type TaskDeletePreparation struct {
 func IsTerminal(status string) bool {
 	return status == "done" || status == "failed" || status == "timeout"
 }
+
+// terminalStatusSQL 是终态集合的唯一字面量来源（TiDB 方言，无 $n）。
+const terminalStatusSQL = `('done','failed','timeout')`
+
+// =====================================================================
+// 写者协议（Writer Protocol）
+// =====================================================================
+
+// ErrTaskNotAlive 表示父任务不存在或已被（软）删除：写者协议的唯一拒绝结果。
+// 正在被级联删除的任务，其行锁会被删除事务持有到提交，写者要么排队、要么在它
+// 提交后拿到"任务已消失"，两种情形都不可能造出孤儿子实体。
+var ErrTaskNotAlive = errors.New("task writer: parent task is missing or deleted")
+
+// ErrTaskDeleteOutcomeUnknown 表示删除事务的**提交结局未知**（连接断流 / 协议失步）。
+// 此时门禁仍被封锁、既不能认定已提交也不能认定已回滚：调用方必须挂起进入人工对账，
+// **绝不**执行外部补偿（traffic / 文件回滚或重放），否则可能把已删数据的外部证据
+// 重新"复活"成不一致状态（I7 fail closed）。
+var ErrTaskDeleteOutcomeUnknown = errors.New("task delete: commit outcome unknown, manual reconciliation required; external compensation MUST NOT run")
+
+// taskTxRunner 构造任务写者统一使用的 TxRunner（默认退避阶梯 + 默认准入）。
+func (d *DB) taskTxRunner() *lockorder.TxRunner {
+	// 退避阶梯与重试上限由 TxRunner 默认值给出（100/250/500/1000ms，整体重放）。
+	return lockorder.NewTxRunner(d.DB)
+}
+
+// lockTaskRowAlive 在事务内以行锁读取父任务行并核验其存活（写者协议第二步）。
+// `FOR UPDATE` 同时是 TiDB 下的当前读：软删标记刚被别的事务写上时也必须看见。
+func lockTaskRowAlive(ctx context.Context, tx *sql.Tx, taskID int64) (bool, error) {
+	var alive bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT deleted_at IS NULL FROM tasks WHERE id = ? FOR UPDATE`, taskID).Scan(&alive); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return alive, nil
+}
+
+// runTaskChildWriter 是"向任务追加子实体"（资产、意图、分类、范围、拦截规则…）的
+// 统一写者事务（计划 §3.2.2 写者协议 / Task 2.2 I1 屏障的落地入口）：
+//
+//	TxRunner.Run(RequiresBusinessGate: true)   // 全局业务门禁，排除并发级联删除
+//	  → SELECT … FROM tasks WHERE id=? FOR UPDATE  // 行锁父任务
+//	  → 核验 deleted_at IS NULL                     // 绝不向已删任务挂孤儿
+//	  → fn(tx)                                      // 子实体写入
+//
+// 冲突（1062 / 1205 / 1213 / 成员漂移）由 TxRunner **整体回滚 + 指数退避整体重放**；
+// 任何"部分写入 + 原地重试"都被禁止（payload 每次都拿到全新的 *sql.Tx）。
+// fn 返回 lockorder.RetryCurrentAttempt 可在同一 Runner 内重放本轮。
+func (d *DB) runTaskChildWriter(taskID int64, fn func(ctx context.Context, tx *sql.Tx) error) error {
+	if taskID <= 0 {
+		return fmt.Errorf("%w: task id must be positive", ErrTaskNotAlive)
+	}
+	runner := d.taskTxRunner()
+	return runner.Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true},
+		func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
+			alive, err := lockTaskRowAlive(ctx, tx, taskID)
+			if err != nil {
+				return err
+			}
+			if !alive {
+				return fmt.Errorf("%w: task %d", ErrTaskNotAlive, taskID)
+			}
+			return fn(ctx, tx)
+		})
+}
+
+// runTaskWriteTx 在业务门禁内执行一次"任务根"写事务（读改写 / 需要读回的场景）。
+// 与 runTaskChildWriter 的区别：不预置父任务存活核验，由 payload 自己决定语义。
+func (d *DB) runTaskWriteTx(fn func(ctx context.Context, tx *sql.Tx) error) error {
+	runner := d.taskTxRunner()
+	return runner.Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true},
+		func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
+			return fn(ctx, tx)
+		})
+}
+
+// runTaskChildWriters 是批量版写者协议（分类批量移动等）：门禁 → **按 PK 升序**锁定
+// 全部目标任务行 → 把"哪些行仍然存活"交给 payload。
+//
+// 升序锁是硬要求：两个批量写者以不同顺序锁同一批任务行会交叉等待死锁。
+// payload 拿到 alive 后自行决定"消失的 id"是跳过还是报错 —— 与原
+// `UPDATE … WHERE id=ANY(...) AND deleted_at IS NULL RETURNING id` 语义一致：
+// 消失的行不出现在返回集合里，而不是让整笔批量失败。
+func (d *DB) runTaskChildWriters(taskIDs []int64, fn func(ctx context.Context, tx *sql.Tx, alive map[int64]bool) error) error {
+	if len(taskIDs) == 0 {
+		return fmt.Errorf("%w: no task ids", ErrTaskNotAlive)
+	}
+	ordered := make([]int64, 0, len(taskIDs))
+	seen := make(map[int64]struct{}, len(taskIDs))
+	for _, id := range taskIDs {
+		if id <= 0 {
+			return fmt.Errorf("%w: task id must be positive", ErrTaskNotAlive)
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ordered = append(ordered, id)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+
+	runner := d.taskTxRunner()
+	return runner.Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true},
+		func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
+			rows, err := tx.QueryContext(ctx, `SELECT id, deleted_at IS NULL FROM tasks
+WHERE id IN (`+inPlaceholders(len(ordered))+`) ORDER BY id FOR UPDATE`, int64Args(ordered)...)
+			if err != nil {
+				return err
+			}
+			alive := make(map[int64]bool, len(ordered))
+			for rows.Next() {
+				var id int64
+				var ok bool
+				if err := rows.Scan(&id, &ok); err != nil {
+					rows.Close()
+					return err
+				}
+				alive[id] = ok
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			rows.Close()
+			return fn(ctx, tx, alive)
+		})
+}
+
+// =====================================================================
+// 创建
+// =====================================================================
 
 // CreateTask creates an exploration + task in one transaction and returns the task.
 // timeoutSeconds is the task-level wall-clock budget (0 = 不限时); deadline_at is
@@ -160,6 +315,9 @@ type TaskCreateOptions struct {
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
 // and the ordered task LLM chain in one transaction.
+//
+// 创建同样是"任务写者"：它与级联删除/子实体挂载共享同一把全局业务门禁，
+// 因此不会出现"给一个正在被删除的任务登记 source 关系"这类交错（I1）。
 func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOptions) (*Task, error) {
 	if len(opts.SourceTaskIDs) > MaxTaskSourceCount {
 		return nil, fmt.Errorf("too many source tasks: got %d, maximum is %d", len(opts.SourceTaskIDs), MaxTaskSourceCount)
@@ -169,42 +327,66 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 		return nil, err
 	}
 	opts.CompanyIDs = companyIDs
-	tx, err := d.Begin()
+	if opts.TimeoutSeconds < 0 {
+		opts.TimeoutSeconds = 0
+	}
+	opts.PlanHeartbeatSeconds = normalizeHeartbeat(opts.PlanHeartbeatSeconds)
+
+	var created *Task
+	if err := d.runTaskWriteTx(func(ctx context.Context, tx *sql.Tx) error {
+		task, err := d.createTaskInTx(ctx, tx, description, goal, opts)
+		if err != nil {
+			return err
+		}
+		created = task
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+// createTaskInTx 是单次创建尝试：TiDB 没有 RETURNING，自增主键一律 LastInsertId()，
+// 状态/时间等由数据库默认值产出后再回读一次（同一事务内，读到的是自己的写入）。
+func (d *DB) createTaskInTx(ctx context.Context, tx *sql.Tx, description, goal string, opts TaskCreateOptions) (*Task, error) {
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO explorations(description, goal, status, created_at, updated_at) VALUES(?, ?, 'open', NOW(3), NOW(3))`,
+		description, goal)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-	var expID int64
-	if err := tx.QueryRow(`INSERT INTO explorations(description, goal) VALUES ($1,$2) RETURNING id`, description, goal).Scan(&expID); err != nil {
+	expID, err := res.LastInsertId()
+	if err != nil {
 		return nil, err
 	}
+	if expID <= 0 {
+		return nil, fmt.Errorf("create exploration: invalid auto increment id %d", expID)
+	}
+
 	// origin fact: the exploration graph's root, a KindFact node (state='origin')
 	// holding the original task description. Goals/intents/findings descend from
 	// it, and the seeded target asset is anchored to it as lineage (the asset graph
-	// is global and shared, not isolated per task). Being a fact (not a special 'begin' kind) lets every
-	// intent uniformly connect to a fact node, including the first ones.
+	// is global and shared, not isolated per task).
 	originPayload, _ := json.Marshal(map[string]any{
 		"summary":     "任务起点：" + description + "；目标：" + goal,
 		"description": description,
 		"goal":        goal,
 	})
-	if _, err := tx.Exec(`
-INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
-VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin, created_at, updated_at)
+VALUES(?, 'fact', ?, 0, 'origin', 'system', NOW(3), NOW(3))`, expID, string(originPayload)); err != nil {
 		return nil, err
 	}
-	if opts.TimeoutSeconds < 0 {
-		opts.TimeoutSeconds = 0
-	}
-	opts.PlanHeartbeatSeconds = normalizeHeartbeat(opts.PlanHeartbeatSeconds)
+
 	coverageEnabled := opts.CoverageEnabled == nil || *opts.CoverageEnabled
 	var categoryName string
 	if opts.CategoryID != nil {
 		if *opts.CategoryID <= 0 {
 			return nil, fmt.Errorf("%w: category id must be positive", ErrTaskCategoryInvalid)
 		}
-		if err := tx.QueryRow(`SELECT name FROM task_categories WHERE id=$1`, *opts.CategoryID).Scan(&categoryName); err != nil {
-			if err == sql.ErrNoRows {
+		if err := tx.QueryRowContext(ctx, `SELECT name FROM task_categories WHERE id = ?`, *opts.CategoryID).
+			Scan(&categoryName); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrTaskCategoryNotFound
 			}
 			return nil, err
@@ -215,32 +397,49 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		id := opts.LLMProfileIDs[0]
 		active = &id
 	}
+
+	taskRes, err := tx.ExecContext(ctx, `
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id,
+                  timeout_seconds, plan_heartbeat_seconds, coverage_enabled, status, paused, queued, queue_mode,
+                  created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', 0, 0, '', NOW(3), NOW(3))`,
+		opts.Name, opts.CategoryID, description, goal, expID, active, active,
+		opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, boolToInt(coverageEnabled))
+	if err != nil {
+		return nil, err
+	}
+	taskID, err := taskRes.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	if taskID <= 0 {
+		return nil, fmt.Errorf("create task: invalid auto increment id %d", taskID)
+	}
+
 	t := &Task{
-		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
+		ID: taskID, Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
 		Description: description, Goal: goal, ExplorationID: expID,
 		LLMProfileID: active, ActiveLLMProfileID: active,
 		LLMProfileIDs:  append([]int64(nil), opts.LLMProfileIDs...),
 		SourceTaskIDs:  append([]int64(nil), opts.SourceTaskIDs...),
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
+		Status:         "created",
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled,
 	}
-	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM tasks WHERE id = ?`, taskID).Scan(&t.CreatedAt); err != nil {
 		return nil, err
 	}
-	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
+	if err := insertTaskRelations(ctx, tx, taskID, opts.SourceTaskIDs); err != nil {
 		return nil, err
 	}
-	if err := insertTaskCompanies(tx, t.ID, opts.CompanyIDs); err != nil {
+	if err := insertTaskCompanies(ctx, tx, taskID, opts.CompanyIDs); err != nil {
 		return nil, err
 	}
-	if err := insertTaskLLMProfiles(tx, t.ID, opts.LLMProfileIDs); err != nil {
+	if err := insertTaskLLMProfiles(tx, taskID, opts.LLMProfileIDs); err != nil {
 		return nil, err
 	}
-	if err := insertTaskInterceptRules(tx, t.ID, opts.InterceptRules); err != nil {
+	if err := insertTaskInterceptRules(tx, taskID, opts.InterceptRules); err != nil {
 		return nil, err
 	}
 	if len(opts.LLMProfileIDs) == 0 {
@@ -248,10 +447,16 @@ RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, descripti
 	} else {
 		t.LLMFailoverState = "ready"
 	}
-	return t, tx.Commit()
+	return t, nil
 }
 
-func insertTaskCompanies(tx *sql.Tx, taskID int64, companyIDs []int64) error {
+// insertTaskCompanies 把企业关联落进 task_scope（kind=company，带 canonical identity
+// 唯一键），并完成 **assets.task_ids 与 task_asset_links 的原子双写**（M26 / M30）。
+//
+// PG 版本靠 `array_append(task_ids, $1)` + 触发器同步 link 表；TiDB 的 task_ids 是
+// JSON 文本，双写必须由应用层显式完成：先锁住候选资产行，再"读旧值 → 合并 → 写回"，
+// 最后 upsert link 行。任何一步失败整笔事务回滚，绝不留下"JSON 加了、link 没建"的半态。
+func insertTaskCompanies(ctx context.Context, tx *sql.Tx, taskID int64, companyIDs []int64) error {
 	if len(companyIDs) == 0 {
 		return nil
 	}
@@ -260,69 +465,115 @@ func insertTaskCompanies(tx *sql.Tx, taskID int64, companyIDs []int64) error {
 	if err := lockCompanyScopeMutation(tx); err != nil {
 		return err
 	}
-	var inserted int
-	err := tx.QueryRow(`
-WITH requested(company_id, position) AS (
-    SELECT company_id, position
-    FROM unnest($2::bigint[]) WITH ORDINALITY AS requested(company_id, position)
-), inserted AS (
-    INSERT INTO task_scope(task_id, kind, company_id, source, reason)
-    SELECT $1, 'company', companies.id, 'manual', '任务创建时关联企业'
-    FROM requested
-    JOIN companies ON companies.id=requested.company_id
-    ORDER BY requested.position
-    RETURNING company_id
-)
-SELECT count(*) FROM inserted`, taskID, companyIDs).Scan(&inserted)
-	if err != nil {
+
+	ph := inPlaceholders(len(companyIDs))
+	args := int64Args(companyIDs)
+	var found int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM companies WHERE id IN (`+ph+`)`, args...).Scan(&found); err != nil {
 		return err
 	}
-	if inserted != len(companyIDs) {
+	if found != len(companyIDs) {
 		return fmt.Errorf("%w: one or more companies do not exist", ErrTaskCompanyNotFound)
 	}
 
-	// Updating task_ids fires sync_task_asset_links, which first creates generic
-	// source rows. The provenance upsert must therefore run afterwards so the
-	// company name and creation-time reason remain visible to operators.
-	if _, err := tx.Exec(`
-UPDATE assets
-SET task_ids=CASE
-    WHEN $1=ANY(task_ids) THEN task_ids
-    ELSE array_append(task_ids, $1)
-END
-WHERE company_id=ANY($2::bigint[])`, taskID, companyIDs); err != nil {
+	for _, companyID := range companyIDs {
+		identity, hash := canonicalIdentityPair(schema.TaskScopeIdentity(
+			uint64(taskID), "company", "", "", uint64(companyID), ""))
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO task_scope(task_id, kind, company_id, source, reason, created_at, identity, identity_hash)
+VALUES(?, 'company', ?, 'manual', '任务创建时关联企业', NOW(3), ?, ?)
+ON DUPLICATE KEY UPDATE identity = identity`,
+			taskID, companyID, identity, hash); err != nil {
+			return fmt.Errorf("insert task company scope %d: %w", companyID, err)
+		}
+	}
+
+	// 资产双写：候选资产行先锁（与并发 detach / 级联删除互斥），再逐个合并 task_ids。
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, COALESCE(task_ids, '[]') FROM assets WHERE company_id IN (`+ph+`) ORDER BY id FOR UPDATE`, args...)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`
-INSERT INTO task_asset_links(task_id, asset_id, source, source_summary)
-SELECT $1, asset.id, $3, '任务创建时关联企业：' || company.name
-FROM assets asset
-JOIN companies company ON company.id=asset.company_id
-WHERE asset.company_id=ANY($2::bigint[])
-  AND $1=ANY(asset.task_ids)
-ON CONFLICT (task_id, asset_id) DO UPDATE
-SET source=EXCLUDED.source,
-    source_summary=EXCLUDED.source_summary,
-    source_node_id=NULL`, taskID, companyIDs, taskCompanyAssetSource); err != nil {
+	type assetTaskIDs struct {
+		id    int64
+		raw   string
+		merge string
+		added bool
+	}
+	targets := make([]assetTaskIDs, 0, 16)
+	for rows.Next() {
+		var id int64
+		var raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		merged, err := assetUnionTaskIDs(raw, []int64{taskID})
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("asset %d task_ids: %w", id, err)
+		}
+		targets = append(targets, assetTaskIDs{id: id, raw: raw, merge: merged, added: merged != raw})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
 		return err
+	}
+	rows.Close()
+
+	for _, target := range targets {
+		if target.added {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE assets SET task_ids = ?, updated_at = NOW(3) WHERE id = ?`, target.merge, target.id); err != nil {
+				return fmt.Errorf("attach asset %d to task %d: %w", target.id, taskID, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO task_asset_links(task_id, asset_id, source, source_summary, created_at, updated_at)
+VALUES(?, ?, ?, ?, NOW(3), NOW(3))
+ON DUPLICATE KEY UPDATE
+    source=VALUES(source),
+    source_summary=VALUES(source_summary),
+    source_node_id=NULL,
+    updated_at=NOW(3)`, taskID, target.id, taskCompanyAssetSource, companyScopeLinkSummary(tx, target.id)); err != nil {
+			return fmt.Errorf("link asset %d to task %d: %w", target.id, taskID, err)
+		}
 	}
 	return nil
 }
 
-func insertTaskRelations(tx *sql.Tx, taskID int64, sourceIDs []int64) error {
+// companyScopeLinkSummary 组装 link 行的来源说明（企业名可能已被并发清理，取不到就留空）。
+func companyScopeLinkSummary(tx *sql.Tx, assetID int64) string {
+	var name string
+	_ = tx.QueryRow(`
+SELECT COALESCE(c.name, '')
+FROM assets a LEFT JOIN companies c ON c.id = a.company_id
+WHERE a.id = ?`, assetID).Scan(&name)
+	return "任务创建时关联企业：" + name
+}
+
+func insertTaskRelations(ctx context.Context, tx *sql.Tx, taskID int64, sourceIDs []int64) error {
 	seen := map[int64]bool{}
 	for _, sourceID := range sourceIDs {
 		if sourceID <= 0 || sourceID == taskID || seen[sourceID] {
 			return fmt.Errorf("invalid or duplicate source task id %d", sourceID)
 		}
 		seen[sourceID] = true
-		res, err := tx.Exec(`INSERT INTO task_relations(task_id, source_task_id)
-SELECT $1, id FROM tasks WHERE id=$2 AND deleted_at IS NULL`, taskID, sourceID)
+		// 源任务必须存活；它的行也顺带锁住，杜绝"关系指向一个正在消失的任务"。
+		var exists int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT id FROM tasks WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, sourceID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("source task %d not found", sourceID)
+		}
 		if err != nil {
 			return err
 		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return fmt.Errorf("source task %d not found", sourceID)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO task_relations(task_id, source_task_id, created_at) VALUES(?, ?, NOW(3))`,
+			taskID, sourceID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -335,16 +586,22 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 			return fmt.Errorf("invalid or duplicate LLM profile id %d", profileID)
 		}
 		seen[profileID] = true
-		if _, err := tx.Exec(`INSERT INTO task_llm_profiles(task_id, profile_id, position) VALUES ($1,$2,$3)`, taskID, profileID, position); err != nil {
+		if _, err := tx.Exec(`
+INSERT INTO task_llm_profiles(task_id, profile_id, position, status, created_at, updated_at)
+VALUES(?, ?, ?, 'ready', NOW(3), NOW(3))`, taskID, profileID, position); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// =====================================================================
+// 读取与状态机
+// =====================================================================
+
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,1), first_run_at, deadline_at`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
@@ -357,15 +614,19 @@ func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 
 // SetParentRef records a task's parent task id (编排 agent spawn_task 关联).
 func (d *DB) SetParentRef(id int64, parentRef string) error {
-	_, err := d.Exec(`UPDATE tasks SET parent_ref=NULLIF($2,'') WHERE id=$1`, id, parentRef)
+	var nullable any
+	if strings.TrimSpace(parentRef) != "" {
+		nullable = parentRef
+	}
+	_, err := d.Exec(`UPDATE tasks SET parent_ref = ?, updated_at = NOW(3) WHERE id = ?`, nullable, id)
 	return err
 }
 
 // ListTasks returns alive tasks with pinned tasks first, then newest ids.
 func (d *DB) ListTasks() ([]*Task, error) {
-	// id 是 BIGSERIAL，同一时刻创建的任务也有稳定且唯一的顺序。
+	// MySQL/TiDB 没有 NULLS LAST：用"未置顶优先 + pinned_at DESC + id DESC"等价表达。
 	rows, err := d.Query(`SELECT ` + taskCols + ` FROM tasks WHERE deleted_at IS NULL
-ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, id DESC`)
+ORDER BY (pinned_at IS NULL), pinned_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -396,30 +657,57 @@ type TaskPatch struct {
 
 // UpdateTask applies a partial task name/pin mutation and returns the updated row.
 // Re-pinning an already pinned task preserves its original position.
+//
+// TiDB 没有 UPDATE … RETURNING：读改写在业务门禁内一次完成（UPDATE + 同事务回读）。
 func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
-	task, err := scanTask(d.QueryRow(`UPDATE tasks SET
-	name = CASE WHEN $2::boolean THEN $3 ELSE name END,
+	var updated *Task
+	err := d.runTaskWriteTx(func(ctx context.Context, tx *sql.Tx) error {
+		var pinnedArg any
+		if patch.Pinned != nil {
+			pinnedArg = boolToInt(*patch.Pinned)
+		}
+		res, err := tx.ExecContext(ctx, `
+UPDATE tasks SET
+	name = CASE WHEN ? = 1 THEN ? ELSE name END,
 	pinned_at = CASE
-		WHEN $4::boolean IS NULL THEN pinned_at
-		WHEN $4::boolean THEN COALESCE(pinned_at, now())
+		WHEN ? IS NULL THEN pinned_at
+		WHEN ? = 1 THEN COALESCE(pinned_at, NOW(3))
 		ELSE NULL
-	END
-WHERE id=$1 AND deleted_at IS NULL
-RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned))
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+	END,
+	updated_at = NOW(3)
+WHERE id = ? AND deleted_at IS NULL`,
+			boolToInt(patch.Name != nil), patch.Name, pinnedArg, pinnedArg, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id = ?`, id).Scan(&exists); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil // 任务不存在 → 与原契约一致：(nil, nil)
+				}
+				return err
+			}
+			return nil // 存在但已软删 → 同样按"未更新"返回
+		}
+		task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id = ?`, id))
+		if err != nil {
+			return err
+		}
+		updated = task
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return task, nil
+	return updated, nil
 }
 
 // GetTask returns one alive task (nil if not found/deleted).
 func (d *DB) GetTask(id int64) (*Task, error) {
-	t, err := scanTask(d.QueryRow(`SELECT `+taskCols+` FROM tasks WHERE id=$1 AND deleted_at IS NULL`, id))
+	t, err := scanTask(d.QueryRow(`SELECT `+taskCols+` FROM tasks WHERE id=? AND deleted_at IS NULL`, id))
 	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -432,7 +720,7 @@ func (d *DB) GetTask(id int64) (*Task, error) {
 
 // SetPaused persists a task's paused flag.
 func (d *DB) SetPaused(id int64, paused bool) error {
-	_, err := d.Exec(`UPDATE tasks SET paused=$1 WHERE id=$2`, paused, id)
+	_, err := d.Exec(`UPDATE tasks SET paused=?, updated_at=NOW(3) WHERE id=?`, boolToInt(paused), id)
 	return err
 }
 
@@ -442,25 +730,26 @@ func (d *DB) Enqueue(id int64, mode string) error {
 	if mode != "bootstrap" && mode != "resume" {
 		return fmt.Errorf("invalid queue mode %q", mode)
 	}
-	_, err := d.Exec(`UPDATE tasks
-SET queued=true,
-    queued_at=CASE WHEN queued THEN COALESCE(queued_at, now()) ELSE now() END,
-    queue_mode=CASE
-        WHEN queue_mode='bootstrap' OR $2='bootstrap' THEN 'bootstrap'
-        ELSE 'resume'
-    END
-WHERE id=$1`, id, mode)
+	_, err := d.Exec(`
+UPDATE tasks
+SET queued = 1,
+    queued_at = CASE WHEN queued = 1 THEN COALESCE(queued_at, NOW(3)) ELSE NOW(3) END,
+    queue_mode = CASE WHEN queue_mode = 'bootstrap' OR ? = 'bootstrap' THEN 'bootstrap' ELSE 'resume' END,
+    updated_at = NOW(3)
+WHERE id = ?`, mode, id)
 	return err
 }
 
 // Dequeue removes the concurrency hold. clearMode is false when a user pauses a
 // queued task, preserving whether its next admission must bootstrap or resume.
 func (d *DB) Dequeue(id int64, clearMode bool) error {
-	_, err := d.Exec(`UPDATE tasks
-SET queued=false,
-    queued_at=NULL,
-    queue_mode=CASE WHEN $2 THEN '' ELSE queue_mode END
-WHERE id=$1`, id, clearMode)
+	_, err := d.Exec(`
+UPDATE tasks
+SET queued = 0,
+    queued_at = NULL,
+    queue_mode = CASE WHEN ? = 1 THEN '' ELSE queue_mode END,
+    updated_at = NOW(3)
+WHERE id = ?`, boolToInt(clearMode), id)
 	return err
 }
 
@@ -480,9 +769,10 @@ func (d *DB) SetQueued(id int64, queued bool) error {
 func (d *DB) SetStatus(id int64, status string) error {
 	_, err := d.Exec(`
 UPDATE tasks
-   SET status = $1,
-       completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END
- WHERE id = $2`, status, id)
+   SET status = ?,
+       completed_at = CASE WHEN ? IN `+terminalStatusSQL+` THEN COALESCE(completed_at, NOW(3)) ELSE NULL END,
+       updated_at = NOW(3)
+ WHERE id = ?`, status, status, id)
 	return err
 }
 
@@ -493,9 +783,10 @@ UPDATE tasks
 func (d *DB) SetTerminalStatusGuarded(id int64, status string) (won bool, err error) {
 	res, err := d.Exec(`
 UPDATE tasks
-   SET status = $1,
-       completed_at = COALESCE(completed_at, now())
- WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id)
+   SET status = ?,
+       completed_at = COALESCE(completed_at, NOW(3)),
+       updated_at = NOW(3)
+ WHERE id = ? AND status NOT IN `+terminalStatusSQL, status, id)
 	if err != nil {
 		return false, err
 	}
@@ -509,17 +800,33 @@ UPDATE tasks
 // leaves deadline_at NULL (不限时). Returns the resulting deadline (nil = 不限/未变).
 func (d *DB) StampFirstRun(id int64, timeoutSeconds int) (*time.Time, error) {
 	var deadline *time.Time
-	err := d.QueryRow(`
+	err := d.execInTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`
 UPDATE tasks
-   SET first_run_at = COALESCE(first_run_at, now()),
-       deadline_at  = CASE
-           WHEN first_run_at IS NOT NULL THEN deadline_at            -- 已盖过章：不动
-           WHEN $2 > 0 THEN now() + make_interval(secs => $2)
-           ELSE NULL END
- WHERE id = $1
- RETURNING deadline_at`, id, timeoutSeconds).Scan(&deadline)
+   SET first_run_at = COALESCE(first_run_at, NOW(3)),
+       deadline_at = CASE
+           WHEN first_run_at IS NOT NULL THEN deadline_at
+           WHEN ? > 0 THEN DATE_ADD(NOW(3), INTERVAL ? SECOND)
+           ELSE NULL END,
+       updated_at = NOW(3)
+ WHERE id = ?`, timeoutSeconds, timeoutSeconds, id); err != nil {
+			return err
+		}
+		return tx.QueryRow(`SELECT deadline_at FROM tasks WHERE id = ?`, id).Scan(&deadline)
+	})
 	return deadline, err
 }
+
+// =====================================================================
+// 级联删除（四阶段：Fresh Locator → 全序悲观锁 → 成员漂移复核 → 物理逆拓扑清理）
+// =====================================================================
+
+// TaskCascadeTestHookAfterSnapshot 是交付给测试的同步注入钩子（默认 nil）：
+// 在**闭包快照完成之后、持锁成员复核之前**被同步调用一次。
+// 用例借此在第二连接上提交一个"更低 PK 的新成员"，验收本轮尝试必须以
+// lockorder.ErrMembershipDrift 整体回滚 + 退避重放（逆序补锁的实现会在此判红）。
+// 钩子内不得持有本事务的锁，也不得 panic 吞错。
+var TaskCascadeTestHookAfterSnapshot func(taskID uint64)
 
 // DeleteTask preserves the historical behavior: remove the task and its
 // exploration subgraph while retaining global assets.
@@ -528,127 +835,173 @@ func (d *DB) DeleteTask(id int64) error {
 	return err
 }
 
-// DeleteTaskCascade hard-deletes a task and its exploration subgraph
-// (nodes/edges/activity via ON DELETE CASCADE). Optional standalone findings and
-// assets owned only by this task are deleted in the same transaction; shared
-// assets are retained and only have this task id detached. deleteLLMRecords is
-// optional to preserve callers of the original two-option API.
+// DeleteTaskCascade hard-deletes a task, its exploration subgraph and the full
+// physical side-effect closure. Assets shared with another live task are only
+// detached (task_ids 位剥离 + 本任务 link 删除)；shared rows survive.
 func (d *DB) DeleteTaskCascade(id int64, deleteAssets, deleteFindings bool, deleteLLMRecords ...bool) (TaskDeleteResult, error) {
 	deleteRecords := len(deleteLLMRecords) > 0 && deleteLLMRecords[0]
 	return d.DeleteTaskCascadePrepared(id, deleteAssets, deleteFindings, deleteRecords, nil)
 }
 
 // DeleteTaskCascadePrepared coordinates reversible external deletion with the
-// PostgreSQL cascade. When prepare is non-nil, host ownership is resolved and
-// prepare is invoked inside this transaction while asset and anchor writers are
-// excluded. The locks remain held through commit, closing the window where a
-// host could become shared after its traffic had already been staged.
+// TiDB cascade. When prepare is non-nil, host ownership is resolved and prepare
+// is invoked inside the deletion transaction **after** the whole physical
+// side-effect closure has been locked, so a host cannot become shared after its
+// traffic had already been staged.
 //
 // prepare must only stage reversible work. Any returned error or later database
-// error rolls PostgreSQL back; the caller remains responsible for rolling back
-// external work that its callback staged successfully.
+// error rolls the transaction back and the caller remains responsible for undoing
+// the staged external work — **except** when the returned error wraps
+// ErrTaskDeleteOutcomeUnknown: then the commit outcome is unknown, the gates stay
+// held and no external compensation may run at all (manual reconciliation only).
 func (d *DB) DeleteTaskCascadePrepared(
 	id int64,
 	deleteAssets, deleteFindings, deleteLLMRecords bool,
 	prepare func(TaskDeletePreparation) error,
 ) (TaskDeleteResult, error) {
 	var result TaskDeleteResult
-	tx, err := d.Begin()
+	if id <= 0 {
+		return result, fmt.Errorf("delete task cascade: invalid task id %d", id)
+	}
+	opts := TaskClosureOptions{
+		DeleteAssets:     deleteAssets,
+		DeleteFindings:   deleteFindings,
+		DeleteLLMRecords: deleteLLMRecords,
+	}
+	runner := d.taskTxRunner()
+	err := runner.Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true},
+		func(ctx context.Context, tx *sql.Tx, lockCtx *lockorder.LockContext) error {
+			out, err := d.runTaskCascadeAttempt(ctx, tx, lockCtx, id, opts, prepare)
+			if err != nil {
+				return err
+			}
+			result = out
+			return nil
+		})
+	if err != nil {
+		if errors.Is(err, lockorder.ErrOutcomeUnknown) {
+			// 提交结局未知：门禁封锁、绝不重放，也绝不外部补偿。
+			return result, fmt.Errorf("%w: %w", ErrTaskDeleteOutcomeUnknown, err)
+		}
+		return result, err
+	}
+	return result, nil
+}
+
+// runTaskCascadeAttempt 是删除级联的**一次完整尝试**（四阶段）。任何错误都让
+// TxRunner 整体回滚，重试从阶段 1 的非加锁 Locator 重新开始。
+func (d *DB) runTaskCascadeAttempt(
+	ctx context.Context,
+	tx *sql.Tx,
+	lockCtx *lockorder.LockContext,
+	id int64,
+	opts TaskClosureOptions,
+	prepare func(TaskDeletePreparation) error,
+) (TaskDeleteResult, error) {
+	var result TaskDeleteResult
+
+	// ── 阶段 1：Fresh Locator（业务门禁保护下的非加锁闭包快照）──────────────
+	snapshot, err := ComputeTaskClosureWithOptions(ctx, tx, uint64(id), opts)
+	if err != nil {
+		if errors.Is(err, ErrForeignKeyViolation) {
+			return result, nil // 任务已不存在：与原契约一致（幂等成功）
+		}
+		return result, err
+	}
+	plan, err := snapshot.LockPlan()
 	if err != nil {
 		return result, err
 	}
-	defer tx.Rollback()
-	var expID int64
-	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, id).Scan(&expID); err != nil {
-		if err == sql.ErrNoRows {
-			return result, nil // already gone
-		}
+
+	// ── 阶段 2：全序悲观锁（(TableOrder, PK 升序)，含跨根物理副作用行）──────
+	if err := lockorder.LockEntitiesInOrder(ctx, tx, lockCtx, plan); err != nil {
 		return result, err
 	}
 
-	// SHARE ROW EXCLUSIVE conflicts with every INSERT/UPDATE/DELETE on these
-	// tables and with another coordinated deletion. Taking both in one fixed order
-	// prevents phantoms (a distinct asset row for the same host) as well as new
-	// ownership/anchor references until the deletion transaction commits.
-	if deleteAssets || prepare != nil {
-		if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
-			return result, err
-		}
+	// 测试注入点：快照已成型、成员复核尚未开始。
+	if TaskCascadeTestHookAfterSnapshot != nil {
+		TaskCascadeTestHookAfterSnapshot(snapshot.TaskID)
 	}
+
+	// ── 阶段 3：持锁成员漂移复核（当前读重跑定位，只发现不补锁）────────────
+	locked, err := ComputeLockedTaskClosure(ctx, tx, uint64(id), opts)
+	if err != nil {
+		if errors.Is(err, ErrForeignKeyViolation) {
+			return result, nil
+		}
+		return result, err
+	}
+	current, err := locked.MembershipKeys()
+	if err != nil {
+		return result, err
+	}
+	if err := lockorder.CompareMembership(plan, current); err != nil {
+		// 新成员 / 更低 PK / 成员缺失 → 由 TxRunner 整体回滚 + 指数退避整体重放。
+		return result, fmt.Errorf("task cascade membership check: %w", err)
+	}
+
+	// ── 流量主机归属：在锁内解析，交由 prepare 暂存可逆的外部删除 ───────────
 	if prepare != nil {
-		hosts, err := hostsForTaskDeletion(tx, id, expID)
+		hosts, err := hostsForTaskDeletion(&txQuerier{tx}, int64(locked.TaskID), int64(locked.ExplorationID))
 		if err != nil {
 			return result, err
 		}
 		if err := prepare(TaskDeletePreparation{
-			ExplorationID: expID,
+			ExplorationID: int64(locked.ExplorationID),
 			TrafficHosts:  hosts,
 		}); err != nil {
 			return result, err
 		}
 	}
-	if deleteAssets {
-		// Ownership is the union of explicit task_ids and this exploration's anchors.
-		// An asset is deletable only when no other live task references it through
-		// either mechanism. This covers legacy anchor-only seeds without destroying
-		// evidence anchored by another task.
-		res, err := tx.Exec(`
-WITH candidate_assets AS (
-  SELECT id FROM assets WHERE $1 = ANY(task_ids)
-  UNION
-  SELECT ea.asset_id
-  FROM exploration_anchors ea
-  JOIN exploration_nodes n ON n.id=ea.node_id
-  WHERE n.exploration_id=$2
-),
-deletable AS (
-  SELECT a.id
-  FROM assets a
-  JOIN candidate_assets c ON c.id=a.id
-  WHERE NOT EXISTS (
-    SELECT 1 FROM tasks t
-    WHERE t.id<>$1 AND t.deleted_at IS NULL AND t.id=ANY(a.task_ids)
-  ) AND NOT EXISTS (
-    SELECT 1
-    FROM exploration_anchors ea
-    JOIN exploration_nodes n ON n.id=ea.node_id
-    JOIN tasks t ON t.exploration_id=n.exploration_id
-    WHERE ea.asset_id=a.id AND t.id<>$1 AND t.deleted_at IS NULL
-  )
-)
-DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
-		if err != nil {
-			return result, err
-		}
-		result.AssetsDeleted, _ = res.RowsAffected()
 
-		res, err = tx.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, id)
-		if err != nil {
-			return result, err
-		}
-		result.AssetsDetached, _ = res.RowsAffected()
-	}
-	if deleteFindings {
-		res, err := tx.Exec(`DELETE FROM findings WHERE task_id = $1`, id)
-		if err != nil {
-			return result, err
-		}
-		result.FindingsDeleted, _ = res.RowsAffected()
-	}
-	if deleteLLMRecords {
-		res, err := tx.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(id, 10))
-		if err != nil {
-			return result, err
-		}
-		result.LLMRecordsDeleted, _ = res.RowsAffected()
-	}
-	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
-	// task — it is kept as historical accounting even after the task is gone.
-	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
+	// ── 阶段 4：物理逆拓扑清理（写集严格收敛于上面锁定的 PK 集合）──────────
+	audit, err := ExecuteTaskCascade(ctx, tx, locked)
+	if err != nil {
 		return result, err
 	}
-	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=$1`, expID); err != nil {
-		return result, err
+	result.AssetsDeleted = audit.EntitiesDeleted["assets"]
+	result.AssetsDetached = int64(len(locked.AssetIDsToDetach))
+	result.FindingsDeleted = audit.EntitiesDeleted["findings"]
+	result.LLMRecordsDeleted = audit.EntitiesDeleted["llm_records"]
+	return result, nil
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+// boolToInt 把布尔写入参数编成 TINYINT(1) 绑定值（TiDB 无 BOOLEAN 字面量参数）。
+func boolToInt(v bool) int {
+	if v {
+		return 1
 	}
-	return result, tx.Commit()
+	return 0
+}
+
+// int64Args 把 int64 列表编成 SQL 参数。
+func int64Args(ids []int64) []any {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
+}
+
+// inPlaceholders 生成 n 个逗号分隔的 `?`。
+func inPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// txQuerier 把 *sql.Tx 适配到只查询接口（hostsForTaskDeletion 等历史签名）。
+type txQuerier struct{ tx *sql.Tx }
+
+func (q *txQuerier) Query(query string, args ...any) (*sql.Rows, error) {
+	return q.tx.Query(query, args...)
+}
+
+func (q *txQuerier) QueryRow(query string, args ...any) *sql.Row {
+	return q.tx.QueryRow(query, args...)
 }
