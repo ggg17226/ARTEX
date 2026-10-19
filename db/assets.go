@@ -1,14 +1,23 @@
 package db
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/Autumn-27/artex/db/lockorder"
+	"github.com/Autumn-27/artex/db/schema"
+	"github.com/go-sql-driver/mysql"
 )
 
 // =====================================================================
@@ -96,6 +105,20 @@ type AssetStore struct {
 	tx      *sql.Tx
 }
 
+// execInTx 在单条事务里执行 fn：TiDB 没有 DELETE … RETURNING，
+// "先读回副作用再删除"这类读改写必须整体包在事务里。
+func (d *DB) execInTx(fn func(tx *sql.Tx) error) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交后 Rollback 只返回 ErrTxDone
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // Assets returns the asset store.
 func (d *DB) Assets() *AssetStore {
 	return &AssetStore{db: d, company: d.Companies()}
@@ -104,21 +127,71 @@ func (d *DB) Assets() *AssetStore {
 // Companies returns the company store associated with this asset store.
 func (s *AssetStore) Companies() *CompanyStore { return s.company }
 
-// withCompanyScopeMutation serializes scope resolution and every asset write
-// that consumes its result in one transaction. Nested asset side effects reuse
-// the same transaction through the scoped store.
-func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
+// ── 事务边界与外层重试（spec §3.2.1 第 2 点）─────────────────────────────────
+//
+// 原实现是 `SELECT pg_advisory_xact_lock($1)` 的进程级串行化：TiDB 没有 advisory
+// lock，也不需要它 —— 资产唯一性现在由 8 条 hash 唯一索引 + 写前仲裁协议保证，
+// 并发赢家与输家的裁决权交给数据库的 1062，而不是应用层互斥锁。
+//
+// 外层重试循环负责 spec §3.2.1 路径 B-3：1062 / 1213 / 1205 一律**整笔回滚**后在
+// **全新事务**里重放（此时并发赢家已可见，重放自然落入 Path A）。
+const assetWriteMaxAttempts = 4
+
+// assetWriteBackoffSchedule 是失败尝试之间的退避阶梯（首档 0：确定性冲突立即重放）。
+var assetWriteBackoffSchedule = []time.Duration{
+	0,
+	50 * time.Millisecond,
+	200 * time.Millisecond,
+	500 * time.Millisecond,
+}
+
+// errAssetWriteRetry 标记"本轮尝试已完整回滚，必须在新事务里重放"的内部信号。
+// 它只在外层重试循环内部出现，绝不会返回给调用方（耗尽后会被包装成显式错误）。
+var errAssetWriteRetry = errors.New("assets: retryable write conflict")
+
+// ErrAssetWriteRetriesExhausted 表示外层事务重试循环已耗尽。
+var ErrAssetWriteRetriesExhausted = errors.New("assets: write retry attempts exhausted")
+
+// withAssetMutation 在一次事务里执行 fn，并在可重试冲突时以全新事务重放。
+// 嵌套的资产副作用（例如 subdomain 写入顺带 upsert root_domain/IP）通过
+// 同一个 scoped store 复用同一事务，不会各开一笔。
+func (s *AssetStore) withAssetMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
 	if s.tx != nil {
 		return fn(s)
 	}
+	var lastErr error
+	for attempt := 0; attempt < assetWriteMaxAttempts; attempt++ {
+		if attempt > 0 {
+			if wait := assetBackoff(attempt - 1); wait > 0 {
+				time.Sleep(wait)
+			}
+		}
+		id, err := s.runAssetAttempt(fn)
+		if err == nil {
+			return id, nil
+		}
+		lastErr = err
+		if !assetShouldRetry(err) {
+			return 0, err
+		}
+	}
+	return 0, fmt.Errorf("%w after %d attempts: %w", ErrAssetWriteRetriesExhausted, assetWriteMaxAttempts, lastErr)
+}
+
+// withCompanyScopeMutation 保留旧名字（tasks.go / task_assets.go 的同名锁由
+// Task 2.3 统一接入 lockorder.TxRunner），语义等价于 withAssetMutation。
+func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
+	return s.withAssetMutation(fn)
+}
+
+// runAssetAttempt 是单次尝试：Begin → fn → Commit；任何错误路径都由 defer 完整
+// Rollback（严禁"原地重试"：重试必须发生在 runAssetAttempt 之外的事务里）。
+func (s *AssetStore) runAssetAttempt(fn func(*AssetStore) (int64, error)) (int64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback() //nolint:errcheck
-	if err := lockCompanyScopeMutation(tx); err != nil {
-		return 0, err
-	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 只返回 ErrTxDone
 	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
 	id, err := fn(scoped)
 	if err != nil {
@@ -130,11 +203,162 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 	return id, nil
 }
 
+// assetShouldRetry 只按**结构化**信号判定：本包的重试哨兵，或 lockorder 按 MySQL
+// 错误编号（1062/1205/1213）分类的可重试冲突。碰撞哨兵 ErrIdentityHashCollision
+// 不在其中 —— 身份冲突是业务终局，绝不重放。
+func assetShouldRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, schema.ErrIdentityHashCollision) {
+		return false
+	}
+	return errors.Is(err, errAssetWriteRetry) || lockorder.IsRetryableConflict(err)
+}
+
+func assetBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(assetWriteBackoffSchedule) {
+		return assetWriteBackoffSchedule[len(assetWriteBackoffSchedule)-1]
+	}
+	return assetWriteBackoffSchedule[attempt]
+}
+
+// assetIsDuplicateKey 结构化识别 MySQL 1062（唯一索引/主键冲突）。
+func assetIsDuplicateKey(err error) bool {
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number == 1062
+	}
+	return false
+}
+
+// ── 企业归属解析（TiDB 方言）─────────────────────────────────────────────────
+//
+// 原实现依赖 PG 的 `net >>= $1::inet` 与 masklen()。TiDB 的 company_scope.net 是
+// CIDR 文本，没有 inet 类型，所以网络归属按 spec §3.3.1 的口径改成
+// "SQL 取候选 + Go 内存前缀匹配"，匹配语义（最长前缀优先、同长比 company_id）不变。
+
+type assetScopeQueryer interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 func (s *AssetStore) resolveCompanyWithICP(rootDomain, ipStr, icp string) (*int64, error) {
 	if s.tx != nil {
-		return resolveCompanyWithICP(s.tx, rootDomain, ipStr, icp)
+		return resolveAssetCompany(s.tx, rootDomain, ipStr, icp)
 	}
-	return s.company.ResolveCompanyWithICP(rootDomain, ipStr, icp)
+	return resolveAssetCompany(s.db, rootDomain, ipStr, icp)
+}
+
+func resolveAssetCompany(q assetScopeQueryer, rootDomain, ipStr, icp string) (*int64, error) {
+	if rootDomain != "" {
+		var cid int64
+		err := q.QueryRow(`
+SELECT company_id FROM company_scope
+WHERE kind = 'domain' AND domain = ?
+ORDER BY CHAR_LENGTH(domain) DESC, company_id ASC
+LIMIT 1`, rootDomain).Scan(&cid)
+		if err == nil {
+			return &cid, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
+	if ip := net.ParseIP(strings.TrimSpace(ipStr)); ip != nil {
+		cid, err := resolveCompanyByIP(q, ip)
+		if err != nil {
+			return nil, err
+		}
+		if cid != nil {
+			return cid, nil
+		}
+	}
+	if normalized := NormalizeICP(icp); normalized != "" {
+		var cid int64
+		err := q.QueryRow(`
+SELECT company_id FROM company_scope
+WHERE kind = 'icp' AND value = ?
+ORDER BY company_id ASC
+LIMIT 1`, normalized).Scan(&cid)
+		if err == nil {
+			return &cid, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+// resolveCompanyByIP 取回全部 ip/cidr 归属规则，在内存里做最长前缀匹配
+// （原 PG 语义：masklen 降序、company_id 升序）。
+func resolveCompanyByIP(q assetScopeQueryer, ip net.IP) (*int64, error) {
+	rows, err := q.Query(`
+SELECT company_id, net FROM company_scope
+WHERE kind IN ('ip', 'cidr') AND net IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		companyID int64
+		maskBits  int
+	}
+	var best *candidate
+	for rows.Next() {
+		var cid int64
+		var raw []byte
+		if err := rows.Scan(&cid, &raw); err != nil {
+			return nil, err
+		}
+		ones, ok := assetNetPrefixLen(string(raw), ip)
+		if !ok {
+			continue
+		}
+		if best == nil || ones > best.maskBits || (ones == best.maskBits && cid < best.companyID) {
+			best = &candidate{companyID: cid, maskBits: ones}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if best == nil {
+		return nil, nil
+	}
+	id := best.companyID
+	return &id, nil
+}
+
+// assetNetPrefixLen 判断 ip 是否落在规则 net（CIDR 或裸地址）内，并返回前缀长度。
+func assetNetPrefixLen(rawNet string, ip net.IP) (int, bool) {
+	raw := strings.TrimSpace(rawNet)
+	if raw == "" {
+		return 0, false
+	}
+	if strings.ContainsRune(raw, '/') {
+		_, network, err := net.ParseCIDR(raw)
+		if err != nil || !network.Contains(ip) {
+			return 0, false
+		}
+		ones, bits := network.Mask.Size()
+		if ones == 0 && bits == 0 {
+			return 0, false
+		}
+		return ones, true
+	}
+	rule := net.ParseIP(raw)
+	if rule == nil || !rule.Equal(ip) {
+		return 0, false
+	}
+	if ip.To4() != nil {
+		return 32, true
+	}
+	return 128, true
 }
 
 // =====================================================================
@@ -159,21 +383,49 @@ func calcCSegment(ipStr string) string {
 		return ""
 	}
 	// IPv6 /48
-	_, ipnet, err := net.ParseCIDR(ipStr + "/48")
+	_, ipnet, err := net.ParseCIDR(ip.String() + "/48")
 	if err != nil {
 		return ""
 	}
 	return ipnet.String()
 }
 
-// normalizeURL lowercases scheme and host, strips trailing slash from bare roots.
+// canonicalIP 把地址规范成 Canonical 文本（IPv4 点分十进制、IPv6 压缩小写），
+// 使 "::ffff:127.0.0.1" 与 "127.0.0.1" 这类同址写法命中同一 canonical 身份。
+func canonicalIP(raw string) (string, bool) {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return "", false
+	}
+	return ip.String(), true
+}
+
+// normalizeURL lowercases scheme and host, strips the scheme's default port and
+// trims a trailing slash (bare root or a single path segment), so that
+// "HTTP://API.Example.COM:80/v1/" and "http://api.example.com/v1" share one URL.
 func normalizeURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return raw
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port != "" && port == strconv.Itoa(defaultPort(strings.ToLower(u.Scheme), "")) {
+		port = "" // 默认端口不进入 canonical URL
+	}
+	if host != "" {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			host = "[" + host + "]" // IPv6 needs brackets again
+		}
+	}
+	if port != "" {
+		host = host + ":" + port
+	}
+	u.Host = host
+	if strings.HasSuffix(u.Path, "/") && u.Path != "/" {
+		u.Path = strings.TrimSuffix(u.Path, "/")
+	}
 	s := u.String()
 	if strings.HasSuffix(s, "/") && u.Path == "/" && u.RawQuery == "" {
 		s = strings.TrimSuffix(s, "/")
@@ -200,50 +452,627 @@ func parseURL(raw string) (domain string, port int, serviceName string) {
 	return
 }
 
-func marshalJSONBArray(items []map[string]any) (string, error) {
-	if len(items) == 0 {
-		return "{}", nil
-	}
-	parts := make([]string, len(items))
-	for i, m := range items {
-		b, err := json.Marshal(m)
-		if err != nil {
-			return "", err
-		}
-		// PostgreSQL array literal for jsonb[]: each element must be
-		// double-quoted with internal backslashes and double-quotes escaped.
-		s := strings.ReplaceAll(string(b), `\`, `\\`)
-		s = strings.ReplaceAll(s, `"`, `\"`)
-		parts[i] = `"` + s + `"`
-	}
-	return "{" + strings.Join(parts, ",") + "}", nil
-}
-
-func marshalStringArray(items []string) string {
-	if len(items) == 0 {
-		return "{}"
-	}
-	escaped := make([]string, len(items))
-	for i, s := range items {
-		escaped[i] = `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
-	}
-	return "{" + strings.Join(escaped, ",") + "}"
-}
-
-func marshalPortServices(ps []PortService) (string, error) {
-	items := make([]map[string]any, len(ps))
-	for i, p := range ps {
-		items[i] = map[string]any{"port": p.Port, "service": p.Service}
-	}
-	return marshalJSONBArray(items)
-}
-
 // nullableInt64 returns sql.NullInt64.
 func nullableInt(v int) interface{} {
 	if v == 0 {
 		return nil
 	}
 	return v
+}
+
+// ── JSON 编解码（原 PG text[]/jsonb[] 列在 TiDB 里是 JSON 文本 MEDIUMTEXT）────
+
+// marshalJSONArray 把对象数组编成合法 JSON 文本（空 → "[]"）。
+func marshalJSONArray(items []map[string]any) (string, error) {
+	if len(items) == 0 {
+		return "[]", nil
+	}
+	b, err := json.Marshal(items)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// marshalStringArray 把字符串数组编成合法 JSON 文本（空 → "[]"）。
+func marshalStringArray(items []string) string {
+	if len(items) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(items)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+func marshalPortServices(ps []PortService) (string, error) {
+	items := make([]map[string]any, 0, len(ps))
+	for _, p := range ps {
+		items = append(items, map[string]any{"port": p.Port, "service": p.Service})
+	}
+	return marshalJSONArray(items)
+}
+
+// marshalTaskIDs 把 task_id 集合编成 JSON 数字数组（assets.task_ids 列）。
+func marshalTaskIDs(ids []int64) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, itoa(id))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// decodeJSONArray 读回一个 JSON 数组列；空列 / 非法 JSON 一律按空数组处理。
+func decodeJSONArray(raw string) []any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []any
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// decodeStringArray 读回一个字符串 JSON 数组列。
+func decodeStringArray(raw string) []string {
+	var out []string
+	for _, item := range decodeJSONArray(raw) {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// decodeInt64Array 读回一个数字 JSON 数组列（assets.task_ids）。
+func decodeInt64Array(raw string) []int64 {
+	var out []int64
+	for _, item := range decodeJSONArray(raw) {
+		switch n := item.(type) {
+		case float64:
+			out = append(out, int64(n))
+		case string:
+			var v int64
+			if _, err := fmt.Sscanf(n, "%d", &v); err == nil {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+// assetUnionStrings 合并字符串 JSON 数组：旧元素保持原顺序在前，新元素按值去重后追加。
+func assetUnionStrings(oldJSON string, added []string) string {
+	if len(added) == 0 {
+		if strings.TrimSpace(oldJSON) == "" {
+			return "[]"
+		}
+		return marshalStringArray(decodeStringArray(oldJSON))
+	}
+	seen := map[string]struct{}{}
+	merged := make([]string, 0, len(added))
+	for _, s := range decodeStringArray(oldJSON) {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		merged = append(merged, s)
+	}
+	for _, s := range added {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		merged = append(merged, s)
+	}
+	return marshalStringArray(merged)
+}
+
+// assetUnionTaskIDs 合并 assets.task_ids（数字数组，按值去重，保持稳定顺序）。
+func assetUnionTaskIDs(oldJSON string, added []int64) string {
+	seen := map[int64]struct{}{}
+	merged := make([]int64, 0, len(added))
+	for _, id := range decodeInt64Array(oldJSON) {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		merged = append(merged, id)
+	}
+	for _, id := range added {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		merged = append(merged, id)
+	}
+	return marshalTaskIDs(merged)
+}
+
+// assetMergeObjects 合并对象 JSON 数组：同 key 由 pick 决定保留哪一个，
+// 不同 key 按"旧在前、新在后"排列。pick 返回 true 表示用 next 替换 cur。
+// open_ports（port 分组 + service 非空优先）与 params（location+name 分组 +
+// 元素文本 DESC 优先）都走这里，对应 spec §3.3.1 的两条真实去重语义。
+func assetMergeObjects(
+	oldJSON string,
+	added []map[string]any,
+	key func(map[string]any) string,
+	pick func(cur, next map[string]any) bool,
+) (string, error) {
+	var current []map[string]any
+	for _, item := range decodeJSONArray(oldJSON) {
+		if m, ok := item.(map[string]any); ok {
+			current = append(current, m)
+		}
+	}
+	index := map[string]int{}
+	for i, m := range current {
+		index[key(m)] = i
+	}
+	for _, next := range added {
+		k := key(next)
+		if at, ok := index[k]; ok {
+			if pick != nil && pick(current[at], next) {
+				current[at] = next
+			}
+			continue
+		}
+		index[k] = len(current)
+		current = append(current, next)
+	}
+	if len(current) == 0 {
+		return "[]", nil
+	}
+	return marshalJSONArray(current)
+}
+
+// assetPortKey 是 open_ports 元素的去重键（同端口只保留一条）。
+func assetPortKey(m map[string]any) string {
+	return fmt.Sprintf("%v", m["port"])
+}
+
+// assetPreferService 是同端口元素的保留策略：service 非空优先（spec §3.3.1）。
+func assetPreferService(cur, next map[string]any) bool {
+	return assetTextField(cur, "service") == "" && assetTextField(next, "service") != ""
+}
+
+// assetTextField 取对象字段的文本值（缺失 / null → ""）。
+func assetTextField(m map[string]any, key string) string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", v))
+}
+
+// assetParamKey 是 endpoint.params 元素的去重键（location + name 视为同一引用）。
+func assetParamKey(m map[string]any) string {
+	return fmt.Sprintf("%v\x00%v", m["location"], m["name"])
+}
+
+// assetJSONText 把元素稳定编码成 JSON 文本，用于"元素整体"比较与 DESC 排序。
+func assetJSONText(m map[string]any) string {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// =====================================================================
+// 8 分支规范化写入引擎（spec §3.2.1）
+// =====================================================================
+
+// assetBranchPair 是 8 个身份分支的 (identity 列, hash 列) 对，顺序固定，
+// 用于"仅激活当前分支、其余 7 对显式绑定 NULL"的全量列绑定。
+var assetBranchPair = [8][2]string{
+	{"identity_root_domain", "hash_root_domain"},
+	{"identity_ip", "hash_ip"},
+	{"identity_subdomain", "hash_subdomain"},
+	{"identity_app_bundle", "hash_app_bundle"},
+	{"identity_app_name", "hash_app_name"},
+	{"identity_service_http", "hash_service_http"},
+	{"identity_service_other", "hash_service_other"},
+	{"identity_endpoint", "hash_endpoint"},
+}
+
+// assetNotNullDefaults 是 assets 表上 NOT NULL 且无 DEFAULT 的列兜底值
+// （TiDB strict 模式下漏写即报错；JSON 列一律写成合法 JSON 文本）。
+var assetNotNullDefaults = []assetCol{
+	{"task_ids", "[]"},
+	{"bound_domains", "[]"},
+	{"open_ports", "[]"},
+	{"record_value", "[]"},
+	{"technologies", "[]"},
+	{"auth", "[]"},
+	{"params", "[]"},
+	{"extra", "{}"},
+	{"company_source", "scope"},
+}
+
+// assetBranch 是一个分支的 canonical 身份 + 该身份的 identity/hash 列对。
+type assetBranch struct {
+	name     string // 诊断用分支名
+	identCol string
+	hashCol  string
+	identity []byte
+	hash     [32]byte
+}
+
+func newAssetBranch(name string, identity []byte) assetBranch {
+	sum := schema.CanonicalHash(identity)
+	return assetBranch{
+		name:     name,
+		identCol: "identity_" + strings.TrimPrefix(name, "assets_"),
+		hashCol:  "hash_" + strings.TrimPrefix(name, "assets_"),
+		identity: identity,
+		hash:     sum,
+	}
+}
+
+// assetCol 是写入时的一列（列名 + 绑定值）。
+type assetCol struct {
+	Col string
+	Val any
+}
+
+// assetRawExpr 标记"直接嵌入 SQL 的表达式"（例如 last_seen = NOW(3)），
+// 它不参与参数绑定，因此不会被当成字符串字面量写进 DATETIME 列。
+type assetRawExpr string
+
+// assetWrite 是一次分支写入：全量插入列 + 身份不可变更新所需的回读列与合并器。
+type assetWrite struct {
+	branch assetBranch
+	// insert 是业务列（不含 identity_*/hash_*，那些由引擎按严格激活规则追加）。
+	insert []assetCol
+	// mergeCols 是 Path A 在持锁保护下需要回读的非身份业务列。
+	mergeCols []string
+	// merge 依据旧行产出 UPDATE 的 SET 列表；严禁返回 identity_*/hash_*/自然键列。
+	merge func(old *assetSnapshot) ([]assetCol, error)
+}
+
+// assetSnapshot 是 Path A 持锁回读到的非身份业务列视图。
+type assetSnapshot struct {
+	cols map[string]any
+}
+
+// str 返回文本列（NULL → ""）。
+func (a *assetSnapshot) str(col string) string {
+	switch v := a.cols[col].(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// raw 返回列的原始驱动值。
+func (a *assetSnapshot) raw(col string) any { return a.cols[col] }
+
+// int64Val 返回整数列（NULL / 非数值 → ok=false）。
+func (a *assetSnapshot) int64Val(col string) (int64, bool) {
+	switch v := a.cols[col].(type) {
+	case int64:
+		return v, true
+	case []byte:
+		var n int64
+		_, err := fmt.Sscanf(string(v), "%d", &n)
+		return n, err == nil
+	case string:
+		var n int64
+		_, err := fmt.Sscanf(v, "%d", &n)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// assetForbiddenUpdateCols 是 Path A UPDATE 里**绝对禁止**出现的身份/自然键列。
+var assetForbiddenUpdateCols = map[string]struct{}{
+	"identity_root_domain": {}, "hash_root_domain": {},
+	"identity_ip": {}, "hash_ip": {},
+	"identity_subdomain": {}, "hash_subdomain": {},
+	"identity_app_bundle": {}, "hash_app_bundle": {},
+	"identity_app_name": {}, "hash_app_name": {},
+	"identity_service_http": {}, "hash_service_http": {},
+	"identity_service_other": {}, "hash_service_other": {},
+	"identity_endpoint": {}, "hash_endpoint": {},
+	"type": {}, "domain": {}, "root_domain": {}, "record_type": {},
+	"bundle_id": {}, "app_name": {}, "url": {}, "method": {},
+	"port": {}, "service_name": {}, "service_type": {},
+}
+
+// writeAsset 执行 spec §3.2.1 的两阶段写前仲裁协议：
+//
+//	候选定位（非锁定读 hash 唯一索引）
+//	  ├─ Path A（candidatePK > 0）：SELECT id … WHERE id = ? FOR UPDATE 行级悲观锁
+//	  │                              → schema.VerifyHashArbitration 写前仲裁
+//	  │                              → 身份不可变 UPDATE → 身份漂移复核
+//	  └─ Path B（无候选）        ：严格 INSERT（无 ODKU / 无 RETURNING）
+//	                                 → LastInsertId → 同事务 VerifyHashArbitration 自洽
+//	                                 → 1062 时整笔回滚，由外层在新事务里转 Path A
+//
+// 任何 ErrIdentityHashCollision 都直接上抛，由 runAssetAttempt 的 defer 完整回滚，
+// 绝不修改该行（"先覆盖后仲裁"在本协议里被结构性排除）。
+func (s *AssetStore) writeAsset(w assetWrite) (int64, error) {
+	if s.tx == nil {
+		return 0, fmt.Errorf("assets: writeAsset requires an active transaction")
+	}
+	ctx := context.Background()
+
+	candidate, err := s.assetCandidatePK(w.branch)
+	if err != nil {
+		return 0, err
+	}
+	if candidate > 0 {
+		return s.assetPathA(ctx, w, candidate)
+	}
+	return s.assetPathB(ctx, w)
+}
+
+// assetCandidatePK 按 hash 唯一索引定位候选物理 PK（非锁定读；真正的悲观锁
+// 只在 Path A 拿到 PK 之后按物理主键获取，符合 spec §4.3 的锁序前置条件）。
+func (s *AssetStore) assetCandidatePK(b assetBranch) (int64, error) {
+	var pk int64
+	err := s.tx.QueryRow("SELECT id FROM assets WHERE "+b.hashCol+" = ?", b.hash[:]).Scan(&pk)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if pk < 0 {
+		return 0, fmt.Errorf("assets: negative candidate pk %d on %s", pk, b.hashCol)
+	}
+	return pk, nil
+}
+
+// assetPathA 是已知候选行的两阶段更新：PK 行锁 → 写前仲裁 → 身份不可变更新。
+func (s *AssetStore) assetPathA(ctx context.Context, w assetWrite, candidate int64) (int64, error) {
+	b := w.branch
+
+	// 1) 行级悲观锁：严格按物理 PK 取锁（hash/自然键一律不能当预定位器）。
+	var locked int64
+	err := s.tx.QueryRow("SELECT id FROM assets WHERE id = ? FOR UPDATE", candidate).Scan(&locked)
+	if errors.Is(err, sql.ErrNoRows) {
+		// 候选已被并发删除：整笔回滚后在新事务里重放（此时应落进 Path B）。
+		return 0, fmt.Errorf("%w: candidate %d vanished before lock", errAssetWriteRetry, candidate)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if locked != candidate {
+		return 0, fmt.Errorf("%w: pk lock returned %d, want %d", errAssetWriteRetry, locked, candidate)
+	}
+
+	// 2) 写前仲裁：持锁保护下核验"持久化 identity 与输入逐字节相等且 PK 等于候选"。
+	verified, err := schema.VerifyHashArbitration(ctx, s.tx, "assets", "id", b.identCol, b.hashCol, b.hash, b.identity)
+	if err != nil {
+		// ErrIdentityHashCollision 走这里：调用方 defer 已保证完整回滚、零写入。
+		return 0, fmt.Errorf("assets: write-ahead arbitration rejected branch %s: %w", b.name, err)
+	}
+	if uint64(candidate) != verified {
+		return 0, fmt.Errorf("%w: arbitration pk %d != candidate %d", errAssetWriteRetry, verified, candidate)
+	}
+
+	// 3) 身份不可变更新：只读非身份业务列，只写非身份业务列。
+	old, err := s.assetReadCols(candidate, w.mergeCols)
+	if err != nil {
+		return 0, err
+	}
+	set, err := w.merge(old)
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range set {
+		if _, forbidden := assetForbiddenUpdateCols[c.Col]; forbidden {
+			return 0, fmt.Errorf("assets: identity-immutable violation, UPDATE must never write column %q", c.Col)
+		}
+	}
+	if err := s.assetUpdate(candidate, set); err != nil {
+		return 0, err
+	}
+
+	// 4) 更新后复核：身份必须仍然逐字节等于输入 canonical 身份（零漂移）。
+	if err := s.assetVerifyIdentity(ctx, b, candidate); err != nil {
+		return 0, err
+	}
+	return candidate, nil
+}
+
+// assetPathB 是无候选行的严格插入路径。
+func (s *AssetStore) assetPathB(ctx context.Context, w assetWrite) (int64, error) {
+	b := w.branch
+
+	cols := make([]assetCol, 0, len(w.insert)+len(assetNotNullDefaults)+len(assetBranchPair)*2)
+	cols = append(cols, w.insert...)
+	// 表上这些列是 NOT NULL 且没有 DEFAULT：任何分支漏写都会在 strict 模式下
+	// 直接失败，所以由引擎统一兜底成合法 JSON 文本 / 默认归属来源。
+	provided := make(map[string]struct{}, len(cols))
+	for _, c := range cols {
+		provided[c.Col] = struct{}{}
+	}
+	for _, def := range assetNotNullDefaults {
+		if _, ok := provided[def.Col]; !ok {
+			cols = append(cols, def)
+		}
+	}
+	for _, pair := range assetBranchPair {
+		if pair[0] == b.identCol {
+			cols = append(cols,
+				assetCol{pair[0], b.identity},
+				assetCol{pair[1], b.hash[:]},
+			)
+			continue
+		}
+		// 其余 7 个分支必须显式绑定 NULL（hash 唯一索引对 NULL 不去重，
+		// 漏绑会让分支唯一性静默失效）。
+		cols = append(cols,
+			assetCol{pair[0], nil},
+			assetCol{pair[1], nil},
+		)
+	}
+
+	names := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols))
+	for _, c := range cols {
+		names = append(names, c.Col)
+		args = append(args, c.Val)
+	}
+	stmt := "INSERT INTO assets(" + strings.Join(names, ", ") + ") VALUES (" +
+		strings.Join(repeatQuestion(len(cols)), ", ") + ")"
+
+	res, err := s.tx.Exec(stmt, args...)
+	if err != nil {
+		if assetIsDuplicateKey(err) {
+			// 并发插入赢家：本轮尝试必须整体回滚，由外层重试循环在全新事务里转 Path A。
+			return 0, fmt.Errorf("%w: duplicate %s on branch %s: %v", errAssetWriteRetry, b.hashCol, b.name, err)
+		}
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("assets: LastInsertId after INSERT: %w", err)
+	}
+	// LastInsertId 必须落在 [1, MaxInt64]：int64 天然满足上界，这里当场拒绝
+	// 0 与负数（BIGINT UNSIGNED 溢出成负数时必须阻断，绝不能让脏 PK 扩散到 API）。
+	if id < 1 || id > int64(math.MaxInt64) {
+		return 0, fmt.Errorf("assets: inserted pk %d out of range [1, %d]", id, int64(math.MaxInt64))
+	}
+
+	// 同事务自洽校验：新行的持久化 identity 必须与输入逐字节一致且 PK 等于自增值。
+	verified, err := schema.VerifyHashArbitration(ctx, s.tx, "assets", "id", b.identCol, b.hashCol, b.hash, b.identity)
+	if err != nil {
+		return 0, fmt.Errorf("assets: self-verification failed for fresh row on branch %s: %w", b.name, err)
+	}
+	if uint64(id) != verified {
+		return 0, fmt.Errorf("assets: self-verification pk %d != inserted %d", verified, id)
+	}
+	return id, nil
+}
+
+// assetVerifyIdentity 复核持久化身份未发生漂移。
+func (s *AssetStore) assetVerifyIdentity(ctx context.Context, b assetBranch, pk int64) error {
+	var persisted []byte
+	if err := s.tx.QueryRowContext(ctx, "SELECT "+b.identCol+" FROM assets WHERE id = ?", pk).Scan(&persisted); err != nil {
+		return fmt.Errorf("assets: identity recheck on %d: %w", pk, err)
+	}
+	if !bytes.Equal(persisted, b.identity) {
+		return fmt.Errorf("assets: identity drifted on pk %d branch %s after update", pk, b.name)
+	}
+	return nil
+}
+
+// assetReadCols 在持锁保护下回读指定的非身份业务列。
+func (s *AssetStore) assetReadCols(pk int64, cols []string) (*assetSnapshot, error) {
+	snapshot := &assetSnapshot{cols: map[string]any{}}
+	if len(cols) == 0 {
+		return snapshot, nil
+	}
+	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM assets WHERE id = ?"
+	row := s.tx.QueryRow(stmt, pk)
+	targets := make([]any, 0, len(cols))
+	for range cols {
+		targets = append(targets, new(any))
+	}
+	if err := row.Scan(targets...); err != nil {
+		return nil, fmt.Errorf("assets: read business columns on %d: %w", pk, err)
+	}
+	for i, col := range cols {
+		if ptr, ok := targets[i].(*any); ok {
+			snapshot.cols[col] = *ptr
+		}
+	}
+	return snapshot, nil
+}
+
+// assetUpdate 只写非身份业务列（调用前已按 assetForbiddenUpdateCols 过滤）。
+func (s *AssetStore) assetUpdate(pk int64, set []assetCol) error {
+	if len(set) == 0 {
+		return nil
+	}
+	assign := make([]string, 0, len(set))
+	args := make([]any, 0, len(set)+1)
+	for _, c := range set {
+		if expr, ok := c.Val.(assetRawExpr); ok {
+			assign = append(assign, c.Col+" = "+string(expr))
+			continue
+		}
+		assign = append(assign, c.Col+" = ?")
+		args = append(args, c.Val)
+	}
+	args = append(args, pk)
+	if _, err := s.tx.Exec("UPDATE assets SET "+strings.Join(assign, ", ")+" WHERE id = ?", args...); err != nil {
+		return fmt.Errorf("assets: identity-immutable update on %d: %w", pk, err)
+	}
+	return nil
+}
+
+func repeatQuestion(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "?"
+	}
+	return out
+}
+
+// assetCompanyCols 把归属解析结果编成 company_id / company_source 两列。
+func assetCompanyCols(id *int64, explicit bool) []assetCol {
+	source := "scope"
+	if explicit {
+		source = "explicit"
+	}
+	var val any
+	if id != nil {
+		val = *id
+	}
+	return []assetCol{{"company_id", val}, {"company_source", source}}
+}
+
+// assetMergeCompanyCols 复刻原 ODKU 的归属优先级：
+// 持久化 explicit 归属不可被 scope 推导覆盖；本次是 explicit 时直接覆盖。
+func assetMergeCompanyCols(old *assetSnapshot, incoming *int64, incomingExplicit bool) []assetCol {
+	persistedID, hasID := old.int64Val("company_id")
+	persistedSource := old.str("company_source")
+
+	if incomingExplicit && incoming != nil {
+		return []assetCol{{"company_id", *incoming}, {"company_source", "explicit"}}
+	}
+	if persistedSource == "explicit" && hasID {
+		return []assetCol{{"company_id", persistedID}, {"company_source", "explicit"}}
+	}
+	if incoming != nil {
+		return []assetCol{{"company_id", *incoming}, {"company_source", "scope"}}
+	}
+	if hasID {
+		source := persistedSource
+		if source == "" {
+			source = "scope"
+		}
+		return []assetCol{{"company_id", persistedID}, {"company_source", source}}
+	}
+	return nil
+}
+
+// assetTaskIDsOf 把单个 TaskID 编成切片（0 表示本次不归属任何任务）。
+func assetTaskIDsOf(taskID int64) []int64 {
+	if taskID > 0 {
+		return []int64{taskID}
+	}
+	return nil
 }
 
 // =====================================================================
@@ -273,38 +1102,33 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 		return 0, err
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
 	var icpVal any
 	if req.ICP != "" {
 		icpVal = req.ICP
 	}
 
-	var id int64
-	err = s.tx.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, icp, company_id, company_source, task_ids)
-VALUES ('root_domain', $1, $1, $2, $3, 'scope', $4::bigint[])
-ON CONFLICT (domain) WHERE type = 'root_domain' DO UPDATE SET
-    icp        = COALESCE(EXCLUDED.icp, assets.icp),
-    company_id = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    extra      = assets.extra || EXCLUDED.extra,
-    last_seen  = now()
-RETURNING id`, domain, icpVal, companyID, taskIDs).Scan(&id)
-	return id, err
+	branch := newAssetBranch("assets_root_domain", schema.AssetsRootDomainIdentity(domain))
+	return s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "root_domain"},
+			{"domain", domain},
+			{"root_domain", domain},
+			{"icp", icpVal},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+			{"extra", "{}"},
+		}, assetCompanyCols(companyID, false)...),
+		mergeCols: []string{"task_ids", "icp", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))}}
+			if req.ICP != "" && old.str("icp") == "" {
+				set = append(set, assetCol{"icp", req.ICP})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, false)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 }
 
 // ErrAssetIPInvalid marks a non-address value in an asset's ip field. Both
@@ -348,26 +1172,23 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 	if err := ValidateAssetIP(req.IP); err != nil {
 		return 0, err
 	}
+	ipStr, ok := canonicalIP(req.IP)
+	if !ok {
+		return 0, fmt.Errorf("%w: %s", ErrAssetIPInvalid, req.IP)
+	}
 	if s.tx == nil {
 		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertIP(req)
 		})
 	}
-	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP("", req.IP, "")
+	cseg := calcCSegment(ipStr)
+	companyID, err := s.resolveCompanyWithICP("", ipStr, "")
 	if err != nil {
 		return 0, err
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
 	boundDomains := marshalStringArray(req.BoundDomains)
-	openPortsJSON, err := marshalPortServices(req.OpenPorts)
+	openPorts, err := marshalPortServices(req.OpenPorts)
 	if err != nil {
 		return 0, err
 	}
@@ -377,34 +1198,41 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 		csegVal = cseg
 	}
 
-	var id int64
-	err = s.tx.QueryRow(`
-INSERT INTO assets(type, ip, c_segment, bound_domains, open_ports, company_id, company_source, task_ids)
-VALUES ('ip', $1, $2::cidr, $3::text[], $4::jsonb[], $5, 'scope', $6::bigint[])
-ON CONFLICT (ip) WHERE type = 'ip' DO UPDATE SET
-    bound_domains = (SELECT ARRAY(SELECT DISTINCT unnest(assets.bound_domains || EXCLUDED.bound_domains))),
-    open_ports    = (
-        SELECT ARRAY(
-            SELECT DISTINCT ON ((elem->>'port')::int) elem
-            FROM unnest(assets.open_ports || EXCLUDED.open_ports) AS elem
-            ORDER BY (elem->>'port')::int,
-                     CASE WHEN elem->>'service' IS NOT NULL AND elem->>'service' <> '' THEN 0 ELSE 1 END
-        )
-    ),
-    c_segment  = COALESCE(assets.c_segment, EXCLUDED.c_segment),
-    company_id = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    last_seen  = now()
-RETURNING id`, req.IP, csegVal, boundDomains, openPortsJSON, companyID, taskIDs).Scan(&id)
-	return id, err
+	addedPorts := make([]map[string]any, 0, len(req.OpenPorts))
+	for _, p := range req.OpenPorts {
+		addedPorts = append(addedPorts, map[string]any{"port": p.Port, "service": p.Service})
+	}
+
+	branch := newAssetBranch("assets_ip", schema.AssetsIPIdentity(ipStr))
+	return s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "ip"},
+			{"ip", ipStr},
+			{"c_segment", csegVal},
+			{"bound_domains", boundDomains},
+			{"open_ports", openPorts},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+		}, assetCompanyCols(companyID, false)...),
+		mergeCols: []string{"task_ids", "bound_domains", "open_ports", "c_segment", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{
+				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"bound_domains", assetUnionStrings(old.str("bound_domains"), req.BoundDomains)},
+			}
+			merged, err := assetMergeObjects(old.str("open_ports"), addedPorts, assetPortKey, assetPreferService)
+			if err != nil {
+				return nil, err
+			}
+			set = append(set, assetCol{"open_ports", merged})
+			if csegVal != nil && old.str("c_segment") == "" {
+				set = append(set, assetCol{"c_segment", csegVal})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, false)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 }
 
 // AppendIPPort appends a {port, service} entry to an existing IP asset's open_ports.
@@ -412,20 +1240,10 @@ func (s *AssetStore) AppendIPPort(ipStr string, port int, serviceName string) er
 	if ipStr == "" || port == 0 {
 		return nil
 	}
-	entry, _ := json.Marshal(map[string]any{"port": port, "service": serviceName})
-	_, err := s.db.Exec(`
-UPDATE assets SET
-    open_ports = (
-        SELECT ARRAY(
-            SELECT DISTINCT ON ((elem->>'port')::int) elem
-            FROM unnest(open_ports || ARRAY[$1::jsonb]) AS elem
-            ORDER BY (elem->>'port')::int,
-                     CASE WHEN elem->>'service' IS NOT NULL AND elem->>'service' <> '' THEN 0 ELSE 1 END
-        )
-    ),
-    last_seen = now()
-WHERE type = 'ip' AND ip = $2`, string(entry), ipStr)
-	return err
+	entry := map[string]any{"port": port, "service": serviceName}
+	return s.appendIPJSONArray(ipStr, "open_ports", func(old string) (string, error) {
+		return assetMergeObjects(old, []map[string]any{entry}, assetPortKey, assetPreferService)
+	})
 }
 
 // AppendIPBoundDomain appends a domain to an existing IP asset's bound_domains.
@@ -433,11 +1251,53 @@ func (s *AssetStore) AppendIPBoundDomain(ipStr, domain string) error {
 	if ipStr == "" || domain == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`
-UPDATE assets SET
-    bound_domains = (SELECT ARRAY(SELECT DISTINCT unnest(bound_domains || ARRAY[$1::text]))),
-    last_seen = now()
-WHERE type = 'ip' AND ip = $2`, domain, ipStr)
+	canonical, ok := canonicalIP(ipStr)
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrAssetIPInvalid, ipStr)
+	}
+	return s.appendIPJSONArray(canonical, "bound_domains", func(old string) (string, error) {
+		return assetUnionStrings(old, []string{domain}), nil
+	})
+}
+
+// appendIPJSONArray 在 IP 资产的 hash 行锁保护下读改写一个 JSON 数组列
+// （TiDB 8.5 不支持 JSON_TABLE，数组展开/去重一律在 Go 内存里完成）。
+func (s *AssetStore) appendIPJSONArray(ipStr, column string, merge func(string) (string, error)) error {
+	identity := schema.AssetsIPIdentity(ipStr)
+	hash := schema.CanonicalHash(identity)
+
+	run := func(store *AssetStore) (int64, error) {
+		var pk int64
+		err := store.tx.QueryRow("SELECT id FROM assets WHERE hash_ip = ? FOR UPDATE", hash[:]).Scan(&pk)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil // IP 资产不存在：与原实现一致，静默 no-op
+		}
+		if err != nil {
+			return 0, err
+		}
+		if _, err := schema.VerifyHashArbitration(context.Background(), store.tx, "assets", "id",
+			"identity_ip", "hash_ip", hash, identity); err != nil {
+			return 0, fmt.Errorf("assets: append %s arbitration: %w", column, err)
+		}
+		var current string
+		if err := store.tx.QueryRow("SELECT "+column+" FROM assets WHERE id = ?", pk).Scan(&current); err != nil {
+			return 0, fmt.Errorf("assets: read %s on %d: %w", column, pk, err)
+		}
+		merged, err := merge(current)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := store.tx.Exec("UPDATE assets SET "+column+" = ?, last_seen = NOW(3) WHERE id = ?", merged, pk); err != nil {
+			return 0, fmt.Errorf("assets: write %s on %d: %w", column, pk, err)
+		}
+		return pk, nil
+	}
+
+	if s.tx != nil {
+		_, err := run(s)
+		return err
+	}
+	_, err := s.withAssetMutation(func(scoped *AssetStore) (int64, error) { return run(scoped) })
 	return err
 }
 
@@ -494,11 +1354,15 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 				if candidate == "" || net.ParseIP(candidate) == nil {
 					continue
 				}
+				canonical, ok := canonicalIP(candidate)
+				if !ok {
+					continue
+				}
 				if ipStr == "" {
-					ipStr = candidate
+					ipStr = canonical
 				}
 				_, _ = s.UpsertIP(UpsertIPReq{
-					IP:           candidate,
+					IP:           canonical,
 					BoundDomains: []string{domain},
 					TaskID:       req.TaskID,
 				})
@@ -511,13 +1375,6 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		companyID, _ = s.resolveCompanyWithICP("", ipStr, "")
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
 	var icpVal, csegVal, ipVal any
 	if req.ICP != "" {
 		icpVal = req.ICP
@@ -528,31 +1385,50 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 	if ipStr != "" {
 		ipVal = ipStr
 	}
-	recordType := req.RecordType
-	recordValueArr := marshalStringArray(req.RecordValue)
+	// record_type 参与 canonical 身份：NULL 一律按 "" 参与 COALESCE。
+	recordType := strings.TrimSpace(req.RecordType)
+	recordValue := marshalStringArray(req.RecordValue)
 
-	err = s.tx.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, record_type, record_value, ip, c_segment, icp, company_id, company_source, task_ids)
-VALUES ('subdomain', $1, $2, $3, $4::text[], $5, $6::cidr, $7, $8, 'scope', $9::bigint[])
-ON CONFLICT (domain, COALESCE(record_type,'')) WHERE type = 'subdomain' DO UPDATE SET
-    ip           = COALESCE(EXCLUDED.ip, assets.ip),
-    c_segment    = COALESCE(EXCLUDED.c_segment, assets.c_segment),
-    icp          = COALESCE(EXCLUDED.icp, assets.icp),
-    company_id   = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    task_ids     = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    record_value = (SELECT ARRAY(SELECT DISTINCT unnest(assets.record_value || EXCLUDED.record_value))),
-    extra        = assets.extra || EXCLUDED.extra,
-    last_seen    = now()
-RETURNING id`, domain, rootDomain, recordType, recordValueArr, ipVal, csegVal, icpVal, companyID, taskIDs).Scan(&id)
-	return id, err
+	bindRecordType := any(nil)
+	if recordType != "" {
+		bindRecordType = recordType
+	}
+
+	branch := newAssetBranch("assets_subdomain", schema.AssetsSubdomainIdentity(domain, recordType))
+	return s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "subdomain"},
+			{"domain", domain},
+			{"root_domain", rootDomain},
+			{"record_type", bindRecordType},
+			{"record_value", recordValue},
+			{"ip", ipVal},
+			{"c_segment", csegVal},
+			{"icp", icpVal},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+			{"extra", "{}"},
+		}, assetCompanyCols(companyID, false)...),
+		mergeCols: []string{"task_ids", "record_value", "ip", "c_segment", "icp", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{
+				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"record_value", assetUnionStrings(old.str("record_value"), req.RecordValue)},
+			}
+			if ipVal != nil && old.str("ip") == "" {
+				set = append(set, assetCol{"ip", ipVal})
+			}
+			if csegVal != nil && old.str("c_segment") == "" {
+				set = append(set, assetCol{"c_segment", csegVal})
+			}
+			if icpVal != nil && old.str("icp") == "" {
+				set = append(set, assetCol{"icp", icpVal})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, false)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 }
 
 // =====================================================================
@@ -570,7 +1446,8 @@ type UpsertAppReq struct {
 	TaskID      int64
 }
 
-// UpsertApp idempotently inserts or merges an app asset.
+// UpsertApp idempotently inserts or merges an app asset. bundle_id 与 app_name
+// 两个分支严格互斥：bundle_id 非空时只激活 app_bundle 分支，否则回落到 app_name。
 func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 	if req.Name == "" {
 		return 0, fmt.Errorf("app name is required")
@@ -581,18 +1458,7 @@ func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 		})
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
-	var bundleVal, catVal, descVal, icpVal, companyIDVal any
-	companySource := "scope"
-	if req.BundleID != "" {
-		bundleVal = req.BundleID
-	}
+	var catVal, descVal, icpVal any
 	if req.Category != "" {
 		catVal = req.Category
 	}
@@ -602,69 +1468,58 @@ func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 	if req.ICP != "" {
 		icpVal = req.ICP
 	}
-	if req.CompanyID != nil {
-		companyIDVal = *req.CompanyID
-		companySource = "explicit"
-	} else {
-		companyID, err := s.resolveCompanyWithICP("", "", req.ICP)
+	companyID := req.CompanyID
+	explicit := companyID != nil
+	if !explicit {
+		resolved, err := s.resolveCompanyWithICP("", "", req.ICP)
 		if err != nil {
 			return 0, err
 		}
-		if companyID != nil {
-			companyIDVal = *companyID
-		}
+		companyID = resolved
 	}
 
-	var id int64
-	var err error
+	bundleID := strings.TrimSpace(req.BundleID)
+	appName := strings.TrimSpace(req.Name)
 
-	if req.BundleID != "" {
-		err = s.tx.QueryRow(`
-INSERT INTO assets(type, bundle_id, app_name, category, app_description, app_icp, company_id, company_source, task_ids)
-VALUES ('app', $1, $2, $3, $4, $5, $6, $7, $8::bigint[])
-ON CONFLICT (bundle_id) WHERE type = 'app' AND bundle_id IS NOT NULL DO UPDATE SET
-    app_name        = COALESCE(EXCLUDED.app_name, assets.app_name),
-    category        = COALESCE(EXCLUDED.category, assets.category),
-    app_description = COALESCE(EXCLUDED.app_description, assets.app_description),
-    app_icp         = COALESCE(EXCLUDED.app_icp, assets.app_icp),
-    company_id      = CASE
-        WHEN EXCLUDED.company_source = 'explicit' THEN EXCLUDED.company_id
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source  = CASE
-        WHEN EXCLUDED.company_source = 'explicit' THEN 'explicit'
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    task_ids        = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    last_seen       = now()
-RETURNING id`, bundleVal, req.Name, catVal, descVal, icpVal, companyIDVal, companySource, taskIDs).Scan(&id)
+	var branch assetBranch
+	bundleCol := any(nil)
+	if bundleID != "" {
+		bundleCol = bundleID
+		branch = newAssetBranch("assets_app_bundle", schema.AssetsAppBundleIdentity(bundleID))
 	} else {
-		err = s.tx.QueryRow(`
-INSERT INTO assets(type, bundle_id, app_name, category, app_description, app_icp, company_id, company_source, task_ids)
-VALUES ('app', NULL, $1, $2, $3, $4, $5, $6, $7::bigint[])
-ON CONFLICT (app_name) WHERE type = 'app' AND bundle_id IS NULL DO UPDATE SET
-    category        = COALESCE(EXCLUDED.category, assets.category),
-    app_description = COALESCE(EXCLUDED.app_description, assets.app_description),
-    app_icp         = COALESCE(EXCLUDED.app_icp, assets.app_icp),
-    company_id      = CASE
-        WHEN EXCLUDED.company_source = 'explicit' THEN EXCLUDED.company_id
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source  = CASE
-        WHEN EXCLUDED.company_source = 'explicit' THEN 'explicit'
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    task_ids        = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    last_seen       = now()
-RETURNING id`, req.Name, catVal, descVal, icpVal, companyIDVal, companySource, taskIDs).Scan(&id)
+		branch = newAssetBranch("assets_app_name", schema.AssetsAppNameIdentity(appName))
 	}
-	return id, err
+
+	return s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "app"},
+			{"bundle_id", bundleCol},
+			{"app_name", appName},
+			{"category", catVal},
+			{"app_description", descVal},
+			{"app_icp", icpVal},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+		}, assetCompanyCols(companyID, explicit)...),
+		mergeCols: []string{"task_ids", "category", "app_description", "app_icp", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{
+				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+			}
+			if catVal != nil && old.str("category") == "" {
+				set = append(set, assetCol{"category", catVal})
+			}
+			if descVal != nil && old.str("app_description") == "" {
+				set = append(set, assetCol{"app_description", descVal})
+			}
+			if icpVal != nil && old.str("app_icp") == "" {
+				set = append(set, assetCol{"app_icp", icpVal})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, explicit)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 }
 
 // =====================================================================
@@ -693,33 +1548,34 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	if err := ValidateAssetIP(req.IP); err != nil {
 		return 0, err
 	}
+	normURL := normalizeURL(req.URL)
 	if s.tx == nil {
 		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertHTTPService(req)
 		})
 	}
-	normURL := normalizeURL(req.URL)
 	domain, port, serviceName := parseURL(normURL)
 	rootDomain, _ := RootDomain(domain)
 	if rootDomain == "" {
 		rootDomain = domain
 	}
 
-	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	canonicalIPStr := ""
+	if req.IP != "" {
+		canonical, ok := canonicalIP(req.IP)
+		if !ok {
+			return 0, fmt.Errorf("%w: %s", ErrAssetIPInvalid, req.IP)
+		}
+		canonicalIPStr = canonical
+	}
+	cseg := calcCSegment(canonicalIPStr)
+	companyID, err := s.resolveCompanyWithICP(rootDomain, canonicalIPStr, "")
 	if err != nil {
 		return 0, err
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
-	techsArr := marshalStringArray(req.Technologies)
-	authJSON, err := marshalJSONBArray(req.Auth)
+	techs := marshalStringArray(req.Technologies)
+	authJSON, err := marshalJSONArray(req.Auth)
 	if err != nil {
 		return 0, err
 	}
@@ -728,8 +1584,8 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	if domain != "" {
 		domainVal = domain
 	}
-	if req.IP != "" {
-		ipVal = req.IP
+	if canonicalIPStr != "" {
+		ipVal = canonicalIPStr
 	}
 	if cseg != "" {
 		csegVal = cseg
@@ -741,55 +1597,68 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 		faviconVal = req.FaviconMMH3
 	}
 
-	var id int64
-	err = s.tx.QueryRow(`
-INSERT INTO assets(
-    type, url, service_type, service_name, domain, ip, port, root_domain,
-    c_segment, favicon_mmh3, technologies, status_code, content_length, page_title,
-    auth, company_id, company_source, task_ids
-)
-VALUES (
-    'service', $1, 'http', $2, $3, $4, $5, $6,
-    $7::cidr, $8, $9::text[], $10, $11, $12,
-    $13::jsonb[], $14, 'scope', $15::bigint[]
-)
-ON CONFLICT (url) WHERE type = 'service' AND service_type = 'http' DO UPDATE SET
-    status_code    = COALESCE(EXCLUDED.status_code,    assets.status_code),
-    content_length = COALESCE(EXCLUDED.content_length, assets.content_length),
-    page_title     = COALESCE(EXCLUDED.page_title,     assets.page_title),
-    favicon_mmh3   = COALESCE(EXCLUDED.favicon_mmh3,   assets.favicon_mmh3),
-    ip             = COALESCE(EXCLUDED.ip,             assets.ip),
-    c_segment      = COALESCE(EXCLUDED.c_segment,      assets.c_segment),
-    technologies   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.technologies || EXCLUDED.technologies))),
-    auth           = (
-        SELECT ARRAY(
-            SELECT DISTINCT ON (elem::text) elem
-            FROM unnest(assets.auth || EXCLUDED.auth) AS elem
-        )
-    ),
-    task_ids       = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    company_id     = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    last_seen      = now()
-RETURNING id`,
-		normURL, serviceName, domainVal, ipVal, nullableInt(port), rootDomain,
-		csegVal, faviconVal, techsArr, req.StatusCode, req.ContentLength, titleVal,
-		authJSON, companyID, taskIDs,
-	).Scan(&id)
+	branch := newAssetBranch("assets_service_http", schema.AssetsServiceHTTPIdentity(normURL))
+	id, err := s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "service"},
+			{"service_type", "http"},
+			{"url", normURL},
+			{"service_name", serviceName},
+			{"domain", domainVal},
+			{"ip", ipVal},
+			{"port", nullableInt(port)},
+			{"root_domain", rootDomain},
+			{"c_segment", csegVal},
+			{"favicon_mmh3", faviconVal},
+			{"technologies", techs},
+			{"status_code", req.StatusCode},
+			{"content_length", req.ContentLength},
+			{"page_title", titleVal},
+			{"auth", authJSON},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+		}, assetCompanyCols(companyID, false)...),
+		mergeCols: []string{"task_ids", "technologies", "auth", "status_code", "content_length",
+			"page_title", "favicon_mmh3", "ip", "c_segment", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{
+				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"technologies", assetUnionStrings(old.str("technologies"), req.Technologies)},
+			}
+			mergedAuth, err := assetMergeObjects(old.str("auth"), req.Auth, assetJSONText, nil)
+			if err != nil {
+				return nil, err
+			}
+			set = append(set, assetCol{"auth", mergedAuth})
+			if req.StatusCode != nil {
+				set = append(set, assetCol{"status_code", *req.StatusCode})
+			}
+			if req.ContentLength != nil {
+				set = append(set, assetCol{"content_length", *req.ContentLength})
+			}
+			if titleVal != nil && old.str("page_title") == "" {
+				set = append(set, assetCol{"page_title", titleVal})
+			}
+			if faviconVal != nil && old.str("favicon_mmh3") == "" {
+				set = append(set, assetCol{"favicon_mmh3", faviconVal})
+			}
+			if ipVal != nil && old.str("ip") == "" {
+				set = append(set, assetCol{"ip", ipVal}, assetCol{"c_segment", csegVal})
+			} else if csegVal != nil && old.str("c_segment") == "" {
+				set = append(set, assetCol{"c_segment", csegVal})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, false)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 	if err != nil {
 		return 0, err
 	}
 
 	// side effects: register root_domain + subdomain as their own assets too
 	s.linkHostAssets(domain, rootDomain, req.TaskID)
-	if req.IP != "" {
+	if canonicalIPStr != "" {
 		var boundDomains []string
 		if domain != "" {
 			boundDomains = []string{domain}
@@ -799,7 +1668,7 @@ RETURNING id`,
 			openPorts = []PortService{{Port: port, Service: serviceName}}
 		}
 		_, _ = s.UpsertIP(UpsertIPReq{
-			IP:           req.IP,
+			IP:           canonicalIPStr,
 			BoundDomains: boundDomains,
 			OpenPorts:    openPorts,
 			TaskID:       req.TaskID,
@@ -833,6 +1702,10 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	if req.Port == 0 {
 		return 0, fmt.Errorf("port is required")
 	}
+	// port 必须落在合法 1..65535 区间，越界值会污染 canonical 身份。
+	if req.Port < 1 || req.Port > 65535 {
+		return 0, fmt.Errorf("port must be in 1..65535, got %d", req.Port)
+	}
 	if req.ServiceName == "" {
 		return 0, fmt.Errorf("service_name is required")
 	}
@@ -841,11 +1714,19 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 			return scoped.UpsertOtherService(req)
 		})
 	}
-	// normalize service_name (lowercase) so the (domain,ip,port,service_name)
-	// dedup key doesn't split "SSH" and "ssh" into separate rows.
+	// normalize service_name (lowercase) so the canonical identity doesn't split
+	// "SSH" and "ssh" into separate rows.
 	serviceName := strings.ToLower(strings.TrimSpace(req.ServiceName))
 
 	domain := DomainKey(req.Domain)
+	canonicalIPStr := ""
+	if req.IP != "" {
+		canonical, ok := canonicalIP(req.IP)
+		if !ok {
+			return 0, fmt.Errorf("%w: %s", ErrAssetIPInvalid, req.IP)
+		}
+		canonicalIPStr = canonical
+	}
 	var rootDomain string
 	if domain != "" {
 		rootDomain, _ = RootDomain(domain)
@@ -854,20 +1735,13 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 		}
 	}
 
-	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	cseg := calcCSegment(canonicalIPStr)
+	companyID, err := s.resolveCompanyWithICP(rootDomain, canonicalIPStr, "")
 	if err != nil {
 		return 0, err
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
-	authJSON, err := marshalJSONBArray(req.Auth)
+	authJSON, err := marshalJSONArray(req.Auth)
 	if err != nil {
 		return 0, err
 	}
@@ -879,57 +1753,60 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	if rootDomain != "" {
 		rootDomainVal = rootDomain
 	}
-	if req.IP != "" {
-		ipVal = req.IP
+	if canonicalIPStr != "" {
+		ipVal = canonicalIPStr
 	}
 	if cseg != "" {
 		csegVal = cseg
 	}
 
-	var id int64
-	err = s.tx.QueryRow(`
-INSERT INTO assets(
-    type, service_type, service_name, domain, ip, port, root_domain,
-    c_segment, auth, company_id, company_source, task_ids
-)
-VALUES ('service', 'other', $1, $2, $3, $4, $5, $6::cidr, $7::jsonb[], $8, 'scope', $9::bigint[])
-ON CONFLICT (COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE type = 'service' AND service_type = 'other' DO UPDATE SET
-    domain     = COALESCE(EXCLUDED.domain,     assets.domain),
-    ip         = COALESCE(EXCLUDED.ip,         assets.ip),
-    c_segment  = COALESCE(EXCLUDED.c_segment,  assets.c_segment),
-    auth       = (
-        SELECT ARRAY(
-            SELECT DISTINCT ON (elem::text) elem
-            FROM unnest(assets.auth || EXCLUDED.auth) AS elem
-        )
-    ),
-    task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    company_id = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    last_seen  = now()
-RETURNING id`,
-		serviceName, domainVal, ipVal, req.Port, rootDomainVal,
-		csegVal, authJSON, companyID, taskIDs,
-	).Scan(&id)
+	// canonical 身份里的 domain/ip 先按 COALESCE 归一为 ""。
+	branch := newAssetBranch("assets_service_other", schema.AssetsServiceOtherIdentity(
+		domain, canonicalIPStr, uint64(req.Port), false, serviceName, false))
+	id, err := s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "service"},
+			{"service_type", "other"},
+			{"service_name", serviceName},
+			{"domain", domainVal},
+			{"ip", ipVal},
+			{"port", req.Port},
+			{"root_domain", rootDomainVal},
+			{"c_segment", csegVal},
+			{"auth", authJSON},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+		}, assetCompanyCols(companyID, false)...),
+		mergeCols: []string{"task_ids", "auth", "c_segment", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{
+				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+			}
+			mergedAuth, err := assetMergeObjects(old.str("auth"), req.Auth, assetJSONText, nil)
+			if err != nil {
+				return nil, err
+			}
+			set = append(set, assetCol{"auth", mergedAuth})
+			if csegVal != nil && old.str("c_segment") == "" {
+				set = append(set, assetCol{"c_segment", csegVal})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, false)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 	if err != nil {
 		return 0, err
 	}
 
 	// side effects
-	if req.IP != "" && req.Port > 0 {
+	if canonicalIPStr != "" && req.Port > 0 {
 		var boundDomains []string
 		if domain != "" {
 			boundDomains = []string{domain}
 		}
 		_, _ = s.UpsertIP(UpsertIPReq{
-			IP:           req.IP,
+			IP:           canonicalIPStr,
 			BoundDomains: boundDomains,
 			OpenPorts:    []PortService{{Port: req.Port, Service: serviceName}},
 			TaskID:       req.TaskID,
@@ -976,33 +1853,34 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	if err := ValidateAssetIP(req.IP); err != nil {
 		return 0, err
 	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	normURL := normalizeURL(req.URL)
 	if s.tx == nil {
 		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertEndpoint(req)
 		})
 	}
-	method := strings.ToUpper(req.Method)
-	normURL := normalizeURL(req.URL)
 	domain, port, _ := parseURL(normURL)
 	rootDomain, _ := RootDomain(domain)
 	if rootDomain == "" {
 		rootDomain = domain
 	}
 
-	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	canonicalIPStr := ""
+	if req.IP != "" {
+		canonical, ok := canonicalIP(req.IP)
+		if !ok {
+			return 0, fmt.Errorf("%w: %s", ErrAssetIPInvalid, req.IP)
+		}
+		canonicalIPStr = canonical
+	}
+	cseg := calcCSegment(canonicalIPStr)
+	companyID, err := s.resolveCompanyWithICP(rootDomain, canonicalIPStr, "")
 	if err != nil {
 		return 0, err
 	}
 
-	var taskIDs string
-	if req.TaskID > 0 {
-		taskIDs = fmt.Sprintf("{%d}", req.TaskID)
-	} else {
-		taskIDs = "{}"
-	}
-
-	paramsJSON, err := marshalJSONBArray(req.Params)
+	paramsJSON, err := marshalJSONArray(req.Params)
 	if err != nil {
 		return 0, err
 	}
@@ -1014,53 +1892,59 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	if rootDomain != "" {
 		rootDomainVal = rootDomain
 	}
-	if req.IP != "" {
-		ipVal = req.IP
+	if canonicalIPStr != "" {
+		ipVal = canonicalIPStr
 	}
 	if cseg != "" {
 		csegVal = cseg
 	}
 
-	var id int64
-	err = s.tx.QueryRow(`
-INSERT INTO assets(
-    type, url, method, domain, ip, port, root_domain,
-    params, company_id, company_source, task_ids, c_segment
-)
-VALUES ('endpoint', $1, $2, $3, $4, $5, $6, $7::jsonb[], $8, 'scope', $9::bigint[], $10::cidr)
-ON CONFLICT (url, method) WHERE type = 'endpoint' DO UPDATE SET
-    params     = (
-        SELECT ARRAY(
-            SELECT DISTINCT ON ((elem->>'location'), (elem->>'name')) elem
-            FROM unnest(assets.params || EXCLUDED.params) AS elem
-            ORDER BY (elem->>'location'), (elem->>'name'), elem::text DESC
-        )
-    ),
-    ip         = COALESCE(EXCLUDED.ip,        assets.ip),
-    c_segment  = COALESCE(EXCLUDED.c_segment, assets.c_segment),
-    task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
-    company_id = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
-        ELSE COALESCE(EXCLUDED.company_id, assets.company_id)
-    END,
-    company_source = CASE
-        WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN 'explicit'
-        WHEN EXCLUDED.company_id IS NOT NULL THEN 'scope'
-        ELSE assets.company_source
-    END,
-    last_seen  = now()
-RETURNING id`,
-		normURL, method, domainVal, ipVal, nullableInt(port), rootDomainVal,
-		paramsJSON, companyID, taskIDs, csegVal,
-	).Scan(&id)
+	branch := newAssetBranch("assets_endpoint", schema.AssetsEndpointIdentity(normURL, method))
+	id, err := s.writeAsset(assetWrite{
+		branch: branch,
+		insert: append([]assetCol{
+			{"type", "endpoint"},
+			{"url", normURL},
+			{"method", method},
+			{"domain", domainVal},
+			{"ip", ipVal},
+			{"port", nullableInt(port)},
+			{"root_domain", rootDomainVal},
+			{"c_segment", csegVal},
+			{"params", paramsJSON},
+			{"task_ids", marshalTaskIDs(assetTaskIDsOf(req.TaskID))},
+		}, assetCompanyCols(companyID, false)...),
+		mergeCols: []string{"task_ids", "params", "ip", "c_segment", "company_id", "company_source"},
+		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			set := []assetCol{
+				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+			}
+			mergedParams, err := assetMergeObjects(old.str("params"), req.Params, assetParamKey, func(cur, next map[string]any) bool {
+				// 同 (location, name)：元素 JSON 文本 DESC 优先（spec §3.3.1 params 去重）。
+				return assetJSONText(next) > assetJSONText(cur)
+			})
+			if err != nil {
+				return nil, err
+			}
+			set = append(set, assetCol{"params", mergedParams})
+			if ipVal != nil && old.str("ip") == "" {
+				set = append(set, assetCol{"ip", ipVal}, assetCol{"c_segment", csegVal})
+			} else if csegVal != nil && old.str("c_segment") == "" {
+				set = append(set, assetCol{"c_segment", csegVal})
+			}
+			set = append(set, assetMergeCompanyCols(old, companyID, false)...)
+			set = append(set, assetCol{"last_seen", assetRawExpr("NOW(3)")})
+			return set, nil
+		},
+	})
 	if err != nil {
 		return 0, err
 	}
 	// side effects: endpoint previously registered none — register its host as
 	// root_domain + subdomain(+IP) so those asset types get populated too.
 	s.linkHostAssets(domain, rootDomain, req.TaskID)
-	if req.IP != "" {
-		_, _ = s.UpsertIP(UpsertIPReq{IP: req.IP, TaskID: req.TaskID})
+	if canonicalIPStr != "" {
+		_, _ = s.UpsertIP(UpsertIPReq{IP: canonicalIPStr, TaskID: req.TaskID})
 	}
 	return id, nil
 }
@@ -1068,6 +1952,21 @@ RETURNING id`,
 // =====================================================================
 // Query helpers
 // =====================================================================
+
+// assetArrayCol 把一个 JSON 文本数组列安全读成 JSON（NULL → 空数组）。
+func assetArrayCol(col string) string {
+	return "COALESCE(" + col + ", '[]')"
+}
+
+// assetTextCol 把一个可空文本列读成 ” 兜底。
+func assetTextCol(col string) string {
+	return "COALESCE(" + col + ", '')"
+}
+
+// assetJSONExtractInt 是 JSON 数组包含判定的表达式：task_ids 里是否含某个 task_id。
+func assetJSONContains(col string, placeholder string) string {
+	return "JSON_CONTAINS(" + col + ", CAST(" + placeholder + " AS JSON))"
+}
 
 // QueryByType returns assets rows of a given type, newest first.
 func (s *AssetStore) QueryByType(typ string, limit, offset int) ([]*Asset, error) {
@@ -1077,21 +1976,9 @@ func (s *AssetStore) QueryByType(typ string, limit, offset int) ([]*Asset, error
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.Query(`
-SELECT id, type, company_id, array_to_json(task_ids)::text,
-       COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
-       COALESCE(c_segment::text,''), port,
-       COALESCE(icp,''), array_to_json(bound_domains)::text, array_to_json(open_ports)::text, COALESCE(record_type,''),
-       array_to_json(record_value)::text, COALESCE(bundle_id,''), COALESCE(app_name,''),
-       COALESCE(category,''), COALESCE(app_description,''), COALESCE(app_icp,''),
-       COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
-       COALESCE(favicon_mmh3,''), status_code, content_length,
-       COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
-FROM assets
-WHERE type = $1
-ORDER BY last_seen DESC, id DESC
-LIMIT $2 OFFSET $3`, typ, limit, offset)
+	args := []any{typ}
+	q := assetSelectCols + "\nWHERE type = ?" + pageClauseArgs(&args, limit, offset)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1102,30 +1989,20 @@ LIMIT $2 OFFSET $3`, typ, limit, offset)
 // CountByType returns the total number of assets of a type (for server-side pagination).
 func (s *AssetStore) CountByType(typ string) (int, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT count(*) FROM assets WHERE type = $1`, typ).Scan(&n)
+	err := s.db.QueryRow(`SELECT count(*) FROM assets WHERE type = ?`, typ).Scan(&n)
 	return n, err
 }
 
 // QueryByCompany returns assets for a company, optionally filtered by type.
 // limit <= 0 means no limit.
 func (s *AssetStore) QueryByCompany(companyID int64, typ string, limit, offset int) ([]*Asset, error) {
-	q := `SELECT id, type, company_id, array_to_json(task_ids)::text,
-       COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
-       COALESCE(c_segment::text,''), port,
-       COALESCE(icp,''), array_to_json(bound_domains)::text, array_to_json(open_ports)::text, COALESCE(record_type,''),
-       array_to_json(record_value)::text, COALESCE(bundle_id,''), COALESCE(app_name,''),
-       COALESCE(category,''), COALESCE(app_description,''), COALESCE(app_icp,''),
-       COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
-       COALESCE(favicon_mmh3,''), status_code, content_length,
-       COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
-FROM assets WHERE company_id = $1`
+	q := assetSelectCols + " WHERE company_id = ?"
 	args := []any{companyID}
 	if typ != "" {
 		args = append(args, typ)
-		q += fmt.Sprintf(` AND type = $%d`, len(args))
+		q += ` AND type = ?`
 	}
-	q += pageClause(&args, limit, offset)
+	q += pageClauseArgs(&args, limit, offset)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -1135,49 +2012,45 @@ FROM assets WHERE company_id = $1`
 }
 
 func (s *AssetStore) CountByCompany(companyID int64, typ string) (int, error) {
-	q := `SELECT count(*) FROM assets WHERE company_id = $1`
+	q := `SELECT count(*) FROM assets WHERE company_id = ?`
 	args := []any{companyID}
 	if typ != "" {
 		args = append(args, typ)
-		q += fmt.Sprintf(` AND type = $%d`, len(args))
+		q += ` AND type = ?`
 	}
 	var n int
 	err := s.db.QueryRow(q, args...).Scan(&n)
 	return n, err
 }
 
-func pageClause(args *[]any, limit, offset int) string {
+// pageClauseArgs appends positional LIMIT/OFFSET args and returns the clause.
+func pageClauseArgs(args *[]any, limit, offset int) string {
 	q := ` ORDER BY last_seen DESC, id DESC`
 	if limit > 0 {
 		*args = append(*args, limit)
-		q += fmt.Sprintf(` LIMIT $%d`, len(*args))
+		q += ` LIMIT ?`
 	}
 	if offset > 0 {
 		*args = append(*args, offset)
-		q += fmt.Sprintf(` OFFSET $%d`, len(*args))
+		q += ` OFFSET ?`
 	}
 	return q
 }
 
+// pageClause keeps the historical name used by sibling stores.
+func pageClause(args *[]any, limit, offset int) string {
+	return pageClauseArgs(args, limit, offset)
+}
+
 // QueryByTask returns assets rows that have a given task_id in task_ids.
 func (s *AssetStore) QueryByTask(taskID int64, typ string, limit, offset int) ([]*Asset, error) {
-	q := `SELECT id, type, company_id, array_to_json(task_ids)::text,
-       COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
-       COALESCE(c_segment::text,''), port,
-       COALESCE(icp,''), array_to_json(bound_domains)::text, array_to_json(open_ports)::text, COALESCE(record_type,''),
-       array_to_json(record_value)::text, COALESCE(bundle_id,''), COALESCE(app_name,''),
-       COALESCE(category,''), COALESCE(app_description,''), COALESCE(app_icp,''),
-       COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
-       COALESCE(favicon_mmh3,''), status_code, content_length,
-       COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
-FROM assets WHERE $1 = ANY(task_ids)`
+	q := assetSelectCols + " WHERE " + assetJSONContains("task_ids", "?")
 	args := []any{taskID}
 	if typ != "" {
 		args = append(args, typ)
-		q += fmt.Sprintf(` AND type = $%d`, len(args))
+		q += ` AND type = ?`
 	}
-	q += pageClause(&args, limit, offset)
+	q += pageClauseArgs(&args, limit, offset)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -1194,11 +2067,11 @@ FROM assets WHERE $1 = ANY(task_ids)`
 }
 
 func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
-	q := `SELECT count(*) FROM assets WHERE $1 = ANY(task_ids)`
+	q := `SELECT count(*) FROM assets WHERE ` + assetJSONContains("task_ids", "?")
 	args := []any{taskID}
 	if typ != "" {
 		args = append(args, typ)
-		q += fmt.Sprintf(` AND type = $%d`, len(args))
+		q += ` AND type = ?`
 	}
 	var n int
 	err := s.db.QueryRow(q, args...).Scan(&n)
@@ -1206,7 +2079,7 @@ func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
 }
 
 func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
-	rows, err := s.db.Query(`SELECT type, COUNT(*) FROM assets WHERE $1 = ANY(task_ids) GROUP BY type`, taskID)
+	rows, err := s.db.Query(`SELECT type, COUNT(*) FROM assets WHERE `+assetJSONContains("task_ids", "?")+` GROUP BY type`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1218,14 +2091,73 @@ func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
 // assets shared with other tasks. Full task deletion uses the coordinated
 // transaction in DeleteTaskCascadePrepared; this method remains for callers
 // that explicitly manage only asset associations.
+//
+// TiDB 8.5 不支持 JSON_TABLE，"移除单个元素" 与 "是否独占" 判定在 Go 内存里完成，
+// 并且整段跑在同一事务内（避免读改写窗口里的归属漂移）。
 func (s *AssetStore) DeleteByTaskID(taskID int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM assets WHERE task_ids = ARRAY[$1]::bigint[]`, taskID)
+	if s.tx != nil {
+		return s.deleteByTaskIDTx(s.tx, taskID)
+	}
+	var deleted int64
+	err := s.db.execInTx(func(tx *sql.Tx) error {
+		var err error
+		deleted, err = s.deleteByTaskIDTx(tx, taskID)
+		return err
+	})
+	return deleted, err
+}
+
+func (s *AssetStore) deleteByTaskIDTx(tx *sql.Tx, taskID int64) (int64, error) {
+	rows, err := tx.Query("SELECT id, "+assetArrayCol("task_ids")+" FROM assets WHERE "+assetJSONContains("task_ids", "?"), taskID)
 	if err != nil {
 		return 0, err
 	}
-	deleted, _ := res.RowsAffected()
-	if _, err := s.db.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, taskID); err != nil {
-		return deleted, err
+	var owned []int64
+	type sharedRow struct {
+		id      int64
+		taskIDs string
+	}
+	var shared []sharedRow
+	for rows.Next() {
+		var id int64
+		var raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		kept := make([]int64, 0, 4)
+		for _, ownedID := range decodeInt64Array(raw) {
+			if ownedID != taskID {
+				kept = append(kept, ownedID)
+			}
+		}
+		if len(kept) == 0 {
+			owned = append(owned, id)
+			continue
+		}
+		shared = append(shared, sharedRow{id: id, taskIDs: marshalTaskIDs(kept)})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	deleted := int64(0)
+	if len(owned) > 0 {
+		args := make([]any, 0, len(owned))
+		for _, id := range owned {
+			args = append(args, id)
+		}
+		res, err := tx.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(repeatQuestion(len(owned)), ",")+")", args...)
+		if err != nil {
+			return 0, err
+		}
+		deleted, _ = res.RowsAffected()
+	}
+	for _, item := range shared {
+		if _, err := tx.Exec("UPDATE assets SET task_ids = ? WHERE id = ?", item.taskIDs, item.id); err != nil {
+			return deleted, err
+		}
 	}
 	return deleted, nil
 }
@@ -1235,8 +2167,8 @@ func (s *AssetStore) DeleteByTaskID(taskID int64) (int64, error) {
 // services; URL covers HTTP services and endpoints.
 func (s *AssetStore) HostsByTask(taskID int64) ([]string, error) {
 	rows, err := s.db.Query(`
-SELECT COALESCE(domain,''), COALESCE(ip,''), COALESCE(url,'')
-FROM assets WHERE $1 = ANY(task_ids)`, taskID)
+SELECT `+assetTextCol("domain")+`, `+assetTextCol("ip")+`, `+assetTextCol("url")+`
+FROM assets WHERE `+assetJSONContains("task_ids", "?"), taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1290,33 +2222,43 @@ type rowsQuerier interface {
 // committed.
 func hostsForTaskDeletion(q rowsQuerier, taskID, explorationID int64) ([]string, error) {
 	rows, err := q.Query(`
-WITH current_assets AS (
-  SELECT id FROM assets WHERE $1 = ANY(task_ids)
-  UNION
-  SELECT ea.asset_id
-  FROM exploration_anchors ea
-  JOIN exploration_nodes n ON n.id=ea.node_id
-  WHERE n.exploration_id=$2
-),
-other_assets AS (
-  SELECT DISTINCT a.id
-  FROM assets a
-  WHERE EXISTS (
-    SELECT 1 FROM tasks t
-    WHERE t.id<>$1 AND t.deleted_at IS NULL AND t.id=ANY(a.task_ids)
-  ) OR EXISTS (
-    SELECT 1
-    FROM exploration_anchors ea
-    JOIN exploration_nodes n ON n.id=ea.node_id
-    JOIN tasks t ON t.exploration_id=n.exploration_id
-    WHERE ea.asset_id=a.id AND t.id<>$1 AND t.deleted_at IS NULL
-  )
-)
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,''), true
-FROM assets a JOIN current_assets c ON c.id=a.id
+FROM assets a
+WHERE `+assetJSONContains("a.task_ids", "?")+`
+   OR EXISTS (
+        SELECT 1 FROM exploration_anchors ea
+        JOIN exploration_nodes n ON n.id = ea.node_id
+        WHERE n.exploration_id = ? AND ea.asset_id = a.id
+   )
 UNION ALL
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,''), false
-FROM assets a JOIN other_assets o ON o.id=a.id`, taskID, explorationID)
+FROM assets a
+WHERE a.id NOT IN (
+        SELECT a2.id FROM assets a2
+        WHERE `+assetJSONContains("a2.task_ids", "?")+`
+           OR EXISTS (
+                SELECT 1 FROM exploration_anchors ea
+                JOIN exploration_nodes n ON n.id = ea.node_id
+                WHERE n.exploration_id = ? AND ea.asset_id = a2.id
+           )
+   )
+   AND (
+        EXISTS (
+            SELECT 1
+            FROM exploration_anchors ea
+            JOIN exploration_nodes n ON n.id = ea.node_id
+            JOIN tasks t2 ON t2.exploration_id = n.exploration_id
+            WHERE ea.asset_id = a.id AND t2.id <> ? AND t2.deleted_at IS NULL
+        )
+        OR EXISTS (
+            SELECT 1 FROM tasks t
+            WHERE t.id <> ? AND t.deleted_at IS NULL
+              AND (
+                    (JSON_LENGTH(a.task_ids) = 1 AND `+assetJSONContains("a.task_ids", "t.id")+`)
+                 OR `+assetJSONContains("a.task_ids", "?")+`
+                  )
+        )
+   )`, taskID, explorationID, taskID, explorationID, taskID, taskID, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1359,16 +2301,17 @@ FROM assets a JOIN other_assets o ON o.id=a.id`, taskID, explorationID)
 	return out, nil
 }
 
-const assetSelectCols = `SELECT id, type, company_id, array_to_json(task_ids)::text,
-       COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
-       COALESCE(c_segment::text,''), port,
-       COALESCE(icp,''), array_to_json(bound_domains)::text, array_to_json(open_ports)::text, COALESCE(record_type,''),
-       array_to_json(record_value)::text, COALESCE(bundle_id,''), COALESCE(app_name,''),
-       COALESCE(category,''), COALESCE(app_description,''), COALESCE(app_icp,''),
-       COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
-       COALESCE(favicon_mmh3,''), status_code, content_length,
-       COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+var assetSelectCols = `SELECT id, type, company_id, ` + assetArrayCol("task_ids") + `,
+       ` + assetTextCol("domain") + `, ` + assetTextCol("root_domain") + `, ` + assetTextCol("ip") + `,
+       ` + assetTextCol("c_segment") + `, port,
+       ` + assetTextCol("icp") + `, ` + assetArrayCol("bound_domains") + `, ` + assetArrayCol("open_ports") + `, ` + assetTextCol("record_type") + `,
+       ` + assetArrayCol("record_value") + `, ` + assetTextCol("bundle_id") + `, ` + assetTextCol("app_name") + `,
+       ` + assetTextCol("category") + `, ` + assetTextCol("app_description") + `, ` + assetTextCol("app_icp") + `,
+       ` + assetTextCol("url") + `, ` + assetTextCol("service_type") + `, ` + assetTextCol("service_name") + `,
+       ` + assetTextCol("favicon_mmh3") + `, status_code, content_length,
+       ` + assetTextCol("page_title") + `, ` + assetArrayCol("technologies") + `, ` + assetArrayCol("auth") + `,
+       ` + assetTextCol("method") + `, ` + assetArrayCol("params") + `, COALESCE(extra, '{}'),
+       DATE_FORMAT(last_seen, '%Y-%m-%dT%H:%i:%s.%f')
 FROM assets`
 
 // GetByIDs returns assets with the given ids (order preserved by id array order).
@@ -1376,14 +2319,13 @@ func (s *AssetStore) GetByIDs(ids []int64) ([]*Asset, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		args[i] = id
+	placeholders := repeatQuestion(len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
 	}
-	sql := assetSelectCols + " WHERE id IN (" + strings.Join(placeholders, ",") + ") ORDER BY last_seen DESC"
-	rows, err := s.db.Query(sql, args...)
+	sqlText := assetSelectCols + " WHERE id IN (" + strings.Join(placeholders, ",") + ") ORDER BY last_seen DESC"
+	rows, err := s.db.Query(sqlText, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1393,7 +2335,7 @@ func (s *AssetStore) GetByIDs(ids []int64) ([]*Asset, error) {
 
 // DeleteByCompanyID hard-deletes all assets belonging to a company. Returns rows deleted.
 func (s *AssetStore) DeleteByCompanyID(companyID int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM assets WHERE company_id = $1`, companyID)
+	res, err := s.db.Exec(`DELETE FROM assets WHERE company_id = ?`, companyID)
 	if err != nil {
 		return 0, err
 	}
@@ -1408,28 +2350,53 @@ func (s *AssetStore) DeleteByCompanyID(companyID int64) (int64, error) {
 // and their services/endpoints (they carry root_domain = that host); passing a
 // subdomain/IP removes only that host's own assets. Referencing exploration_anchors
 // rows are cleaned by ON DELETE CASCADE. Returns rows deleted, grouped by type.
+//
+// TiDB 没有 DELETE … RETURNING：先在同一事务里按候选行加锁读回 type，再按 PK 删除，
+// 分组计数与原来的 RETURNING type 完全一致。
 func (s *AssetStore) DeleteByHost(host string) (map[string]int64, error) {
 	h := DomainKey(host)
 	if h == "" {
 		return nil, fmt.Errorf("host is required")
 	}
-	rows, err := s.db.Query(`
-DELETE FROM assets
-WHERE domain = $1 OR root_domain = $1 OR ip = $1
-RETURNING type`, h)
+	counts := map[string]int64{}
+	err := s.db.execInTx(func(tx *sql.Tx) error {
+		rows, err := tx.Query(`SELECT id, type FROM assets
+WHERE domain = ? OR root_domain = ? OR ip = ? FOR UPDATE`, h, h, h)
+		if err != nil {
+			return err
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			var typ string
+			if err := rows.Scan(&id, &typ); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+			counts[typ]++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		placeholders := repeatQuestion(len(ids))
+		args := make([]any, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		if _, err := tx.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(placeholders, ",")+")", args...); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	counts := map[string]int64{}
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			return nil, err
-		}
-		counts[t]++
-	}
-	return counts, rows.Err()
+	return counts, nil
 }
 
 // DeleteByIDs hard-deletes assets by their IDs. Returns the number of rows deleted.
@@ -1437,13 +2404,13 @@ func (s *AssetStore) DeleteByIDs(ids []int64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		args[i] = id
+	placeholders := repeatQuestion(len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
 	}
-	res, err := s.db.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+	sqlText := "DELETE FROM assets WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+	res, err := s.db.Exec(sqlText, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -1535,6 +2502,9 @@ func scanAssets(rows *sql.Rows) ([]*Asset, error) {
 		}
 		if len(extraRaw) > 0 {
 			_ = json.Unmarshal(extraRaw, &a.Extra)
+		}
+		if a.TaskIDs == nil {
+			a.TaskIDs = []int64{}
 		}
 		out = append(out, a)
 	}

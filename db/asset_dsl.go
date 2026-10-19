@@ -222,7 +222,7 @@ func (p *dslParser) parseAtom() (*astNode, error) {
 //
 // Syntax:
 //
-//	field=value      fuzzy match (ILIKE '%value%')
+//	field=value      fuzzy, case-insensitive match ("%value%" substring)
 //	field==value     exact match
 //	field!=value     exclude fuzzy
 //	port>8080        numeric comparison
@@ -259,12 +259,41 @@ var fullTextCols = []string{
 
 type whereBuilder struct {
 	args []any
-	base int // placeholders are numbered base+1, base+2, …; 0 = the usual $1, $2, …
+	base int // 历史遗留：PG 用它把占位符整体偏移编号；TiDB 位置占位符下不再参与拼串
 }
 
+// next 追加一个参数并返回 TiDB 的位置占位符 `?`。
+//
+// 与 PG 的 `$n` 不同，`?` 不自带编号，**参数顺序就是占位符出现顺序**：同一个值
+// 若要出现在多个谓词里（原 PG 里可以复用同一个 $n），必须为每个位置各追加一次
+// 参数，否则占位符与参数就会错位。
 func (b *whereBuilder) next(v any) string {
 	b.args = append(b.args, v)
-	return fmt.Sprintf("$%d", b.base+len(b.args))
+	return "?"
+}
+
+// assetLikeFold 把 PG 的 ILIKE 换成 TiDB 的 LOWER(col) LIKE LOWER(?)。
+// assets 表按 utf8mb4_bin 排序（大小写敏感），而 ILIKE 大小写无关，
+// 所以两侧都要显式 LOWER 才保持原有的匹配语义。
+func assetLikeFold(col string) string {
+	return "LOWER(" + col + ") LIKE LOWER(?)"
+}
+
+// assetArrayLikeFold 在 JSON 数组列上做大小写无关的子串命中。
+// TiDB 8.5 没有 unnest / jsonb_array_elements_text，元素级匹配落到整列 JSON 文本上。
+func assetArrayLikeFold(col string) string {
+	return "LOWER(COALESCE(" + col + ", '[]')) LIKE LOWER(?)"
+}
+
+// assetArrayExactExpr 判定 JSON 数组列是否精确包含某个文本元素（等价原 `= ANY(col)`）。
+func assetArrayExactExpr(col string) string {
+	return "JSON_CONTAINS(COALESCE(" + col + ", '[]'), JSON_QUOTE(?))"
+}
+
+// assetTaskMemberExpr 判定 assets.task_ids（JSON 数字数组）是否含某个 task_id
+// （等价原 `$n = ANY(task_ids)`）。
+func assetTaskMemberExpr(col string) string {
+	return "JSON_CONTAINS(COALESCE(" + col + ", '[]'), CAST(? AS JSON))"
 }
 
 func (b *whereBuilder) build(node *astNode) (string, error) {
@@ -300,25 +329,28 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 
 	// bare-text: OR across all text fields + arrays
 	if f == "" {
-		p := b.next("%" + e.Value + "%")
-		var parts []string
+		// `?` 没有 $n 的复用能力：每个 OR 分支都要一份自己的参数。
+		parts := make([]string, 0, len(fullTextCols)+2)
 		for _, col := range fullTextCols {
-			parts = append(parts, col+" ILIKE "+p)
+			parts = append(parts, assetLikeFold(col))
+			b.args = append(b.args, "%"+e.Value+"%")
 		}
-		parts = append(parts,
-			"EXISTS (SELECT 1 FROM unnest(technologies) t(v) WHERE v ILIKE "+p+")",
-			"EXISTS (SELECT 1 FROM unnest(bound_domains) t(v) WHERE v ILIKE "+p+")",
-		)
+		for _, col := range []string{"technologies", "bound_domains"} {
+			parts = append(parts, assetArrayLikeFold(col))
+			b.args = append(b.args, "%"+e.Value+"%")
+		}
 		return "(" + strings.Join(parts, " OR ") + ")", nil
 	}
 
-	// task_id: $N = ANY(task_ids)
+	// task_id: JSON 数组成员判定（assets.task_ids 含该 task_id）
 	if f == "task_id" {
 		n, err := strconv.ParseInt(e.Value, 10, 64)
 		if err != nil {
 			return "", fmt.Errorf("task_id 需要整数值: %s", e.Value)
 		}
-		return b.next(n) + " = ANY(task_ids)", nil
+		expr := assetTaskMemberExpr("task_ids")
+		b.args = append(b.args, n)
+		return expr, nil
 	}
 
 	// company_id: exact integer
@@ -350,12 +382,17 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 	if col, ok := knownArrayFields[f]; ok {
 		switch e.Op {
 		case "==":
-			return b.next(e.Value) + " = ANY(" + col + ")", nil
+			expr := assetArrayExactExpr(col)
+			b.args = append(b.args, e.Value)
+			return expr, nil
 		case "!=":
-			return "NOT (" + b.next(e.Value) + " = ANY(" + col + "))", nil
+			expr := "NOT (" + assetArrayExactExpr(col) + ")"
+			b.args = append(b.args, e.Value)
+			return expr, nil
 		case "=":
-			p := b.next("%" + e.Value + "%")
-			return "EXISTS (SELECT 1 FROM unnest(" + col + ") t(v) WHERE v ILIKE " + p + ")", nil
+			expr := assetArrayLikeFold(col)
+			b.args = append(b.args, "%"+e.Value+"%")
+			return expr, nil
 		default:
 			return "", fmt.Errorf("数组字段 %s 不支持运算符 %s", f, e.Op)
 		}
@@ -365,11 +402,15 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 	if col, ok := knownStringFields[f]; ok {
 		switch e.Op {
 		case "=":
-			return col + " ILIKE " + b.next("%"+e.Value+"%"), nil
+			expr := assetLikeFold(col)
+			b.args = append(b.args, "%"+e.Value+"%")
+			return expr, nil
 		case "==":
 			return col + " = " + b.next(e.Value), nil
 		case "!=":
-			return col + " NOT ILIKE " + b.next("%"+e.Value+"%"), nil
+			expr := "NOT (" + assetLikeFold(col) + ")"
+			b.args = append(b.args, "%"+e.Value+"%")
+			return expr, nil
 		default:
 			return "", fmt.Errorf("字符串字段 %s 不支持运算符 %s", f, e.Op)
 		}
@@ -382,9 +423,10 @@ func buildDSLWhere(node *astNode) (string, []any, error) {
 	return buildDSLWhereBase(node, 0)
 }
 
-// buildDSLWhereBase is buildDSLWhere with a placeholder offset: emitted args are
-// numbered base+1 onward, leaving $1..$base free for the caller (e.g. a scope CTE
-// that reserves $1 for the task id).
+// buildDSLWhereBase is buildDSLWhere for callers that prepend their own args to
+// the same statement (e.g. the scope CTE that binds taskID first). With TiDB
+// positional placeholders `base` no longer numbers anything — callers only have to
+// keep args in the exact order the final SQL text binds them.
 func buildDSLWhereBase(node *astNode, base int) (string, []any, error) {
 	if node == nil {
 		return "1=1", nil, nil
@@ -491,11 +533,11 @@ func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
 	}
 	if typ != "" {
 		args = append(args, typ)
-		where += fmt.Sprintf(" AND type = $%d", len(args))
+		where += " AND type = ?"
 	}
 	if taskID > 0 {
 		args = append(args, taskID)
-		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+		where += " AND " + assetTaskMemberExpr("task_ids")
 	}
 	var n int
 	err = s.db.QueryRow("SELECT count(*) FROM assets WHERE "+where, args...).Scan(&n)
@@ -523,15 +565,15 @@ func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) 
 	}
 	if typ != "" {
 		args = append(args, typ)
-		where += fmt.Sprintf(" AND type = $%d", len(args))
+		where += " AND type = ?"
 	}
 	if taskID > 0 {
 		args = append(args, taskID)
-		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+		where += " AND " + assetTaskMemberExpr("task_ids")
 	}
 	args = append(args, limit, offset)
 	q := assetSelectCols + " WHERE " + where +
-		fmt.Sprintf(" ORDER BY last_seen DESC, id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+		" ORDER BY last_seen DESC, id DESC LIMIT ? OFFSET ?"
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -570,7 +612,7 @@ func (s *AssetStore) QueryDSLInScope(dsl, typ string, taskID int64, limit, offse
 	if err != nil {
 		return nil, err
 	}
-	// $1 is reserved for taskID (scopeTargetCTE); DSL placeholders start at $2.
+	// scopeTargetCTE 的入参在 SQL 文本最前面，所以 args 先放 taskID，再接 DSL 参数。
 	where, dslArgs, err := buildDSLWhereBase(node, 1)
 	if err != nil {
 		return nil, err
@@ -579,12 +621,12 @@ func (s *AssetStore) QueryDSLInScope(dsl, typ string, taskID int64, limit, offse
 	args = append(args, dslArgs...)
 	if typ != "" {
 		args = append(args, typ)
-		where += fmt.Sprintf(" AND type = $%d", len(args))
+		where += " AND type = ?"
 	}
 	where += " AND id IN (SELECT id FROM target)"
 	args = append(args, limit, offset)
 	q := `WITH ` + scopeTargetCTE + ` ` + assetSelectCols + " WHERE " + where +
-		fmt.Sprintf(" ORDER BY last_seen DESC, id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+		" ORDER BY last_seen DESC, id DESC LIMIT ? OFFSET ?"
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -612,10 +654,12 @@ func (s *AssetStore) GetByIDsInScope(taskID int64, ids []int64) ([]*Asset, error
 		return nil, nil
 	}
 	args := make([]any, 0, len(ids)+1)
-	args = append(args, taskID) // $1 reserved for scopeTargetCTE
+	args = append(args, taskID) // scopeTargetCTE 先绑定 taskID
 	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = fmt.Sprintf("$%d", i+2)
+	for i := range ids {
+		placeholders[i] = "?"
+	}
+	for _, id := range ids {
 		args = append(args, id)
 	}
 	q := `WITH ` + scopeTargetCTE + ` ` + assetSelectCols +
