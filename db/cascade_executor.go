@@ -280,8 +280,6 @@ func executeTaskCascade(
 	if err != nil {
 		return nil, err
 	}
-	// llm_records 是记账表：写集来自显式枚举，不参与成员复核。
-	w.allowExtra("llm_records", closure.LLMRecordIDs)
 
 	// Step 1: 记账表（可选）
 	if closure.Options.DeleteLLMRecords {
@@ -292,6 +290,21 @@ func executeTaskCascade(
 
 	// Step 2: findings —— 整行删除，或按列置空（同行两列都要置空时只发一条语句）
 	if closure.Options.DeleteFindings {
+		// 删除 findings 时，必须先清理其关联弱引用子表（基线无 FK 约束）：
+		// 级联清理 finding_assets、finding_retests、finding_traffic_bindings
+		if len(closure.FindingIDs) > 0 {
+			fArgs := uint64Args(closure.FindingIDs)
+			ph := closurePlaceholders(len(closure.FindingIDs))
+			if _, err := tx.ExecContext(ctx, "DELETE FROM finding_assets WHERE finding_id IN ("+ph+")", fArgs...); err != nil {
+				return nil, fmt.Errorf("cascade delete finding_assets: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, "DELETE FROM finding_retests WHERE finding_id IN ("+ph+")", fArgs...); err != nil {
+				return nil, fmt.Errorf("cascade delete finding_retests: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, "DELETE FROM finding_traffic_bindings WHERE finding_id IN ("+ph+")", fArgs...); err != nil {
+				return nil, fmt.Errorf("cascade delete finding_traffic_bindings: %w", err)
+			}
+		}
 		if err := w.deleteByPK("findings", closure.FindingIDs); err != nil {
 			return nil, err
 		}

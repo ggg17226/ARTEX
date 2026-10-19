@@ -333,7 +333,7 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 				var alreadyLinked bool
 				err := tx.QueryRowContext(ctx, `SELECT id, `+
 					assetJSONContains("COALESCE(task_ids, '[]')", "?")+
-					` FROM assets WHERE type='root_domain' AND domain=?`, rule.Domain, taskID).
+					` FROM assets WHERE type='root_domain' AND domain=?`, taskID, rule.Domain).
 					Scan(&assetID, &alreadyLinked)
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return err
@@ -358,7 +358,7 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 				var alreadyLinked bool
 				err := tx.QueryRowContext(ctx, `SELECT id, `+
 					assetJSONContains("COALESCE(task_ids, '[]')", "?")+
-					` FROM assets WHERE type='ip' AND ip=?`, ipValue, taskID).
+					` FROM assets WHERE type='ip' AND ip=?`, taskID, ipValue).
 					Scan(&assetID, &alreadyLinked)
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return err

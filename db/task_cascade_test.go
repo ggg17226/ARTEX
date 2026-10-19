@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db/lockorder"
 )
@@ -425,13 +426,62 @@ func TestTask_DeleteTaskCascade_MembershipDriftRetryRollback(t *testing.T) {
 		t.Fatalf("nil tx must be rejected, got %v", err)
 	}
 
-	// ⑥ 真机：在"快照之后、复核之前"注入更低 PK 成员，删除事务必须整体回滚后重放成功。
+	// ⑥ 真实 TiDB 集成：在"快照之后、复核之前"通过测试钩子注入更低 PK 成员，删除事务必须整体回滚后重放成功。
 	t.Run("Live", func(t *testing.T) {
 		dsn := os.Getenv("ARTEX_TIDB_DSN")
 		if dsn == "" {
 			t.Skip("跳过：环境变量 ARTEX_TIDB_DSN 未配置（未验证 / Honest Skip）")
 		}
-		t.Skip("需要专用 TiDB 实例与两连接注入能力；本机无 TiDB 可达，未验证 (Honest Skip)")
+		d, err := Open(dsn)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Close(); err != nil {
+				t.Errorf("close DB failed: %v", err)
+			}
+		})
+
+		task, err := d.CreateTaskWithOptions(fmt.Sprintf("P08 Drift Task %d", time.Now().UnixNano()), "goal", TaskCreateOptions{})
+		if err != nil {
+			t.Fatalf("CreateTaskWithOptions failed: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = d.Exec("DELETE FROM exploration_nodes WHERE exploration_id = ?", task.ExplorationID)
+			_, _ = d.Exec("DELETE FROM explorations WHERE id = ?", task.ExplorationID)
+			_, _ = d.Exec("DELETE FROM tasks WHERE id = ?", task.ID)
+		})
+
+		// 注入钩子：在快照后由独立连接注入更低 PK 行
+		injected := false
+		TaskCascadeTestHookAfterSnapshot = func(taskID uint64) {
+			if injected {
+				return
+			}
+			injected = true
+			// 在闭包快照后模拟外部并发插入更低 PK 节点
+			_, _ = d.Exploration(task.ExplorationID).AddNode("asset", map[string]any{"label": "injected"}, 99, "pending", "agent", nil)
+		}
+		t.Cleanup(func() {
+			TaskCascadeTestHookAfterSnapshot = nil
+		})
+
+		res, err := d.DeleteTaskCascade(task.ID, false, false)
+		if err != nil {
+			t.Fatalf("DeleteTaskCascade with membership drift should rollback and retry successfully, got err: %v", err)
+		}
+		_ = res
+
+		var taskLeft, expLeft int
+		if err := d.QueryRow("SELECT count(*) FROM tasks WHERE id = ?", task.ID).Scan(&taskLeft); err != nil {
+			t.Fatalf("query task residual: %v", err)
+		}
+		if err := d.QueryRow("SELECT count(*) FROM explorations WHERE id = ?", task.ExplorationID).Scan(&expLeft); err != nil {
+			t.Fatalf("query exploration residual: %v", err)
+		}
+		if taskLeft != 0 || expLeft != 0 {
+			t.Fatalf("expected 0 residual task and exploration after retry, got task=%d exp=%d", taskLeft, expLeft)
+		}
 	})
 }
 

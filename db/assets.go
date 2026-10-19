@@ -1171,6 +1171,19 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 		return 0, fmt.Errorf("domain is required")
 	}
 	if s.tx == nil {
+		if req.TaskID > 0 {
+			var assetID int64
+			err := s.withTaskChildWriter(req.TaskID, func(ctx context.Context, tx *sql.Tx) error {
+				scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
+				id, err := scoped.UpsertRootDomain(req)
+				if err != nil {
+					return err
+				}
+				assetID = id
+				return upsertTaskAssetLinkTx(ctx, tx, req.TaskID, id, defaultTaskAssetSource, "", nil)
+			})
+			return assetID, err
+		}
 		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
 			return scoped.UpsertRootDomain(req)
 		})

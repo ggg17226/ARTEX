@@ -1483,6 +1483,10 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, prepare,
 	)
 	if err != nil {
+		if errors.Is(err, pgdb.ErrTaskDeleteOutcomeUnknown) {
+			// 提交结局未知：严禁执行任何外部补偿（rollbackTaskDelete），挂起进入人工对账保护
+			return result, err
+		}
 		return result, rollbackTaskDelete(err, trafficStage, fileStage)
 	}
 	result.AssetsDeleted = dbResult.AssetsDeleted

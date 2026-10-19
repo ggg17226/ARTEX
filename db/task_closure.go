@@ -196,6 +196,7 @@ func (c *TaskCascadeClosure) lockPlanSpecs() []struct {
 		{"task_llm_profiles", c.LLMProfileLinkIDs},
 		{"task_relations", c.RelationIDs},
 		{"task_scope", c.ScopeIDs},
+		{"llm_records", c.LLMRecordIDs},
 	}
 }
 
