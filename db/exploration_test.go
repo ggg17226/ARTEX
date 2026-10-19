@@ -1430,8 +1430,9 @@ func TestExploration_Fix1_LineageTopologyCorners(t *testing.T) {
 }
 
 // TestExploration_Fix2_CancelIntentClosesFindingChildTables 复核取消意图时对 findings
-// 无 FK 子表的收尾：证据绑定整行删除、未收尾的复测封成终态，且都发生在删 findings 行
-// 之前；复测历史保留（只封状态不物理删）。
+// 无 FK 子表的收尾：证据绑定与**全部**复测子行都在删 findings 行之前整行物理删除，与
+// Task 3.2 的 DeleteFinding / DeleteFindingsByTask 同一口径（只封状态会把历史复测永久
+// 悬挂在已删漏洞上）。
 func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 	eng := newExpMockEngine()
 	d := openExpMockDB(t, eng)
@@ -1446,7 +1447,12 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 		[]driver.Value{int64(10), "yields", int64(30)},
 		[]driver.Value{int64(10), "yields", int64(31)},
 	)
-	// 两个 finding 节点名下各挂一行漏洞（701/702），其中一行有证据绑定与活跃复测。
+	// 前置锁读：故意乱序返回，钉住「持锁后仍按主键升序重排」这一可重放性要求。
+	eng.on("SELECT id FROM findings WHERE id IN", []string{"id"},
+		[]driver.Value{int64(702)},
+		[]driver.Value{int64(701)},
+	)
+	// 两个 finding 节点名下各挂一行漏洞（701/702），其一有证据绑定与复测。
 	eng.on("SELECT id FROM findings", []string{"id"},
 		[]driver.Value{int64(701)},
 		[]driver.Value{int64(702)},
@@ -1466,10 +1472,11 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 		expAssertOrderByInCatalog(t, c)
 	}
 
-	// 顺序：绑定/复测 → findings 行 → 节点行，任何一环倒序都会留下孤儿。
+	// 顺序：前置锁 → 绑定 → 复测 → findings 行 → 节点行，任何一环倒序都会留下孤儿。
 	order := map[string]int{
+		"SELECT id FROM findings WHERE id IN":  expIndexCall(calls, "SELECT id FROM findings WHERE id IN"),
 		"DELETE FROM finding_traffic_bindings": expIndexCall(calls, "DELETE FROM finding_traffic_bindings"),
-		"UPDATE finding_retests":               expIndexCall(calls, "UPDATE finding_retests"),
+		"DELETE FROM finding_retests":          expIndexCall(calls, "DELETE FROM finding_retests"),
 		"DELETE FROM findings WHERE id IN":     expIndexCall(calls, "DELETE FROM findings WHERE id IN"),
 		"DELETE FROM exploration_nodes":        expIndexCall(calls, "DELETE FROM exploration_nodes"),
 	}
@@ -1478,10 +1485,12 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 			t.Fatalf("取消意图必须发出 %q；实际语句: %v", want, queriesOf(calls))
 		}
 	}
-	if !(order["DELETE FROM finding_traffic_bindings"] < order["DELETE FROM findings WHERE id IN"] &&
-		order["UPDATE finding_retests"] < order["DELETE FROM findings WHERE id IN"] &&
+	if !(order["SELECT id FROM findings WHERE id IN"] < order["DELETE FROM finding_traffic_bindings"] &&
+		order["SELECT id FROM findings WHERE id IN"] < order["DELETE FROM finding_retests"] &&
+		order["DELETE FROM finding_traffic_bindings"] < order["DELETE FROM findings WHERE id IN"] &&
+		order["DELETE FROM finding_retests"] < order["DELETE FROM findings WHERE id IN"] &&
 		order["DELETE FROM findings WHERE id IN"] < order["DELETE FROM exploration_nodes"]) {
-		t.Fatalf("必须先子表、再 findings、最后节点: %+v", order)
+		t.Fatalf("必须先锁 finding、再子表、再 findings、最后节点: %+v", order)
 	}
 
 	// 证据绑定按查到的 finding 主键整行删除（无 FK，没有置空这条路）。
@@ -1493,24 +1502,19 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 		t.Fatalf("证据绑定参数=%v, want [701 702]", bindings.Args)
 	}
 
-	// 复测封终态：只碰 pending/running，finished_at 由 Go 端盖同一时钟。
-	retests := expCallFor(t, calls, "UPDATE finding_retests")
-	if !strings.Contains(retests.Query, "status='stopped'") {
-		t.Fatalf("活跃复测必须封成 stopped 终态（active_finding_id 生成列才会归 NULL）: %s", retests.Query)
+	// 复测子行整行物理删除：pending/running 之外还有 completed/failed/stopped 的历史，
+	// 它们同样挂在被删的 finding_id 上，只改状态等于留悬挂引用（Task 3.2 的 I2 契约）。
+	retests := expCallFor(t, calls, "DELETE FROM finding_retests")
+	if !strings.Contains(retests.Query, "finding_id IN (?, ?)") {
+		t.Fatalf("复测必须按 finding 主键 IN 列表整行删除: %s", retests.Query)
 	}
-	if !strings.Contains(retests.Query, "status IN ('pending','running')") {
-		t.Fatalf("只能封未收尾的复测，历史结论不得改写: %s", retests.Query)
-	}
-	if _, ok := retests.Args[0].(time.Time); !ok {
-		t.Fatalf("finished_at 必须是 Go 端算好后显式绑定的时间，got %T", retests.Args[0])
-	}
-	if got := fmt.Sprint(retests.Args[1:]); got != "[701 702]" {
-		t.Fatalf("复测收尾参数=%v, want [701 702]", retests.Args[1:])
+	if got := fmt.Sprint(retests.Args); got != "[701 702]" {
+		t.Fatalf("复测删除参数=%v, want [701 702]", retests.Args)
 	}
 	if left := eng.statements(func(c expMockCall) bool {
-		return strings.Contains(c.Query, "DELETE FROM finding_retests")
+		return strings.Contains(c.Query, "UPDATE finding_retests")
 	}); len(left) != 0 {
-		t.Fatalf("复测历史是审计事实，必须封终态而非物理删除: %v", queriesOf(left))
+		t.Fatalf("不得再以 UPDATE 收尾复测（历史行会永久悬挂在已删漏洞上）: %v", queriesOf(left))
 	}
 
 	// 旧的"按未索引 node_id 裸删漏洞"必须消失，改为先枚举主键再按主键删。
@@ -1521,6 +1525,108 @@ func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
 	}
 	if counts := eng.txCounts(); counts.Commits != 1 {
 		t.Fatalf("commits=%d, want the whole cascade in one transaction", counts.Commits)
+	}
+}
+
+// TestExploration_Fix2R2_CancelLocksFindingsBeforeChildCleanup 钉住残余 Important 的
+// 修复：清任何 finding 子表之前，必须已经按**物理主键**取得待删 finding 行的 FOR UPDATE 锁。
+//
+// 为什么这是并发正确性的前提而不是可优化项：证据写者（Store.Bind → LockFindingEvidenceTx
+// → AddFindingTrafficTx）与发起复测遵守的都是 finding 行锁，不是意图锁。取消事务若先清空的
+// 是当时为空的子集合，再让并发的 Bind 校验父行存在并插入新绑定，最后自己删掉父行，三者可以
+// 依次提交，留下一条指向已删漏洞的绑定；事后父行 DELETE 的行锁无法追溯保护已完成的子表清理。
+func TestExploration_Fix2R2_CancelLocksFindingsBeforeChildCleanup(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("SELECT 1 FROM exploration_nodes", []string{"one"}, []driver.Value{int64(1)})
+	eng.on("SELECT id, kind, state FROM exploration_nodes", []string{"id", "kind", "state"},
+		[]driver.Value{int64(10), "intent", "running"},
+		[]driver.Value{int64(30), "finding", "confirmed"},
+	)
+	eng.on("SELECT src_id, rel, dst_id FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+		[]driver.Value{int64(10), "yields", int64(30)},
+	)
+	eng.on("SELECT id FROM findings", []string{"id"}, []driver.Value{int64(701)})
+
+	if _, err := d.Exploration(501).CancelIntent(10); err != nil {
+		t.Fatalf("CancelIntent: %v", err)
+	}
+	calls := eng.snapshotCalls()
+
+	firstLock, firstChildDelete := -1, -1
+	for i, c := range calls {
+		upper := strings.ToUpper(c.Query)
+		if firstLock < 0 && strings.Contains(upper, "FROM FINDINGS") && strings.Contains(upper, "FOR UPDATE") {
+			firstLock = i
+		}
+		if firstChildDelete < 0 &&
+			(strings.Contains(c.Query, "DELETE FROM finding_traffic_bindings") ||
+				strings.Contains(c.Query, "DELETE FROM finding_retests")) {
+			firstChildDelete = i
+		}
+	}
+	if firstLock < 0 {
+		t.Fatalf("取消意图必须在清子表之前锁定待删 finding 行；实际语句: %v", queriesOf(calls))
+	}
+	if firstChildDelete >= 0 && firstLock > firstChildDelete {
+		t.Fatalf("finding 行锁（%d）必须早于首次子表清理（%d）: %v", firstLock, firstChildDelete, queriesOf(calls))
+	}
+	// 锁必须落在物理主键上：node_id 无索引，按它做锁定读会在 TiDB 上升级成近乎全表加锁。
+	lock := calls[firstLock]
+	if !strings.Contains(lock.Query, "id IN (") {
+		t.Fatalf("finding 前置锁必须按主键 IN 列表加锁: %s", lock.Query)
+	}
+	if strings.Contains(lock.Query, "node_id IN") {
+		t.Fatalf("不得按未索引的 node_id 做锁定读: %s", lock.Query)
+	}
+	if got := fmt.Sprint(lock.Args); got != "[701]" {
+		t.Fatalf("前置锁参数=%v, want [701]", lock.Args)
+	}
+}
+
+// TestExploration_Fix2R2_NoLockedFindingMeansNoChildCleanup 确认锁定读回空集（定位与加锁
+// 之间这批漏洞已被别的事务删净）时，不发出任何子表删除，也不会渲染出 `IN ()`。
+func TestExploration_Fix2R2_NoLockedFindingMeansNoChildCleanup(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("SELECT 1 FROM exploration_nodes", []string{"one"}, []driver.Value{int64(1)})
+	eng.on("SELECT id, kind, state FROM exploration_nodes", []string{"id", "kind", "state"},
+		[]driver.Value{int64(10), "intent", "running"},
+		[]driver.Value{int64(30), "finding", "confirmed"},
+	)
+	eng.on("SELECT src_id, rel, dst_id FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+		[]driver.Value{int64(10), "yields", int64(30)},
+	)
+	// 定位读还能看见 701，持锁当前读已经什么都没有（别的事务先删掉了）。
+	eng.on("SELECT id FROM findings WHERE id IN", []string{"id"})
+	eng.on("SELECT id FROM findings", []string{"id"}, []driver.Value{int64(701)})
+
+	if _, err := d.Exploration(501).CancelIntent(10); err != nil {
+		t.Fatalf("CancelIntent: %v", err)
+	}
+	calls := eng.snapshotCalls()
+	for _, want := range []string{
+		"DELETE FROM finding_traffic_bindings",
+		"DELETE FROM finding_retests",
+		"DELETE FROM findings WHERE id IN",
+	} {
+		if left := eng.statements(func(c expMockCall) bool {
+			return strings.Contains(c.Query, want)
+		}); len(left) != 0 {
+			t.Fatalf("锁定读为空集时不得发出 %q: %v", want, queriesOf(left))
+		}
+	}
+	if got := eng.statements(func(c expMockCall) bool {
+		return strings.Contains(c.Query, "IN ()")
+	}); len(got) != 0 {
+		t.Fatalf("空集合不得渲染成 IN (): %v", queriesOf(got))
+	}
+	// 父节点仍须照常删除，且整段仍是一次提交。
+	if expIndexCall(calls, "DELETE FROM exploration_nodes") < 0 {
+		t.Fatal("漏洞已被并发删除时，节点删除仍须照常发出")
+	}
+	if counts := eng.txCounts(); counts.Commits != 1 {
+		t.Fatalf("commits=%d, want one transaction", counts.Commits)
 	}
 }
 
@@ -1688,6 +1794,43 @@ func TestExploration_Fix4_UpdateGoalPayloadMissingStillFails(t *testing.T) {
 	}
 }
 
+// TestExploration_Fix2R2_ChildDeleteFailureRollsBackWholeCancel 确认子表收尾中途失败时
+// 整笔取消回滚：既不提交，也不会「绑定已删、漏洞行还在」地走下去。
+func TestExploration_Fix2R2_ChildDeleteFailureRollsBackWholeCancel(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("SELECT 1 FROM exploration_nodes", []string{"one"}, []driver.Value{int64(1)})
+	eng.on("SELECT id, kind, state FROM exploration_nodes", []string{"id", "kind", "state"},
+		[]driver.Value{int64(10), "intent", "running"},
+		[]driver.Value{int64(30), "finding", "confirmed"},
+	)
+	eng.on("SELECT src_id, rel, dst_id FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+		[]driver.Value{int64(10), "yields", int64(30)},
+	)
+	eng.on("SELECT id FROM findings", []string{"id"}, []driver.Value{int64(701)})
+	eng.failOnExec("DELETE FROM finding_retests")
+
+	if _, err := d.Exploration(501).CancelIntent(10); err == nil {
+		t.Fatal("子表收尾失败必须把整笔取消带进回滚")
+	}
+	counts := eng.txCounts()
+	if counts.Commits != 0 {
+		t.Fatalf("commits=%d, want 0（中途失败不得提交）", counts.Commits)
+	}
+	if counts.Rollbacks == 0 {
+		t.Fatal("rollbacks=0, want the deferred rollback to run")
+	}
+	calls := eng.snapshotCalls()
+	if got := expIndexCall(calls, "DELETE FROM finding_retests"); got < 0 {
+		t.Fatalf("失败注入未命中复测删除: %v", queriesOf(calls))
+	}
+	for _, mustNotEmit := range []string{"DELETE FROM findings WHERE id IN", "DELETE FROM exploration_nodes"} {
+		if expIndexCall(calls, mustNotEmit) >= 0 {
+			t.Fatalf("子表失败后不得继续发出 %q: %v", mustNotEmit, queriesOf(calls))
+		}
+	}
+}
+
 // =====================================================================
 // 语句级替身驱动（离线）
 // =====================================================================
@@ -1715,6 +1858,7 @@ type expMockEngine struct {
 	rules     []expMockRule
 	nextID    int64
 	affected  *int64 // 非 INSERT 语句的 changed rows 注入（nil = 1）
+	failExec  string // 命中该子串的 Exec 报错（空 = 不注入）
 	commits   int
 	rollbacks int
 }
@@ -1750,6 +1894,20 @@ func (e *expMockEngine) forceAffectedRows(rows int64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.affected = &rows
+}
+
+// failOnExec 让**下一条**命中 substr 的 Exec 直接失败，用来把"删除路径中途报错必须整笔回滚"
+// 变成离线可判定的输入。默认不注入任何失败，对既有测试零影响。
+func (e *expMockEngine) failOnExec(substr string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.failExec = substr
+}
+
+func (e *expMockEngine) execFailure(query string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.failExec != "" && strings.Contains(query, e.failExec)
 }
 
 func (e *expMockEngine) affectedRows() int64 {
@@ -1871,6 +2029,9 @@ func (c *expMockConn) QueryContext(_ context.Context, query string, args []drive
 func (c *expMockConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	values := c.expArgs(args)
 	c.eng.record(expMockCall{Kind: "exec", Query: query, Args: values})
+	if c.eng.execFailure(query) {
+		return nil, fmt.Errorf("expMock: injected failure on %s", strings.TrimSpace(query))
+	}
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "INSERT") {
 		return expMockResult{id: c.eng.nextInsertID(), rows: 1}, nil
 	}

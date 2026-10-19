@@ -384,48 +384,70 @@ func expCollect[T int64 | string](ex expQueryExecer, query string, args ...any) 
 // expDropFindingRows 删掉一批 finding **节点**名下的 findings 行及其子表。
 //
 // findings 的子表在 DDL 里都没有指向 findings 的外键（历史设计），删了漏洞行它们谁也
-// 不会跟着动，只能按「先子后父」在同一事务里显式收尾（与 DeleteFinding /
-// DeleteFindingsByTask 同一业务口径）：
+// 不会跟着动，只能按「锁父 → 清子 → 删父」在同一事务里显式收尾，并与 Task 3.2 已入库的
+// DeleteFinding / DeleteFindingsByTask 保持**同一删除口径**：
 //   - finding_traffic_bindings：finding_id NOT NULL，没有置空这条路，整行删除；证据
 //     快照文件本身由证据存储的 GC 负责，这里只断开绑定；
-//   - finding_retests：历史复测是审计事实，保留，但 pending/running 必须封成 stopped
-//     终态。active_finding_id 是 IF(status IN ('pending','running'), finding_id, NULL)
-//     的生成列，漏封就让前端永久显示「复测中」，并且这些漏洞的后续复测会被
-//     uq_finding_retests_active 去重吞掉；
-//   - findings：按上一步查到的主键删，绝不写 `WHERE node_id=?` 这种按未索引列的裸范围
+//   - finding_retests：整行物理删除。只把 pending/running 封成 stopped 终态，等于让
+//     completed/failed/stopped 的历史连同指向**已删漏洞**的 finding_id 永久留在库里，
+//     那是悬挂引用而不是「解除关联」（Task 3.2 I2 的结论）；承载复测的 conversation 独立
+//     存在，不随漏洞删除；
+//   - findings：只按锁读回来的主键删，绝不写 `WHERE node_id=?` 这种按未索引列的裸范围
 //     删除。
 //
-// 这里的 SELECT 不加 FOR UPDATE：findings.node_id 没有索引，按未索引列做锁定读会在
-// TiDB 上升级成近乎全表加锁；并发正确性由调用方已持有的意图行锁 + 本事务随后按主键的
-// DELETE 保证，SELECT 与 DELETE 之间新插入的漏洞行也会被 expDropNodes 的
-// `UPDATE findings SET node_id=NULL` 断链，不会留下孤儿。
+// 并发协议（Important 2）：第一步按 node_id 的普通读**只用于定位**（findings.node_id 没有
+// 索引，对它做锁定读会在 TiDB 上升级成近乎全表加锁），拿到的候选主键必须立刻换成按物理
+// 主键升序的 `SELECT … FOR UPDATE` 锁定当前读，**在任何子表清理之前**把待删的 finding 行
+// 全部锁住；随后以锁定读的结果为准清子表、再删父行。
+//
+// 为什么意图行锁不够：证据写者根本不遵守意图锁 —— Store.Bind 走 WithEvidenceTx →
+// LockFindingEvidenceTx（锁 task / finding 行）→ AddFindingTrafficTx 追加绑定，发起复测同样
+// 按 finding 行锁串行化。少了这把前置锁，「本事务清空 bindings（当时为空）→ 并发的 Bind
+// 校验父行仍存在并插入新绑定 → 本事务删掉父行」就能依次提交，留下一条指向已删漏洞的绑定；
+// 事后那条父行 DELETE 的行锁无法追溯保护已经做完的子表清理，TiDB 也不会靠空匹配集上的
+// 间隙锁替我们挡住新子行。全局锁序不变（tasks=1 → exploration_nodes=7 → findings=9）：
+// 调用方先锁意图节点，本函数只在之后才按主键锁 findings。
 func expDropFindingRows(ex expQueryExecer, nodeIDs []int64) error {
 	if len(nodeIDs) == 0 {
 		return nil
 	}
-	selectArgs := make([]any, 0, len(nodeIDs))
-	nodeList := expInPlaceholders(nodeIDs, &selectArgs)
-	findingRowIDs, err := expCollect[int64](ex, `SELECT id FROM findings WHERE node_id IN (`+nodeList+`)`, selectArgs...)
+	// 1) 定位读（非锁定）：只为拿到候选主键，锁一律留到下一步按主键取。
+	locateArgs := make([]any, 0, len(nodeIDs))
+	nodeList := expInPlaceholders(nodeIDs, &locateArgs)
+	candidates, err := expCollect[int64](ex, `SELECT id FROM findings WHERE node_id IN (`+nodeList+`)`, locateArgs...)
+	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// 2) 前置锁：按物理主键升序（稳定顺序，避免不同事务以相反顺序抢同一批锁而互相死锁）
+	//    锁定这些 finding 行。这一步先于任何子表语句，是整段清理的串行化前提。
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+	lockArgs := make([]any, 0, len(candidates))
+	lockList := expInPlaceholders(candidates, &lockArgs)
+	findingRowIDs, err := expCollect[int64](ex, `SELECT id FROM findings WHERE id IN (`+lockList+`) FOR UPDATE`, lockArgs...)
 	if err != nil {
 		return err
 	}
 	if len(findingRowIDs) == 0 {
+		// 定位与加锁之间这批漏洞已被别的事务删净：本路径无事可做，父节点由调用方继续收尾。
 		return nil
 	}
+	// 持锁后的当前读才是本次要删的全集；顺序仍按主键升序，保证后续语句的 IN 列表可重放。
+	sort.Slice(findingRowIDs, func(i, j int) bool { return findingRowIDs[i] < findingRowIDs[j] })
 
+	// 3) 子表 → 父表：任何一步失败都由调用方的 deferred rollback 整笔回滚。
 	bindingArgs := make([]any, 0, len(findingRowIDs))
 	bindingList := expInPlaceholders(findingRowIDs, &bindingArgs)
 	if _, err := ex.Exec(`DELETE FROM finding_traffic_bindings WHERE finding_id IN (`+bindingList+`)`, bindingArgs...); err != nil {
 		return err
 	}
 
-	// 时序列同样由 Go 端盖：finished_at 与本次取消发生在同一时刻、同一个时钟。
-	retestArgs := make([]any, 0, len(findingRowIDs)+1)
-	retestArgs = append(retestArgs, expNow())
+	retestArgs := make([]any, 0, len(findingRowIDs))
 	retestList := expInPlaceholders(findingRowIDs, &retestArgs)
-	if _, err := ex.Exec(`UPDATE finding_retests
-	SET status='stopped', error='意图已删除，复测随之终止', finished_at=?
-	WHERE status IN ('pending','running') AND finding_id IN (`+retestList+`)`, retestArgs...); err != nil {
+	if _, err := ex.Exec(`DELETE FROM finding_retests WHERE finding_id IN (`+retestList+`)`, retestArgs...); err != nil {
 		return err
 	}
 
@@ -729,10 +751,10 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 // yields/derived_from 向下可达、且所有父节点(所有指向它的边的源)都落在删除集内的节点。
 // goal 与 origin fact 永不删除;还被删除集之外的意图/digest 引用的共享节点也保留,以免破坏
 // 其它分支、产生断链。被删的每个 intent 先做 token rollup(保留不可逆计量)并清理其 activity
-// 与副会话(会话连同 session_key 名下的请求历史一并删除);被删的 finding 先按主键删除
-// findings 行,并在删漏洞行之前先清掉无外键的 finding_traffic_bindings、把 pending/running
-// 的 finding_retests 封成 stopped 终态(新库没有 FK,也没有 ON DELETE CASCADE/SET NULL,
-// 不写就永久残留孤儿)。
+// 与副会话(会话连同 session_key 名下的请求历史一并删除);被删的 finding 先按主键锁定
+// findings 行,再清掉无外键的 finding_traffic_bindings 与 finding_retests(与 DeleteFinding
+// 同口径整行删除,不做只改状态的收尾,否则历史复测会永久悬挂在已删漏洞上),最后才删漏洞行
+// (新库没有 FK,也没有 ON DELETE CASCADE/SET NULL,不写就永久残留孤儿)。
 // 边与锚点显式删除、activity/findings/task_asset_links 弱引用显式置空,整个清理保持在一个事务内。调用方须先停掉运行中的 worker 防止其后续写入。
 func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	var out IntentCleanup
