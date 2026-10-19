@@ -10,9 +10,13 @@ package db
 // 上的 `ON DUPLICATE KEY UPDATE 列 = 列` 空转换）。
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sort"
+
+	"github.com/Autumn-27/artex/db/lockorder"
 )
 
 // BumpRound advances this exploration's planner-round counter and returns the
@@ -144,35 +148,46 @@ func (s *ExplorationStore) ActiveDigests() ([]*Node, error) {
 // 自增主键经 LastInsertId 取回并做 [1, MaxInt64] 校验（expInsertID）；covers 边的
 // "已存在即幂等"落在 uq_exploration_edges 上，用 `src_id = src_id` 的空转换表达
 // DO NOTHING —— 不用 INSERT IGNORE，免得把非空/截断这类真错误一起吞掉。
+// AddDigest writes one digest node and its covers edges (digest→member) in a
+// single transaction under business gate protection (Spec §3.2.2, 闭环 I1).
 func (s *ExplorationStore) AddDigest(payload map[string]any, memberIDs []int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback() //nolint:errcheck
-	res, err := tx.Exec(`
+	var id int64
+	err := s.db.taskTxRunner().Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true}, func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
+		// 核验所属 exploration 仍真实存活，杜绝向正在被删除的任务/探索写入孤儿节点和边
+		var expExists int
+		if err := tx.QueryRowContext(ctx, "SELECT 1 FROM explorations WHERE id = ? FOR UPDATE", s.expID).Scan(&expExists); err != nil {
+			return fmt.Errorf("add digest: exploration %d not found or deleting: %w", s.expID, err)
+		}
+
+		res, err := tx.ExecContext(ctx, `
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES (?, ?, ?, 0, ?, 'compactor')`,
-		s.expID, KindDigest, string(raw), StateDigestActive)
-	if err != nil {
-		return 0, err
-	}
-	id, err := expInsertID(res, "exploration_nodes")
-	if err != nil {
-		return 0, err
-	}
-	for _, m := range memberIDs {
-		if m == id {
-			continue
+			s.expID, KindDigest, string(raw), StateDigestActive)
+		if err != nil {
+			return err
 		}
-		if _, err := tx.Exec(`
+		insertedID, err := expInsertID(res, "exploration_nodes")
+		if err != nil {
+			return err
+		}
+		id = insertedID
+		for _, m := range memberIDs {
+			if m == id {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
 INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES (?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE src_id = src_id`, s.expID, id, RelCovers, m); err != nil {
-			return 0, err
+				return err
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	return id, tx.Commit()
+	return id, nil
 }
 
 // CoveredMembers maps member id → covering digest id, for ACTIVE digests only

@@ -912,12 +912,14 @@ func TestTools_KeywordColumnsRoundTrip(t *testing.T) {
 }
 
 // TestTools_AgentBindingRoundTrip 覆盖 Go 端数组改写的追加/幂等/删除三条路径。
+// 使用唯一的测试 agent key，绝不解绑公用 worker（杜绝测试副作用污染，闭环 I2）。
 func TestTools_AgentBindingRoundTrip(t *testing.T) {
 	d := task33Open(t)
 	key := task33ToolKey(t, "p08_bind")
+	testAgent := fmt.Sprintf("t-ag-%d", time.Now().UnixNano())
 	t.Cleanup(func() { task33Exec(t, d, "DELETE FROM tools WHERE `key` = ?", key) })
 
-	if err := d.SeedTool(key, "bind", json.RawMessage(`{}`), json.RawMessage(`["worker"]`)); err != nil {
+	if err := d.SeedTool(key, "bind", json.RawMessage(`{}`), json.RawMessage(fmt.Sprintf(`["%s"]`, testAgent))); err != nil {
 		t.Fatalf("SeedTool: %v", err)
 	}
 	if err := d.AddAgentToToolBinding("auto", []string{key, "p08_never_seeded_" + key}); err != nil {
@@ -927,7 +929,7 @@ func TestTools_AgentBindingRoundTrip(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("GetTool: %v", err)
 	}
-	if len(got.Agents) != 2 || got.Agents[0] != "worker" || got.Agents[1] != "auto" {
+	if len(got.Agents) != 2 || got.Agents[0] != testAgent || got.Agents[1] != "auto" {
 		t.Fatalf("append wrong: %+v", got.Agents)
 	}
 	// 幂等：重复补绑不产生重复元素，也不改写顺序。
@@ -949,10 +951,10 @@ func TestTools_AgentBindingRoundTrip(t *testing.T) {
 	if err != nil || after == nil {
 		t.Fatalf("GetTool after remove: %v", err)
 	}
-	if len(after.Agents) != 1 || after.Agents[0] != "worker" {
+	if len(after.Agents) != 1 || after.Agents[0] != testAgent {
 		t.Errorf("remove must keep the remaining order, got %+v", after.Agents)
 	}
-	if err := d.RemoveAgentFromToolBindings("worker"); err != nil {
+	if err := d.RemoveAgentFromToolBindings(testAgent); err != nil {
 		t.Fatalf("RemoveAgentFromToolBindings: %v", err)
 	}
 	gone, err := d.GetTool(key)

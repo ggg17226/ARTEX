@@ -111,37 +111,36 @@ func toolAgentLiteral(agentKey string) ([]byte, bool) {
 	return buf.Bytes(), true
 }
 
-// toolAgentsContains 按 JSON 值判定成员资格（元素带内部空白也不漏判；非字符串元素
-// 永远不相等，因此不会被误当成某个 key）。
-func toolAgentsContains(items []json.RawMessage, agentKey string) bool {
-	want, ok := toolAgentLiteral(agentKey)
-	if !ok {
-		return false
+// toolAgentStrValue 从 json.RawMessage 元素解码为真实 string 值（按 JSON 字符串规范解码，
+// 完美支持 Unicode 转义如 "\u0077orker" 等，杜绝文本比较假阴性，闭环 I3）。
+func toolAgentStrValue(item json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(item)
+	if len(trimmed) == 0 {
+		return "", false
 	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return s, true
+	}
+	return "", false
+}
+
+// toolAgentsContains 按 JSON 解码后的字符串值判定成员资格。
+func toolAgentsContains(items []json.RawMessage, agentKey string) bool {
 	for _, item := range items {
-		var buf bytes.Buffer
-		if err := json.Compact(&buf, bytes.TrimSpace(item)); err != nil {
-			continue
-		}
-		if bytes.Equal(buf.Bytes(), want) {
+		if val, ok := toolAgentStrValue(item); ok && val == agentKey {
 			return true
 		}
 	}
 	return false
 }
 
-// toolAgentsWithout 剔除数组里的 agentKey；第二个返回值表示是否真的删掉了元素
-// （false → 调用方跳过 UPDATE，不产生空转写入）。
+// toolAgentsWithout 剔除数组里的 agentKey；第二个返回值表示是否真的删掉了元素。
 func toolAgentsWithout(items []json.RawMessage, agentKey string) ([]json.RawMessage, bool) {
-	want, ok := toolAgentLiteral(agentKey)
-	if !ok {
-		return items, false
-	}
 	out := make([]json.RawMessage, 0, len(items))
 	removed := false
 	for _, item := range items {
-		var buf bytes.Buffer
-		if err := json.Compact(&buf, bytes.TrimSpace(item)); err == nil && bytes.Equal(buf.Bytes(), want) {
+		if val, ok := toolAgentStrValue(item); ok && val == agentKey {
 			removed = true
 			continue
 		}
@@ -244,10 +243,9 @@ func (d *DB) RemoveAgentFromToolBindings(agentKey string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	rows, err := tx.Query(`SELECT row_id, `+toolKeyCol+`, agents FROM tools
-WHERE agents LIKE ? ESCAPE '\\'
+	rows, err := tx.Query(`SELECT row_id, ` + toolKeyCol + `, agents FROM tools
 ORDER BY row_id
-FOR UPDATE`, toolLikePattern(agentKey))
+FOR UPDATE`)
 	if err != nil {
 		return err
 	}
