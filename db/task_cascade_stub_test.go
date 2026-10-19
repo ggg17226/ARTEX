@@ -286,6 +286,8 @@ func stubCascadeRules() []stubRule {
 		{match: stubMatch("FROM finding_retests WHERE finding_id IN"), rows: stubRowsAlways(9101)},
 		{match: stubMatch("FROM finding_traffic_bindings WHERE finding_id IN"), rows: stubRowsAlways(9201)},
 		{match: stubMatch("SELECT row_id FROM task_asset_links WHERE task_id"), rows: stubRowsAlways(501)},
+		{match: stubMatch("SELECT id FROM activity WHERE node_id IN"), rows: stubRowsAlways(402)},
+		{match: stubMatch("SELECT row_id FROM task_asset_links WHERE source_node_id IN"), rows: stubRowsAlways(502)},
 	}
 }
 
@@ -356,6 +358,32 @@ func TestTask_ClosureLocator_EnumeratesFindingChildPKs(t *testing.T) {
 	// 定位阶段必须零加锁（Fresh Locator 契约）。
 	if n := state.lockReads(); n != 0 {
 		t.Fatalf("locator must not take a single row lock, got %d FOR UPDATE statements", n)
+	}
+}
+
+// TestTask_ClosureLocator_CrossRootPhysicalIDsEnumerated 测试 R6：
+// 证明真实 ComputeTaskClosure 能够端到端收集到跨根 activity 与跨根 task_asset_links，
+// 且若这些跨根查询被破坏或漏收，测试必将判红。
+func TestTask_ClosureLocator_CrossRootPhysicalIDsEnumerated(t *testing.T) {
+	state := newCascadeStub()
+	d := openStubDB(t, state)
+
+	closure, err := ComputeTaskClosureWithOptions(context.Background(), d.DB, stubTask,
+		TaskClosureOptions{DeleteFindings: true})
+	if err != nil {
+		t.Fatalf("compute closure failed: %v", err)
+	}
+	if len(closure.CrossRootActivityIDs) == 0 {
+		t.Fatal("locator failed to collect CrossRootActivityIDs from other explorations")
+	}
+	if len(closure.CrossRootLinkIDs) == 0 {
+		t.Fatal("locator failed to collect CrossRootLinkIDs from other tasks")
+	}
+	if fmt.Sprint(closure.CrossRootActivityIDs) != "[402]" {
+		t.Fatalf("CrossRootActivityIDs = %v, want [402]", closure.CrossRootActivityIDs)
+	}
+	if fmt.Sprint(closure.CrossRootLinkIDs) != "[502]" {
+		t.Fatalf("CrossRootLinkIDs = %v, want [502]", closure.CrossRootLinkIDs)
 	}
 }
 
@@ -702,11 +730,12 @@ func TestTask_PrepareUndoFailureStopsRetryAndIsFatal(t *testing.T) {
 
 	stagedCalls := 0
 	undoCalls := 0
+	expectedUndoErr := errors.New("external restoreTrees failed")
 	failingPrepare := func(TaskDeletePreparation) (TaskDeleteUndo, error) {
 		stagedCalls++
 		return func() error {
 			undoCalls++
-			return errors.New("external restoreTrees failed")
+			return expectedUndoErr
 		}, nil
 	}
 
@@ -716,6 +745,10 @@ func TestTask_PrepareUndoFailureStopsRetryAndIsFatal(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTaskStageUndoFailed) {
 		t.Fatalf("error must wrap ErrTaskStageUndoFailed, got: %v", err)
+	}
+	// 验证原因链完整保留（F3）：上层必须能够通过 errors.Is 识别出原始外部撤销错误
+	if !errors.Is(err, expectedUndoErr) {
+		t.Fatalf("error must wrap original undo error (%v), got: %v", expectedUndoErr, err)
 	}
 	if stagedCalls != 1 {
 		t.Fatalf("must stop retrying immediately on undo failure, stagedCalls=%d", stagedCalls)

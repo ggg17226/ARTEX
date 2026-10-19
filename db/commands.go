@@ -1,8 +1,11 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -211,7 +214,24 @@ func (d *DB) EnsureLLMRecordsTable() error {
 }
 
 // InsertLLMRecord stores one LLM call record using TiDB dialect.
+// 若关联有效任务 ID，接入任务写者门禁协议核验父任务存活，严禁向正在被删除的任务并发写入记录（F1/R3）。
 func (d *DB) InsertLLMRecord(r *LLMRecord) error {
+	taskIDStr := strings.TrimSpace(r.TaskID)
+	if taskIDStr != "" {
+		if tid, parseErr := strconv.ParseInt(taskIDStr, 10, 64); parseErr == nil && tid > 0 {
+			return d.runTaskChildWriter(tid, func(ctx context.Context, tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `
+INSERT INTO llm_records(model, profile_name, session_id, task_id, worker, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, error, request_body, response_body, raw_request, raw_response)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+					r.Model, nullIfEmpty(r.ProfileName), r.SessionID, nullIfEmpty(r.TaskID), nullIfEmpty(r.Worker),
+					r.LatencyMs, r.InputTokens, r.OutputTokens, r.CacheRead, r.CacheWrite,
+					r.Status, nullIfEmpty(r.Error), nullIfEmpty(r.RequestBody), nullIfEmpty(r.ResponseBody),
+					nullIfEmpty(r.RawRequest), nullIfEmpty(r.RawResponse))
+				return err
+			})
+		}
+	}
+
 	_, err := d.Exec(`
 INSERT INTO llm_records(model, profile_name, session_id, task_id, worker, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, error, request_body, response_body, raw_request, raw_response)
 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,

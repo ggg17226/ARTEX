@@ -96,14 +96,27 @@ type TaskDeletePreparation struct {
 var ErrTaskStageUndoFailed = errors.New("task cascade: failed to unwind staged external work after failed attempt")
 
 // StageUndoError 包装外部暂存撤销失败，并实现 fatalUndo 接口通知 TxRunner 永不重试。
+// 同时实现 Unwrap() []error 完整保留 ErrTaskStageUndoFailed、外部撤销具体错误以及底层 DML 原始错误（F3）。
 type StageUndoError struct {
-	Err error
+	StageErr      error
+	UnderlyingErr error
 }
 
-func (e *StageUndoError) Error() string          { return e.Err.Error() }
-func (e *StageUndoError) Unwrap() error          { return e.Err }
-func (e *StageUndoError) Is(target error) bool   { return target == ErrTaskStageUndoFailed }
-func (e *StageUndoError) StageUndoFailed() bool { return true }
+func (e *StageUndoError) Error() string {
+	return fmt.Sprintf("%v: %v (underlying failure: %v)", ErrTaskStageUndoFailed, e.StageErr, e.UnderlyingErr)
+}
+
+func (e *StageUndoError) Unwrap() []error {
+	return []error{ErrTaskStageUndoFailed, e.StageErr, e.UnderlyingErr}
+}
+
+func (e *StageUndoError) Is(target error) bool {
+	return target == ErrTaskStageUndoFailed || errors.Is(e.StageErr, target) || errors.Is(e.UnderlyingErr, target)
+}
+
+func (e *StageUndoError) StageUndoFailed() bool {
+	return true
+}
 
 // TaskDeleteUndo undoes (and releases) the external work staged by **one single
 // attempt** of the cascade. TxRunner replays the whole payload on a retryable
@@ -955,8 +968,10 @@ func (d *DB) runTaskCascadeAttempt(
 		undo = nil // 恰好一次：绝不重复撤销，也绝不留给下一轮
 		if uerr := staged(); uerr != nil {
 			// 撤销失败必须转化为不可重试的致命错误，中断 Runner 的后续自动重试（R4-a）
+			// 完整保留多错误链供 errors.Is / errors.As 查询（F3）
 			err = &StageUndoError{
-				Err: fmt.Errorf("%w: %v (underlying failure: %v)", ErrTaskStageUndoFailed, uerr, err),
+				StageErr:      uerr,
+				UnderlyingErr: err,
 			}
 		}
 	}()
