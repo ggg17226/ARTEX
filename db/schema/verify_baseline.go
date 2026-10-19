@@ -11,6 +11,9 @@ package schema
 //  3. 已知差异白名单。真实 TiDB 把目录中 21 个含 DESC 部件的索引按 ASC 等价方式
 //     存储（COLLATION 报 'A'/NULL），本检查器容忍该方向差异并计数；除此之外方向
 //     漂移（目录 ASC 却存成 DESC）仍判红。
+//  4. 生成列表达式严格比较（Review R1）。表达式比较是**有序**词法 token 的"等长 + 逐位
+//     相等"，只容忍空白、大小写、标识符反引号、字符集引导符、字符串引号风格五类书写差异；
+//     运算符、括号、逗号、关键字、参数顺序与重复次数全部参与判定，绝不排序/去重/集合比较。
 
 import (
 	"context"
@@ -449,94 +452,266 @@ var baselineExpressionCharsetIntroducers = map[string]bool{
 	"_bin":     true,
 }
 
-// baselineExpressionTokens 把表达式切成"标识符 + 字面量"token 序列，
-// 丢弃空白、标点与运算符，并剔除字符集引导符。
+// 生成列表达式的比较口径（Fix Round 1 / Review R1）。
 //
-// 动机：真实 TiDB 会以自身风格回写 GENERATION_EXPRESSION（函数名小写、标识符加反引号、
-// 补字符集引导符与括号空格），逐字符比较必然伪红；token 序列既保留参与计算的列与
-// 字面量语义，又对书写差异稳定。
-func baselineExpressionTokens(expr string) []string {
-	var tokens []string
-	var b strings.Builder
-	flush := func() {
-		if b.Len() == 0 {
-			return
-		}
-		tok := b.String()
-		b.Reset()
-		if !baselineExpressionCharsetIntroducers[tok] {
-			tokens = append(tokens, tok)
-		}
+// 只容忍以下五类"书写差异"，其余一律判红：
+//  1. 空白：空格、换行、缩进（TiDB 会按自身风格重排空白）；
+//  2. 大小写：函数名/关键字/标识符统一按小写比较（字符串字面量内容大小写敏感，原样保留）；
+//  3. 标识符反引号：`status` 与 status 等价；
+//  4. 字符集引导符：_utf8mb4'x' 与 'x' 等价；
+//  5. 字符串字面量引号风格：'x' 与 "x"（含 '' 与反斜杠转义）归一为同一字面量内容。
+//
+// 除上述书写差异外，表达式的词法结构必须逐 token 严格一致：运算符（= <> != < > <= >= <=> + - * /
+// % && || …）、标点（( ) , . …）、关键字与函数名（IF / IN / NOT / AND / OR …）、参数个数与顺序、
+// 同名 token 的出现次数全部保留。条件取反、分支互换、参数换位、新增算术必须判红。
+// 比较是"等长 + 逐位相等"，绝不排序、绝不去重、绝不做集合比较，也不丢弃任何词法 token。
+
+// baselineExpressionOperatorTexts 是必须作为独立 token 保留的运算符与结构标点。
+var baselineExpressionOperatorTexts = []string{
+	"<=>", "<>", "<=", ">=", "!=", ":=", "&&", "||", "<<", ">>", "->", "=>",
+	"(", ")", ",", ";", "=", "<", ">", "+", "-", "*", "/", "%", "!", "&", "|", "^", "~",
+	".", "@", "?", ":", "\\", "{", "}", "[", "]",
+}
+
+// baselineExpressionOperators 是运算符的 rune 形式，按长度降序排列以保证最长匹配
+// （否则 "<=" 会被切成 "<" 与 "="）。
+var baselineExpressionOperators = func() [][]rune {
+	ops := make([][]rune, 0, len(baselineExpressionOperatorTexts))
+	for _, op := range baselineExpressionOperatorTexts {
+		ops = append(ops, []rune(op))
 	}
-	runes := []rune(strings.ToLower(expr))
-	for i := 0; i < len(runes); i++ {
+	sort.SliceStable(ops, func(i, j int) bool { return len(ops[i]) > len(ops[j]) })
+	return ops
+}()
+
+// token 前缀把词法类别编进 token 自身，避免 1 / '1' / `1` 这类跨类别误等同。
+const (
+	baselineTokenIdentifier = "id:"
+	baselineTokenString     = "str:"
+	baselineTokenNumber     = "num:"
+	baselineTokenOperator   = "op:"
+)
+
+// baselineExpressionTokens 把表达式切成**有序**词法 token 序列，仅归一上面列出的五类书写差异。
+//
+// token 形态：
+//   - id:<小写的标识符 / 关键字 / 函数名>
+//   - str:'<解码并统一单引号后的字符串字面量内容>'
+//   - num:<数字字面量原文>
+//   - op:<运算符或标点原文>
+//
+// 无法可靠切分的输入（未闭合的反引号或引号）返回 nil：调用方据此判红，绝不因切分失败而放行。
+func baselineExpressionTokens(expr string) []string {
+	runes := []rune(expr)
+	tokens := make([]string, 0, len(runes))
+	for i := 0; i < len(runes); {
 		r := runes[i]
 		switch {
+		case baselineExprIsSpace(r):
+			i++
 		case r == '`':
-			// 反引号标识符：整体取到闭合反引号，作为单个 token。
-			flush()
-			j := i + 1
-			for j < len(runes) && runes[j] != '`' {
-				b.WriteRune(runes[j])
+			name, next, ok := baselineExprScanQuotedIdentifier(runes, i)
+			if !ok {
+				return nil
+			}
+			tokens = append(tokens, baselineTokenIdentifier+name)
+			i = next
+		case r == '\'' || r == '"':
+			literal, next, ok := baselineExprScanStringLiteral(runes, i)
+			if !ok {
+				return nil
+			}
+			tokens = append(tokens, baselineTokenString+literal)
+			i = next
+		case baselineExprIdentStart(r):
+			j := i
+			for j < len(runes) && baselineExprIdentPart(runes[j]) {
 				j++
 			}
-			i = j
-			flush()
-		case r == '\'' || r == '"':
-			// 字符串字面量：先结算前一个 token（例如 TiDB 的字符集引导符 _utf8mb4）。
-			flush()
-			quote := r
-			b.WriteRune(r)
-			for j := i + 1; j < len(runes); j++ {
+			word := strings.ToLower(string(runes[i:j]))
+			// 字符集引导符只有紧贴字符串字面量时才是引导符（TiDB 回显会补 _utf8mb4 等）。
+			if baselineExpressionCharsetIntroducers[word] && j < len(runes) && (runes[j] == '\'' || runes[j] == '"') {
 				i = j
-				c := runes[j]
-				b.WriteRune(c)
-				if c == quote {
-					// 连续两个引号是转义，继续吸收。
-					if j+1 < len(runes) && runes[j+1] == quote {
-						j++
-						i = j
-						b.WriteRune(quote)
-						continue
-					}
-					break
-				}
+				continue
 			}
-			flush()
-		case r == '_' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '$' || r >= 0x80:
-			b.WriteRune(r)
+			tokens = append(tokens, baselineTokenIdentifier+word)
+			i = j
+		case r >= '0' && r <= '9':
+			number, next := baselineExprScanNumber(runes, i)
+			tokens = append(tokens, baselineTokenNumber+number)
+			i = next
 		default:
-			flush()
+			op := baselineExprOperatorAt(runes[i:])
+			if len(op) == 0 {
+				// 未知字符独立成 token：两侧同规则，识别不了的文本只会判红，不会放行。
+				op = []rune{r}
+			}
+			tokens = append(tokens, baselineTokenOperator+string(op))
+			i += len(op)
 		}
 	}
-	flush()
 	return tokens
 }
 
-// baselineSortedTokens 返回排序后的 token 副本（用于顺序无关比较）。
-func baselineSortedTokens(expr string) []string {
-	toks := baselineExpressionTokens(expr)
-	out := make([]string, 0, len(toks))
-	seen := make(map[string]bool, len(toks))
-	for _, t := range toks {
-		if seen[t] {
+// baselineExprIsSpace 判定可被完全忽略的空白（含换行与缩进）。
+func baselineExprIsSpace(r rune) bool {
+	switch r {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
+}
+
+func baselineExprIdentStart(r rune) bool {
+	return r == '_' || r == '$' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= 0x80
+}
+
+func baselineExprIdentPart(r rune) bool {
+	return baselineExprIdentStart(r) || r >= '0' && r <= '9'
+}
+
+// baselineExprScanQuotedIdentifier 读取一段反引号标识符（MySQL 以双写反引号转义反引号），
+// 返回小写内容；未闭合时返回 ok=false。
+func baselineExprScanQuotedIdentifier(runes []rune, i int) (string, int, bool) {
+	var b strings.Builder
+	for j := i + 1; j < len(runes); {
+		if runes[j] == '`' {
+			if j+1 < len(runes) && runes[j+1] == '`' {
+				b.WriteRune('`')
+				j += 2
+				continue
+			}
+			return strings.ToLower(b.String()), j + 1, true
+		}
+		b.WriteRune(runes[j])
+		j++
+	}
+	return "", 0, false
+}
+
+// baselineExprScanStringLiteral 读取一段字符串字面量并把引号风格与转义归一为
+// '…' 包裹的字面量内容；未闭合时返回 ok=false。
+func baselineExprScanStringLiteral(runes []rune, i int) (string, int, bool) {
+	quote := runes[i]
+	var b strings.Builder
+	for j := i + 1; j < len(runes); {
+		c := runes[j]
+		switch {
+		case c == '\\':
+			if j+1 >= len(runes) {
+				return "", 0, false
+			}
+			n := runes[j+1]
+			switch n {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case 'b':
+				b.WriteByte('\b')
+			case '0':
+				b.WriteByte(0)
+			case 'Z':
+				b.WriteByte(0x1a)
+			case '\'', '"', '\\':
+				b.WriteRune(n)
+			default:
+				// \%= 与 \_ 在 MySQL 里保留反斜杠（LIKE 转义），原样带上。
+				b.WriteRune('\\')
+				b.WriteRune(n)
+			}
+			j += 2
+		case c == quote:
+			if j+1 < len(runes) && runes[j+1] == quote {
+				// 双写引号是字面量引号本身。
+				b.WriteRune(quote)
+				j += 2
+				continue
+			}
+			return "'" + b.String() + "'", j + 1, true
+		default:
+			b.WriteRune(c)
+			j++
+		}
+	}
+	return "", 0, false
+}
+
+// baselineExprScanNumber 读取一段数字字面量（含 0x/0b/0o 前缀、小数与科学计数）。
+func baselineExprScanNumber(runes []rune, i int) (string, int) {
+	if runes[i] == '0' && i+1 < len(runes) && strings.ContainsRune("xXbBoO", runes[i+1]) {
+		k := i + 2
+		for k < len(runes) && (runes[k] >= '0' && runes[k] <= '9' || runes[k] >= 'a' && runes[k] <= 'f' ||
+			runes[k] >= 'A' && runes[k] <= 'F' || runes[k] == '_') {
+			k++
+		}
+		if k > i+2 {
+			return string(runes[i:k]), k
+		}
+	}
+	j := i
+	for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+		j++
+	}
+	if j+1 < len(runes) && runes[j] == '.' && runes[j+1] >= '0' && runes[j+1] <= '9' {
+		j++
+		for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+			j++
+		}
+	}
+	if j < len(runes) && (runes[j] == 'e' || runes[j] == 'E') {
+		k := j + 1
+		if k < len(runes) && (runes[k] == '+' || runes[k] == '-') {
+			k++
+		}
+		if k < len(runes) && runes[k] >= '0' && runes[k] <= '9' {
+			j = k
+			for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+		}
+	}
+	if j == i {
+		// 理论上不会发生（调用方保证首位是数字），保底推进一格避免死循环。
+		j = i + 1
+	}
+	return string(runes[i:j]), j
+}
+
+// baselineExprOperatorAt 返回 runes 前缀上最长的已知运算符；没有匹配时返回 nil。
+func baselineExprOperatorAt(runes []rune) []rune {
+	for _, op := range baselineExpressionOperators {
+		if len(runes) < len(op) {
 			continue
 		}
-		seen[t] = true
-		out = append(out, t)
+		matched := true
+		for k := range op {
+			if runes[k] != op[k] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return op
+		}
 	}
-	sort.Strings(out)
-	return out
+	return nil
 }
 
 // baselineGenerationExprMatches 判断库侧 GENERATION_EXPRESSION 是否等价于目录表达式。
-// 空库侧表达式一律判否（生成列丢失必须显式失败）。
+//
+// 判定是严格顺序敏感的：两侧归一化后的 token 序列必须等长且逐位完全相同。
+// 空库侧表达式、切分失败、token 数不同、任一位置不同（含条件取反、分支互换、
+// 参数换位、新增/替换运算符、重复次数不同）一律返回 false。
 func baselineGenerationExprMatches(catalogExpr, dbExpr string) bool {
 	if strings.TrimSpace(dbExpr) == "" {
 		return false
 	}
-	want := baselineSortedTokens(catalogExpr)
-	got := baselineSortedTokens(dbExpr)
+	want := baselineExpressionTokens(catalogExpr)
+	got := baselineExpressionTokens(dbExpr)
 	if len(want) == 0 || len(want) != len(got) {
 		return false
 	}
