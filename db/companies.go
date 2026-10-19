@@ -609,10 +609,51 @@ func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason str
 	if err != nil {
 		return false, err
 	}
+
+	// 显式将未激活的另外两组 identity 与 hash 列绑定为 NULL（满足 M1 审查要求）：
+	// 无论当前是哪一个分支，全表 3 对 hash 与 identity 列在 INSERT 语句中完整列出，
+	// 仅当前激活分支传入有效值，其余两对显式传入 nil (SQL NULL)。
+	var (
+		identDomain, identNet, identVal []byte
+		hashDomain, hashNet, hashVal   []byte
+		valDomain, valNet, valVal       *string
+	)
+
+	switch rule.Kind {
+	case "domain":
+		identDomain = branch.Identity
+		hashDomain = branch.Hash
+		valDomain = &branch.Value
+	case "net":
+		identNet = branch.Identity
+		hashNet = branch.Hash
+		valNet = &branch.Value
+	case "value":
+		identVal = branch.Identity
+		hashVal = branch.Hash
+		valVal = &branch.Value
+	default:
+		// icp 与 keyword 对应 ValueCol="value"
+		if branch.ValueCol == "value" {
+			identVal = branch.Identity
+			hashVal = branch.Hash
+			valVal = &branch.Value
+		}
+	}
+
 	res, err := tx.Exec(`
-INSERT INTO company_scope(company_id, kind, `+branch.ValueCol+`, raw, reason, `+branch.IdentCol+`, `+branch.HashCol+`)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		companyID, rule.Kind, branch.Value, rule.Raw, reason, branch.Identity, branch.Hash)
+INSERT INTO company_scope(
+    company_id, kind, domain, net, value, raw, reason,
+    identity_scope_domain, hash_scope_domain,
+    identity_scope_net, hash_scope_net,
+    identity_scope_value, hash_scope_value
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		companyID, rule.Kind, valDomain, valNet, valVal, rule.Raw, reason,
+		identDomain, hashDomain,
+		identNet, hashNet,
+		identVal, hashVal,
+	)
 	if err != nil {
 		if tidb.IsDuplicateKey(err) {
 			return false, nil

@@ -330,10 +330,12 @@ func TestCompaniesHashUniqueKeyWritesAreComplete(t *testing.T) {
 	if !strings.Contains(source, "canonicalIdentityPair(schema.NKeyIdentity(nkey))") {
 		t.Error("company nkey 身份必须来自 schema.NKeyIdentity + canonicalIdentityPair")
 	}
-	// 范围规则的载荷列与身份列必须同时来自按 kind 选出的那一个分支，
-	// 分两处硬写就会出现"kind=icp 却写进 net 分支"这类唯一键错位的行。
+	// 范围规则的载荷列与身份列必须同时来自按 kind 选出的那一个分支，且非激活列显式置空
 	for _, want := range []string{
-		"INSERT INTO company_scope(company_id, kind, `+branch.ValueCol+`, raw, reason, `+branch.IdentCol+`, `+branch.HashCol+`)",
+		"INSERT INTO company_scope(",
+		"identity_scope_domain, hash_scope_domain",
+		"identity_scope_net, hash_scope_net",
+		"identity_scope_value, hash_scope_value",
 		"companyScopeBranchFor(companyID, rule)",
 	} {
 		if !strings.Contains(source, want) {

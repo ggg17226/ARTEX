@@ -267,6 +267,21 @@ func (s *AssetStore) resolveCompanyWithICP(rootDomain, ipStr, icp string) (*int6
 }
 
 func resolveAssetCompany(q assetScopeQueryer, rootDomain, ipStr, icp string) (*int64, error) {
+	// 在解析到有效 company_id 时，验证该目标企业在数据库中真实存活且有效（M19 并发防悬垂保护）：
+	// 避免在企业删除提交之后，由于旧快照读解析出了已被删除的 company_id，导致新写入的资产带有悬空的 company_id。
+	verifyCompanyAlive := func(cid int64) (*int64, error) {
+		var exists int
+		err := q.QueryRow(`SELECT 1 FROM companies WHERE id = ? LIMIT 1`, cid).Scan(&exists)
+		if err == nil {
+			return &cid, nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			// 该企业已经被并发删除，忽略陈旧归属
+			return nil, nil
+		}
+		return nil, err
+	}
+
 	if rootDomain != "" {
 		var cid int64
 		err := q.QueryRow(`
@@ -275,7 +290,7 @@ WHERE kind = 'domain' AND domain = ?
 ORDER BY CHAR_LENGTH(domain) DESC, company_id ASC
 LIMIT 1`, rootDomain).Scan(&cid)
 		if err == nil {
-			return &cid, nil
+			return verifyCompanyAlive(cid)
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
@@ -287,7 +302,7 @@ LIMIT 1`, rootDomain).Scan(&cid)
 			return nil, err
 		}
 		if cid != nil {
-			return cid, nil
+			return verifyCompanyAlive(*cid)
 		}
 	}
 	if normalized := NormalizeICP(icp); normalized != "" {
@@ -298,7 +313,7 @@ WHERE kind = 'icp' AND value = ?
 ORDER BY company_id ASC
 LIMIT 1`, normalized).Scan(&cid)
 		if err == nil {
-			return &cid, nil
+			return verifyCompanyAlive(cid)
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
