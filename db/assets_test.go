@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"slices"
@@ -1006,7 +1007,10 @@ func TestAssetMergeParamsDescWins(t *testing.T) {
 
 // task_ids 合并必须保持数值 JSON 且按值去重（原 PG 侧 `|| ARRAY[...]` 去重的等价实现）。
 func TestAssetUnionTaskIDsDedupes(t *testing.T) {
-	got := assetUnionTaskIDs(`[7,11]`, []int64{11, 13})
+	got, err := assetUnionTaskIDs(`[7,11]`, []int64{11, 13})
+	if err != nil {
+		t.Fatalf("assetUnionTaskIDs: %v", err)
+	}
 	if got != "[7,11,13]" {
 		t.Errorf("want [7,11,13], got %s", got)
 	}
@@ -1504,6 +1508,33 @@ type assetMockRow struct {
 	values     map[string]driver.Value // 非身份业务列
 }
 
+// clone 深拷贝一行，供事务快照使用（Rollback 必须恢复到 begin 时的**独立副本**，
+// 否则快照会和在途写入共享同一份 map，回滚就变成空操作）。
+func (r *assetMockRow) clone() *assetMockRow {
+	out := &assetMockRow{
+		id:         r.id,
+		identities: make(map[string][]byte, len(r.identities)),
+		values:     make(map[string]driver.Value, len(r.values)),
+	}
+	for k, v := range r.identities {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out.identities[k] = cp
+	}
+	for k, v := range r.values {
+		out.values[k] = v
+	}
+	return out
+}
+
+// assetMockTxState 是单个事务 begin 时刻的表状态快照；Rollback 时整表恢复。
+// 有了它，离线 mock 才能真正断言"整笔事务回滚 = 零写入"，而不只是数 rollback 次数。
+type assetMockTxState struct {
+	rows   map[int64]*assetMockRow
+	byHash map[string]int64
+	nextID int64
+}
+
 // assetMockEngine 是内存版 assets 唯一索引引擎 + 语句记录器。
 type assetMockEngine struct {
 	mu     sync.Mutex
@@ -1515,14 +1546,56 @@ type assetMockEngine struct {
 	calls      []assetMockCall
 	// hook 可在引擎默认分派前拦截/改写应答（用于注入 1062、碰撞等故障）。
 	hook func(assetMockCall) (assetMockReply, bool)
+	// txStates 是每个在途事务的 begin 时刻快照，Rollback 时恢复。
+	txStates map[int]*assetMockTxState
 }
 
 func newAssetMockEngine() *assetMockEngine {
 	return &assetMockEngine{
-		rows:   map[int64]*assetMockRow{},
-		byHash: map[string]int64{},
-		nextID: 100,
+		rows:     map[int64]*assetMockRow{},
+		byHash:   map[string]int64{},
+		nextID:   100,
+		txStates: map[int]*assetMockTxState{},
 	}
+}
+
+// beginTx 记下事务开始时的表状态（深拷贝，之后的一切写入都碰不到这份副本）。
+func (e *assetMockEngine) beginTx(txID int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state := &assetMockTxState{
+		rows:   make(map[int64]*assetMockRow, len(e.rows)),
+		byHash: make(map[string]int64, len(e.byHash)),
+		nextID: e.nextID,
+	}
+	for id, row := range e.rows {
+		state.rows[id] = row.clone()
+	}
+	for k, v := range e.byHash {
+		state.byHash[k] = v
+	}
+	e.txStates[txID] = state
+}
+
+// commitTx 丢弃快照（写入从此持久化在 mock 表里）。
+func (e *assetMockEngine) commitTx(txID int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.txStates, txID)
+}
+
+// rollbackTx 把表状态整体恢复到 begin 时刻：这是"零写入"断言的真实依据。
+func (e *assetMockEngine) rollbackTx(txID int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state, ok := e.txStates[txID]
+	if !ok {
+		return
+	}
+	e.rows = state.rows
+	e.byHash = state.byHash
+	e.nextID = state.nextID
+	delete(e.txStates, txID)
 }
 
 // corruptIdentityAfterUpdate 让下一次 UPDATE 落库后把指定身份列改成**外来字节**，
@@ -1809,16 +1882,27 @@ func (e *assetMockEngine) handle(c assetMockCall) assetMockReply {
 		return assetReplyRows([]string{"id", identCol}, []driver.Value{pk, identity})
 	}
 
-	// 5) 按物理 PK 的行级悲观锁：SELECT id FROM assets WHERE id = ? FOR UPDATE
+	// 5) 物理 PK 定位的**锁定当前读**：
+	//      SELECT id FROM assets WHERE id = ? FOR UPDATE              （行级悲观预锁）
+	//      SELECT <业务列|身份列> FROM assets WHERE id = ? FOR UPDATE （持锁当前读，R2）
+	//    任何按 hash 定位的 FOR UPDATE 一律判红：hash 不是允许的物理预定位器
+	//    （schema.VerifyHashArbitration 锁序前置契约），带 identity 列的 hash 锁只会
+	//    是分支 4 的仲裁语句，其余（例如旧的 `WHERE hash_ip = ? FOR UPDATE` 追加路径）
+	//    都必须落到这里被拒绝。
 	if c.isSelectForUpdate() {
-		id, _ := assetInt64(c.arg(0))
-		e.mu.Lock()
-		row, ok := e.rows[id]
-		e.mu.Unlock()
-		if !ok {
-			return assetReplyNoRows("id")
+		normalized := strings.ReplaceAll(strings.ToUpper(q), "`", "")
+		if !strings.Contains(normalized, " WHERE ID = ? FOR UPDATE") {
+			return assetReplyErr(fmt.Errorf("mock: FOR UPDATE must be located by physical PK, never by hash: %s", q))
 		}
-		return assetReplyRows([]string{"id"}, []driver.Value{row.id})
+		cols := assetSelectColumns(q)
+		if len(cols) == 0 {
+			return assetReplyErr(fmt.Errorf("mock: cannot parse locking SELECT columns: %s", q))
+		}
+		id, _ := assetInt64(c.arg(0))
+		if e.row(id) == nil {
+			return assetReplyNoRows(cols...)
+		}
+		return assetReplyRows(cols, e.rowValues(id, cols))
 	}
 
 	// 6) 普通回读：按 hash 定位（候选查询）或按 PK 回读业务/身份列。
@@ -1971,6 +2055,8 @@ func (c *assetMockConn) BeginTx(_ context.Context, _ driver.TxOptions) (driver.T
 	txID := c.txSeq
 	c.mu.Unlock()
 	c.engine.record(assetMockCall{TxID: txID, Kind: assetKindBegin})
+	// begin 之后立刻打快照：Rollback 时整表恢复，"回滚 = 零写入"才是可验证的事实。
+	c.engine.beginTx(txID)
 	return &assetMockTx{conn: c, id: txID}, nil
 }
 
@@ -2013,6 +2099,7 @@ func (t *assetMockTx) Commit() error {
 	}
 	t.conn.mu.Unlock()
 	t.conn.engine.record(assetMockCall{TxID: t.id, Kind: assetKindCommit})
+	t.conn.engine.commitTx(t.id)
 	return nil
 }
 
@@ -2023,6 +2110,7 @@ func (t *assetMockTx) Rollback() error {
 	}
 	t.conn.mu.Unlock()
 	t.conn.engine.record(assetMockCall{TxID: t.id, Kind: assetKindRollback})
+	t.conn.engine.rollbackTx(t.id)
 	return nil
 }
 
@@ -2801,5 +2889,487 @@ func TestAssets_PathAIdentityDriftRolledBack(t *testing.T) {
 	}
 	if rollbacks == 0 {
 		t.Errorf("drifted write must roll back the whole attempt")
+	}
+}
+
+// =============================================================================
+// 修复轮次 1 — R1：同一事务内的嵌套子写入不得吞错
+// =============================================================================
+//
+// 子 upsert 复用外层 s.tx，它自己回滚不了；唯一的回滚点是 runAssetAttempt 依据
+// fn 的返回值决定 Commit。因此子调用的 ErrIdentityHashCollision / 1062 必须原样
+// 上抛，否则外层会带着"子写入已失败"的事实把其他资产的写入一起提交（违反 F02）。
+
+// assetMockRowCount 是"回滚后必须逐行复原"的观测辅助（含 hash 唯一索引）。
+func TestAssets_NestedRootDomainCollisionRollsBackWholeTransaction(t *testing.T) {
+	stamp := time.Now().UnixNano()
+	sub := fmt.Sprintf("p08-nest-%d.example.com", stamp)
+	root, _ := RootDomain(sub)
+	foreign := fmt.Sprintf("p08-nest-foreign-%d.example.com", stamp)
+	foreignIdentity := schema.AssetsRootDomainIdentity(foreign)
+
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	rootID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: root})
+	if err != nil {
+		t.Fatalf("seed root_domain failed: %v", err)
+	}
+	// 碰撞前提：hash_root_domain 仍命中 root 的 canonical hash，identity 是别人的。
+	eng.injectHashCollision(t, rootID, "identity_root_domain", foreignIdentity)
+
+	eng.resetCalls()
+	rowsBefore := eng.rowCount()
+
+	_, err = d.Assets().UpsertSubdomain(UpsertSubdomainReq{Domain: sub, RecordType: "CNAME", TaskID: 21})
+	if !errors.Is(err, schema.ErrIdentityHashCollision) {
+		t.Fatalf("nested root_domain collision must surface as ErrIdentityHashCollision, got %v", err)
+	}
+
+	calls := eng.snapshot()
+	assetAssertTiDBDialect(t, calls)
+	if begins, commits, rollbacks := eng.txCounts(); begins != 1 || commits != 0 || rollbacks != 1 {
+		t.Fatalf("nested collision must roll the whole transaction back exactly once (begins=%d commits=%d rollbacks=%d)%s",
+			begins, commits, rollbacks, assetCallsString(calls))
+	}
+	// 协议层零写入：整笔事务里连一条 DML 都不允许出现。
+	if got := eng.callsFor(func(c assetMockCall) bool { return c.isInsert() || c.isUpdate() }); len(got) != 0 {
+		t.Fatalf("nested collision must not issue any DML, first write: %s%s", got[0].line(), assetCallsString(calls))
+	}
+	// 状态层零写入：回滚后表必须回到 begin 时刻。
+	if eng.rowCount() != rowsBefore {
+		t.Fatalf("rolled-back nested write must leave the table untouched: rows %d -> %d", rowsBefore, eng.rowCount())
+	}
+	subIdentity := schema.AssetsSubdomainIdentity(sub, "CNAME")
+	subSum := schema.CanonicalHash(subIdentity)
+	if eng.hashRows("hash_subdomain", subSum[:]) != 0 {
+		t.Fatal("rolled-back subdomain row must not survive the rollback")
+	}
+	if got := eng.row(rootID).identities["identity_root_domain"]; string(got) != string(foreignIdentity) {
+		t.Fatal("nested collision must not overwrite the existing identity")
+	}
+}
+
+func TestAssets_Nested1062RollsBackAndReplaysInNewTransaction(t *testing.T) {
+	stamp := time.Now().UnixNano()
+	sub := fmt.Sprintf("p08-nest-race-%d.example.com", stamp)
+	root, _ := RootDomain(sub)
+
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	winnerID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: root})
+	if err != nil {
+		t.Fatalf("concurrent winner root_domain failed: %v", err)
+	}
+
+	// 受控时序：让嵌套 root_domain 的候选查询看不到赢家 → 严格 INSERT 真的撞上 1062。
+	// 同时记录"第二次候选定位"时刻的行数：此刻 Tx1 已经回滚，若回滚真的撤销了它
+	// 那条 INSERT，行数必须等于 winner 之后的数量。
+	hidden := false
+	var rowsAfterRollback = -1
+	var mu sync.Mutex
+	eng.setHook(func(c assetMockCall) (assetMockReply, bool) {
+		if !assetIsCandidateLookup(c) {
+			return assetMockReply{}, false
+		}
+		if !hidden {
+			hidden = true
+			return assetReplyNoRows(assetSelectColumns(c.Query)...), true
+		}
+		mu.Lock()
+		rowsAfterRollback = eng.rowCount()
+		mu.Unlock()
+		return assetMockReply{}, false
+	})
+	defer eng.setHook(nil)
+
+	eng.resetCalls()
+	rowsBefore := eng.rowCount()
+
+	id, err := d.Assets().UpsertSubdomain(UpsertSubdomainReq{Domain: sub, RecordType: "CNAME"})
+	if err != nil {
+		t.Fatalf("nested 1062 must be retried in a brand-new transaction, got err %v", err)
+	}
+	if id <= 0 {
+		t.Fatalf("expected positive subdomain id, got %d", id)
+	}
+
+	calls := eng.snapshot()
+	assetAssertTiDBDialect(t, calls)
+	begins, commits, rollbacks := eng.txCounts()
+	if begins < 2 || rollbacks < 1 || commits != 1 {
+		t.Fatalf("nested 1062 must rollback Tx1 and commit in a new transaction (begins=%d commits=%d rollbacks=%d)%s",
+			begins, commits, rollbacks, assetCallsString(calls))
+	}
+	rollbackIdx := assetIndexOf(calls, func(c assetMockCall) bool { return c.Kind == assetKindRollback })
+	secondBeginIdx := -1
+	if true {
+		n := 0
+		for i, c := range calls {
+			if c.Kind == assetKindBegin {
+				n++
+				if n == 2 {
+					secondBeginIdx = i
+					break
+				}
+			}
+		}
+	}
+	if !(rollbackIdx >= 0 && secondBeginIdx > rollbackIdx) {
+		t.Fatalf("order must be Tx1 rollback < Tx2 begin (rollback=%d tx2=%d)%s", rollbackIdx, secondBeginIdx, assetCallsString(calls))
+	}
+	// 失败的那一笔确实走到过 INSERT（否则测不到 1062 回滚），且它被回滚撤销了。
+	tx1 := calls[:secondBeginIdx]
+	if assetIndexOf(tx1, assetMockCall.isInsert) < 0 {
+		t.Fatalf("Tx1 must reach the strict INSERT that loses the race:%s", assetCallsString(tx1))
+	}
+	if assetIndexOf(tx1, assetMockCall.isUpdate) >= 0 {
+		t.Fatalf("Tx1 must stop at the failed nested write:%s", assetCallsString(tx1))
+	}
+	mu.Lock()
+	gotRows := rowsAfterRollback
+	mu.Unlock()
+	if gotRows != rowsBefore {
+		t.Fatalf("Tx1 rollback must undo its own INSERT: rows %d -> %d", rowsBefore, gotRows)
+	}
+	// 重演必须复用赢家物理 PK，并且整笔只留下 subdomain 这一条新行。
+	if eng.row(winnerID) == nil {
+		t.Fatalf("winner row %d must still exist", winnerID)
+	}
+	if eng.rowCount() != rowsBefore+1 {
+		t.Fatalf("replay must add exactly the subdomain row: rows %d -> %d", rowsBefore, eng.rowCount())
+	}
+}
+
+// TestAssets_PostMainWriteSideEffectCollisionRollsBackMainWrite 覆盖"主写入之后
+// 才发生副作用失败"这一类：service_http 已经 INSERT 成功也必须一起回滚（零写入）。
+func TestAssets_PostMainWriteSideEffectCollisionRollsBackMainWrite(t *testing.T) {
+	stamp := time.Now().UnixNano()
+	host := fmt.Sprintf("p08-side-%d.example.com", stamp)
+	seedIP := fmt.Sprintf("10.77.%d.%d", (stamp/1000)%200, stamp%200)
+	foreignIP := fmt.Sprintf("10.78.%d.%d", (stamp/1000)%200, stamp%200)
+
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	ipID, err := d.Assets().UpsertIP(UpsertIPReq{IP: seedIP})
+	if err != nil {
+		t.Fatalf("seed ip failed: %v", err)
+	}
+	eng.injectHashCollision(t, ipID, "identity_ip", schema.AssetsIPIdentity(foreignIP))
+
+	eng.resetCalls()
+	rowsBefore := eng.rowCount()
+
+	_, err = d.Assets().UpsertHTTPService(UpsertHTTPServiceReq{
+		URL: fmt.Sprintf("http://%s:8080/api", host),
+		IP:  seedIP,
+	})
+	if !errors.Is(err, schema.ErrIdentityHashCollision) {
+		t.Fatalf("post-main-write ip side effect collision must surface, got %v", err)
+	}
+
+	calls := eng.snapshot()
+	assetAssertTiDBDialect(t, calls)
+	if _, commits, rollbacks := eng.txCounts(); commits != 0 || rollbacks != 1 {
+		t.Fatalf("a failed side effect after the main INSERT must roll everything back (commits=%d rollbacks=%d)%s",
+			commits, rollbacks, assetCallsString(calls))
+	}
+	if eng.rowCount() != rowsBefore {
+		t.Fatalf("the already-inserted main row must be rolled back too: rows %d -> %d", rowsBefore, eng.rowCount())
+	}
+	serviceIdentity := schema.AssetsServiceHTTPIdentity(fmt.Sprintf("http://%s:8080/api", host))
+	serviceSum := schema.CanonicalHash(serviceIdentity)
+	if eng.hashRows("hash_service_http", serviceSum[:]) != 0 {
+		t.Fatal("rolled-back service_http row must not survive the rollback")
+	}
+}
+
+// =============================================================================
+// 修复轮次 1 — R2：Path A 持锁后必须以锁定当前读回读业务列（杜绝 lost update）
+// =============================================================================
+
+func TestAssets_PathAMergeReadIsLockingCurrentRead(t *testing.T) {
+	domain := fmt.Sprintf("p08-rr-%d.example.com", time.Now().UnixNano())
+
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	id, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: 1})
+	if err != nil {
+		t.Fatalf("seed upsert failed: %v", err)
+	}
+
+	// 并发事实：本事务拿到物理 PK 锁的那一刻，另一个事务已经把 task_ids 提交成 [1,2]。
+	// REPEATABLE-READ 下的普通快照读只会看到 [1]，锁定当前读才会看到 [1,2]。
+	fired := false
+	eng.setHook(func(c assetMockCall) (assetMockReply, bool) {
+		if !fired && assetIsPKLock(c) && !c.has("task_ids") {
+			fired = true
+			eng.row(id).values["task_ids"] = "[1,2]"
+		}
+		return assetMockReply{}, false
+	})
+	defer eng.setHook(nil)
+
+	eng.resetCalls()
+	if _, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: 3}); err != nil {
+		t.Fatalf("path A upsert failed: %v", err)
+	}
+
+	calls := eng.snapshot()
+	assetAssertTiDBDialect(t, calls)
+
+	// ① 协议：业务列回读必须是 `… WHERE id = ? FOR UPDATE` 的锁定当前读。
+	readIdx := assetIndexOf(calls, func(c assetMockCall) bool {
+		return c.isQuery() && c.has("task_ids") && strings.Contains(c.Query, "FROM assets")
+	})
+	if readIdx < 0 {
+		t.Fatalf("Path A must read business columns back before merging%s", assetCallsString(calls))
+	}
+	if !calls[readIdx].isSelectForUpdate() {
+		t.Fatalf("Path A merge read must be a locking current read, snapshot read loses concurrent writes: %s",
+			calls[readIdx].line())
+	}
+	for _, c := range calls {
+		if c.isQuery() && c.has("task_ids") && strings.Contains(c.Query, "FROM assets") && !c.isSelectForUpdate() {
+			t.Fatalf("Path A must never read business columns with a plain snapshot select: %s", c.line())
+		}
+	}
+	// ② 时序：PK 预锁 < 当前读回读 < UPDATE。
+	lockIdx := assetIndexOf(calls, func(c assetMockCall) bool { return assetIsPKLock(c) && !c.has("task_ids") })
+	updIdx := assetIndexOf(calls, assetMockCall.isUpdate)
+	if !(lockIdx >= 0 && lockIdx < readIdx && readIdx < updIdx) {
+		t.Fatalf("order must be pk-lock < locking read < update (got %d/%d/%d)%s",
+			lockIdx, readIdx, updIdx, assetCallsString(calls))
+	}
+	// ③ 结果：并发写者新增的 2 必须活下来（lost update 判据）。
+	got, _ := assetBytes(eng.row(id).values["task_ids"])
+	if string(got) != "[1,2,3]" {
+		t.Fatalf("concurrent task_ids element lost: want [1,2,3], got %s", string(got))
+	}
+}
+
+// =============================================================================
+// 修复轮次 1 — R3：task_ids 解码不得经过 float64（>2^53 的 BIGINT 必须保真）
+// =============================================================================
+
+func TestAssets_TaskIDsPreserveInt64Precision(t *testing.T) {
+	t.Run("union keeps values above 2^53 exact", func(t *testing.T) {
+		got, err := assetUnionTaskIDs("[9007199254740993]", []int64{17})
+		if err != nil {
+			t.Fatalf("assetUnionTaskIDs: %v", err)
+		}
+		if got != "[9007199254740993,17]" {
+			t.Fatalf("task ID corrupted through float64: got %s, want [9007199254740993,17]", got)
+		}
+	})
+	t.Run("adjacent big integers and MaxInt64 survive dedupe", func(t *testing.T) {
+		old := "[9007199254740992,9007199254740993,9007199254740994,9223372036854775807]"
+		got, err := assetUnionTaskIDs(old, []int64{9223372036854775807, 9007199254740993})
+		if err != nil {
+			t.Fatalf("assetUnionTaskIDs: %v", err)
+		}
+		if got != "[9007199254740992,9007199254740993,9007199254740994,9223372036854775807]" {
+			t.Fatalf("adjacent big task IDs corrupted: got %s", got)
+		}
+	})
+	t.Run("legacy string elements stay exact", func(t *testing.T) {
+		got, err := assetUnionTaskIDs(`["9007199254740993"]`, []int64{5})
+		if err != nil {
+			t.Fatalf("assetUnionTaskIDs: %v", err)
+		}
+		if got != "[9007199254740993,5]" {
+			t.Fatalf("string task ID corrupted: got %s", got)
+		}
+	})
+	t.Run("corrupt column is an error, never a silent empty set", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			raw     string
+			wantErr bool
+		}{
+			{name: "empty", raw: ""},
+			{name: "null", raw: "null"},
+			{name: "empty array", raw: "[]"},
+			{name: "not json", raw: "not-json", wantErr: true},
+			{name: "object", raw: `{"a":1}`, wantErr: true},
+			{name: "fraction", raw: "[1.5]", wantErr: true},
+			{name: "int64 overflow", raw: "[9223372036854775808]", wantErr: true},
+			{name: "null element", raw: "[null]", wantErr: true},
+			{name: "text element", raw: `["abc"]`, wantErr: true},
+		} {
+			_, err := assetUnionTaskIDs(tc.raw, nil)
+			if tc.wantErr && err == nil {
+				t.Errorf("%s: %q must be rejected instead of silently treated as empty", tc.name, tc.raw)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("%s: %q must decode, got %v", tc.name, tc.raw, err)
+			}
+		}
+	})
+	t.Run("end to end merge writes the exact BIGINT back", func(t *testing.T) {
+		const bigTask int64 = 9007199254740993
+		domain := fmt.Sprintf("p08-big-%d.example.com", time.Now().UnixNano())
+
+		eng := newAssetMockEngine()
+		d := openAssetMockDB(t, eng)
+
+		id, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: bigTask})
+		if err != nil {
+			t.Fatalf("seed with big task id failed: %v", err)
+		}
+		if got, _ := assetBytes(eng.row(id).values["task_ids"]); string(got) != "[9007199254740993]" {
+			t.Fatalf("insert task_ids must stay exact, got %s", string(got))
+		}
+		if _, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: 17}); err != nil {
+			t.Fatalf("merge with big task id failed: %v", err)
+		}
+		got, _ := assetBytes(eng.row(id).values["task_ids"])
+		if string(got) != "[9007199254740993,17]" {
+			t.Fatalf("merged task_ids corrupted: want [9007199254740993,17], got %s", string(got))
+		}
+	})
+	t.Run("MaxInt64 round trip", func(t *testing.T) {
+		got, err := parseTaskIDArray(fmt.Sprintf("[%d]", int64(math.MaxInt64)))
+		if err != nil {
+			t.Fatalf("parseTaskIDArray(MaxInt64): %v", err)
+		}
+		if len(got) != 1 || got[0] != int64(math.MaxInt64) {
+			t.Fatalf("MaxInt64 corrupted: %v", got)
+		}
+	})
+}
+
+// =============================================================================
+// 修复轮次 1 — R4：追加路径必须 canonical 化并复用 PK 预锁协议
+// =============================================================================
+
+func TestAssets_AppendIPPortCanonicalEquivalent(t *testing.T) {
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	ipID, err := d.Assets().UpsertIP(UpsertIPReq{IP: "127.0.0.1", TaskID: 5})
+	if err != nil {
+		t.Fatalf("seed ip failed: %v", err)
+	}
+	eng.resetCalls()
+
+	// ::ffff:127.0.0.1 与 127.0.0.1 是同一个地址：入口必须先 canonicalIP。
+	if err := d.Assets().AppendIPPort("::ffff:127.0.0.1", 443, "https"); err != nil {
+		t.Fatalf("AppendIPPort on a canonical-equivalent address failed: %v", err)
+	}
+	if err := d.Assets().AppendIPBoundDomain("::ffff:127.0.0.1", "canonical.example.com"); err != nil {
+		t.Fatalf("AppendIPBoundDomain on a canonical-equivalent address failed: %v", err)
+	}
+
+	calls := eng.snapshot()
+	assetAssertTiDBDialect(t, calls)
+
+	openPorts, _ := assetBytes(eng.row(ipID).values["open_ports"])
+	if !strings.Contains(string(openPorts), "443") {
+		t.Fatalf("canonical equivalent port append silently lost: open_ports=%s%s", string(openPorts), assetCallsString(calls))
+	}
+	bound, _ := assetBytes(eng.row(ipID).values["bound_domains"])
+	if !strings.Contains(string(bound), "canonical.example.com") {
+		t.Fatalf("canonical equivalent bound_domains append silently lost: bound_domains=%s", string(bound))
+	}
+
+	// 协议：候选普通定位 → 物理 PK 预锁 → 写前仲裁 → 持锁当前读 → 非身份 UPDATE。
+	candIdx := assetIndexOf(calls, assetIsCandidateLookup)
+	lockIdx := assetIndexOf(calls, func(c assetMockCall) bool { return assetIsPKLock(c) && !c.has("open_ports") })
+	arbIdx := assetIndexOf(calls, assetIsArbitration)
+	readIdx := assetIndexOf(calls, func(c assetMockCall) bool { return c.isSelectForUpdate() && c.has("open_ports") })
+	updIdx := assetIndexOf(calls, assetMockCall.isUpdate)
+	for name, idx := range map[string]int{"candidate": candIdx, "pk-lock": lockIdx, "arbitration": arbIdx, "locking-read": readIdx, "update": updIdx} {
+		if idx < 0 {
+			t.Fatalf("append path missing %s step:%s", name, assetCallsString(calls))
+		}
+	}
+	if !(candIdx < lockIdx && lockIdx < arbIdx && arbIdx < readIdx && readIdx < updIdx) {
+		t.Fatalf("append order must be candidate < pk-lock < arbitration < locking-read < update (got %d/%d/%d/%d/%d)%s",
+			candIdx, lockIdx, arbIdx, readIdx, updIdx, assetCallsString(calls))
+	}
+	// hash 不是物理预定位器：追加路径绝不允许 WHERE hash_ip = ? FOR UPDATE。
+	for _, c := range calls {
+		if c.isSelectForUpdate() && c.has("hash_ip") && !assetIsArbitration(c) {
+			t.Fatalf("append path must never pre-lock by hash: %s", c.line())
+		}
+	}
+	for _, c := range eng.callsFor(assetMockCall.isUpdate) {
+		for _, col := range assetUpdateColumns(c.Query) {
+			if strings.HasPrefix(col, "identity_") || strings.HasPrefix(col, "hash_") {
+				t.Fatalf("append path must not mutate identity column %q: %s", col, c.line())
+			}
+		}
+	}
+	// 两次追加（open_ports / bound_domains）各自一笔事务，都必须干净提交。
+	if _, commits, rollbacks := eng.txCounts(); commits != 2 || rollbacks != 0 {
+		t.Fatalf("successful appends must commit once per call without rollback (commits=%d rollbacks=%d)%s",
+			commits, rollbacks, assetCallsString(calls))
+	}
+}
+
+func TestAssets_AppendIPPortCollisionRollsBackWithZeroWrite(t *testing.T) {
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	ipID, err := d.Assets().UpsertIP(UpsertIPReq{IP: "10.98.76.54"})
+	if err != nil {
+		t.Fatalf("seed ip failed: %v", err)
+	}
+	eng.injectHashCollision(t, ipID, "identity_ip", schema.AssetsIPIdentity("10.98.76.55"))
+
+	eng.resetCalls()
+	openPortsBefore, _ := assetBytes(eng.row(ipID).values["open_ports"])
+
+	err = d.Assets().AppendIPPort("10.98.76.54", 8443, "https")
+	if !errors.Is(err, schema.ErrIdentityHashCollision) {
+		t.Fatalf("append path must surface write-ahead arbitration collision, got %v", err)
+	}
+	calls := eng.snapshot()
+	assetAssertTiDBDialect(t, calls)
+	if _, commits, rollbacks := eng.txCounts(); commits != 0 || rollbacks != 1 {
+		t.Fatalf("append collision must roll the whole transaction back (commits=%d rollbacks=%d)%s",
+			commits, rollbacks, assetCallsString(calls))
+	}
+	if got := eng.callsFor(assetMockCall.isUpdate); len(got) != 0 {
+		t.Fatalf("append collision must write nothing, first write: %s", got[0].line())
+	}
+	openPortsAfter, _ := assetBytes(eng.row(ipID).values["open_ports"])
+	if string(openPortsAfter) != string(openPortsBefore) {
+		t.Fatalf("rolled-back append must leave open_ports alone: %s -> %s", string(openPortsBefore), string(openPortsAfter))
+	}
+}
+
+// =============================================================================
+// 修复轮次 1 — R6：退避档位与尝试次数严格对齐（每一档都可达）
+// =============================================================================
+
+func TestAssets_WriteRetryBackoffLadderAligned(t *testing.T) {
+	if len(assetWriteRetryDelays) != assetWriteMaxAttempts-1 {
+		t.Fatalf("backoff ladder must expose exactly one entry per retry: attempts=%d delays=%d",
+			assetWriteMaxAttempts, len(assetWriteRetryDelays))
+	}
+	if got := assetBackoff(0); got != 0 {
+		t.Fatalf("the first attempt must never wait, got %v", got)
+	}
+	for retry := 1; retry <= len(assetWriteRetryDelays); retry++ {
+		if got, want := assetBackoff(retry), assetWriteRetryDelays[retry-1]; got != want {
+			t.Fatalf("retry %d backoff = %v, want %v", retry, got, want)
+		}
+	}
+	last := assetWriteRetryDelays[len(assetWriteRetryDelays)-1]
+	if got := assetBackoff(assetWriteMaxAttempts - 1); got != last {
+		t.Fatalf("last ladder entry is unreachable: retry %d -> %v, want %v", assetWriteMaxAttempts-1, got, last)
+	}
+	if got := assetBackoff(assetWriteMaxAttempts + 5); got != last {
+		t.Fatalf("out-of-range retry must clamp to the last entry: got %v, want %v", got, last)
+	}
+	for i := 1; i < len(assetWriteRetryDelays); i++ {
+		if assetWriteRetryDelays[i] < assetWriteRetryDelays[i-1] {
+			t.Fatalf("backoff ladder must be non-decreasing: %v", assetWriteRetryDelays)
+		}
 	}
 }

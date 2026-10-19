@@ -135,14 +135,19 @@ func (s *AssetStore) Companies() *CompanyStore { return s.company }
 //
 // 外层重试循环负责 spec §3.2.1 路径 B-3：1062 / 1213 / 1205 一律**整笔回滚**后在
 // **全新事务**里重放（此时并发赢家已可见，重放自然落入 Path A）。
+
+// assetWriteMaxAttempts 是一次逻辑写入的尝试上限：**1 次首试 + (assetWriteMaxAttempts-1)
+// 次重试**。首试不消耗任何退避档位（它前面没有失败）。
 const assetWriteMaxAttempts = 4
 
-// assetWriteBackoffSchedule 是失败尝试之间的退避阶梯（首档 0：确定性冲突立即重放）。
-var assetWriteBackoffSchedule = []time.Duration{
+// assetWriteRetryDelays 是第 1/2/3 **次重试之前**的退避等待，长度必须严格等于
+// assetWriteMaxAttempts-1：一次重试当且仅当对应一个档位，任何档位都可达。
+// 首档 0 —— 1062 输家是确定性冲突，整笔回滚后立刻在全新事务里重放即可。
+// （R6 整改：原先"4 次尝试 + 4 档阶梯"的下标口径不一致，末档永远够不到。）
+var assetWriteRetryDelays = []time.Duration{
 	0,
 	50 * time.Millisecond,
 	200 * time.Millisecond,
-	500 * time.Millisecond,
 }
 
 // errAssetWriteRetry 标记"本轮尝试已完整回滚，必须在新事务里重放"的内部信号。
@@ -155,16 +160,21 @@ var ErrAssetWriteRetriesExhausted = errors.New("assets: write retry attempts exh
 // withAssetMutation 在一次事务里执行 fn，并在可重试冲突时以全新事务重放。
 // 嵌套的资产副作用（例如 subdomain 写入顺带 upsert root_domain/IP）通过
 // 同一个 scoped store 复用同一事务，不会各开一笔。
+//
+// **同一事务的子写入绝不允许吞错（R1 / F02）**：子调用复用 s.tx，它自己无法回滚，
+// 唯一的回滚点在 runAssetAttempt 依据 fn 的最终返回值决定 Commit。因此子写入的
+// ErrIdentityHashCollision / 1062 / 1205 / 1213 必须原样上抛到这一层，否则外层会
+// 带着"子写入已失败"的事实提交其他资产的写入。
 func (s *AssetStore) withAssetMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
 	if s.tx != nil {
 		return fn(s)
 	}
 	var lastErr error
 	for attempt := 0; attempt < assetWriteMaxAttempts; attempt++ {
-		if attempt > 0 {
-			if wait := assetBackoff(attempt - 1); wait > 0 {
-				time.Sleep(wait)
-			}
+		// attempt == 0 是首试（无退避）；attempt == k 就是第 k 次重试，
+		// 直接以 k 取退避档位 —— 下标口径与 assetWriteRetryDelays 一一对应。
+		if wait := assetBackoff(attempt); wait > 0 {
+			time.Sleep(wait)
 		}
 		id, err := s.runAssetAttempt(fn)
 		if err == nil {
@@ -216,14 +226,16 @@ func assetShouldRetry(err error) bool {
 	return errors.Is(err, errAssetWriteRetry) || lockorder.IsRetryableConflict(err)
 }
 
-func assetBackoff(attempt int) time.Duration {
-	if attempt < 0 {
-		attempt = 0
+// assetBackoff 返回第 retry 次**重试之前**应等待的时长（retry 从 1 开始计数）。
+// retry <= 0 表示首试，永不等待；retry 超出阶梯长度时钳到最后一档。
+func assetBackoff(retry int) time.Duration {
+	if retry <= 0 {
+		return 0
 	}
-	if attempt >= len(assetWriteBackoffSchedule) {
-		return assetWriteBackoffSchedule[len(assetWriteBackoffSchedule)-1]
+	if retry > len(assetWriteRetryDelays) {
+		return assetWriteRetryDelays[len(assetWriteRetryDelays)-1]
 	}
-	return assetWriteBackoffSchedule[attempt]
+	return assetWriteRetryDelays[retry-1]
 }
 
 // assetIsDuplicateKey 结构化识别 MySQL 1062（唯一索引/主键冲突）。
@@ -507,6 +519,9 @@ func marshalTaskIDs(ids []int64) string {
 }
 
 // decodeJSONArray 读回一个 JSON 数组列；空列 / 非法 JSON 一律按空数组处理。
+// 注意：该函数经由 []any 解码，数字元素是 float64，只适用于**元素数值不会超过
+// 2^53** 的列（open_ports 的 port、字符串数组等）。task_ids 这类 BIGINT 列必须走
+// parseTaskIDArray，否则会静默丢精度（R3）。
 func decodeJSONArray(raw string) []any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -530,21 +545,48 @@ func decodeStringArray(raw string) []string {
 	return out
 }
 
-// decodeInt64Array 读回一个数字 JSON 数组列（assets.task_ids）。
-func decodeInt64Array(raw string) []int64 {
-	var out []int64
-	for _, item := range decodeJSONArray(raw) {
-		switch n := item.(type) {
-		case float64:
-			out = append(out, int64(n))
-		case string:
-			var v int64
-			if _, err := fmt.Sscanf(n, "%d", &v); err == nil {
-				out = append(out, v)
+// parseTaskIDArray 严格解析 assets.task_ids 这类"数字 JSON 数组"。
+//
+// R3 关键：全程走 json.Number（UseNumber），**绝不经过 float64**。float64 只有
+// 53 位有效尾数，> 2^53 的合法 BIGINT（如 9007199254740993）会在解码时被舍入成
+// 9007199254740992，而这个函数产出的是要**写回数据库**的值 —— 一旦舍入就等于
+// 静默改写任务归属外键，且再也回不来。
+//
+// 兼容与严格性：
+//   - 空列 / "null" → 空切片，无错误（列本来就没值）；
+//   - 数字元素必须能精确落进 int64，越界 / 小数 / null / 对象 → 显式错误；
+//   - 历史遗留的"数字字符串"元素（"7"）继续接受，同样要求精确落进 int64。
+func parseTaskIDArray(raw string) ([]int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var items []any
+	if err := dec.Decode(&items); err != nil {
+		return nil, fmt.Errorf("assets: task_ids is not a JSON array (%q): %w", raw, err)
+	}
+	out := make([]int64, 0, len(items))
+	for i, item := range items {
+		switch v := item.(type) {
+		case json.Number:
+			n, err := v.Int64()
+			if err != nil {
+				return nil, fmt.Errorf("assets: task_ids[%d]=%s is not an exact int64", i, v.String())
 			}
+			out = append(out, n)
+		case string:
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("assets: task_ids[%d]=%q is not an exact int64", i, v)
+			}
+			out = append(out, n)
+		default:
+			return nil, fmt.Errorf("assets: task_ids[%d] has unexpected JSON type %T", i, item)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // assetUnionStrings 合并字符串 JSON 数组：旧元素保持原顺序在前，新元素按值去重后追加。
@@ -575,10 +617,16 @@ func assetUnionStrings(oldJSON string, added []string) string {
 }
 
 // assetUnionTaskIDs 合并 assets.task_ids（数字数组，按值去重，保持稳定顺序）。
-func assetUnionTaskIDs(oldJSON string, added []int64) string {
+// 旧列解析失败必须显式报错：这里的产出是要写回数据库的值，静默按空数组处理会
+// 把既有归属整体抹掉（R3）。
+func assetUnionTaskIDs(oldJSON string, added []int64) (string, error) {
+	persisted, err := parseTaskIDArray(oldJSON)
+	if err != nil {
+		return "", err
+	}
 	seen := map[int64]struct{}{}
-	merged := make([]int64, 0, len(added))
-	for _, id := range decodeInt64Array(oldJSON) {
+	merged := make([]int64, 0, len(persisted)+len(added))
+	for _, id := range persisted {
 		if _, dup := seen[id]; dup {
 			continue
 		}
@@ -592,7 +640,7 @@ func assetUnionTaskIDs(oldJSON string, added []int64) string {
 		seen[id] = struct{}{}
 		merged = append(merged, id)
 	}
-	return marshalTaskIDs(merged)
+	return marshalTaskIDs(merged), nil
 }
 
 // assetMergeObjects 合并对象 JSON 数组：同 key 由 pick 决定保留哪一个，
@@ -965,9 +1013,13 @@ func (s *AssetStore) assetPathB(ctx context.Context, w assetWrite) (int64, error
 }
 
 // assetVerifyIdentity 复核持久化身份未发生漂移。
+//
+// 这里同样是**锁定当前读**：本事务已持有该 PK 的行锁，普通快照读看不到并发写者
+// 已提交的身份改动，漂移复核就会静默失效（R2 同一口径）。
 func (s *AssetStore) assetVerifyIdentity(ctx context.Context, b assetBranch, pk int64) error {
 	var persisted []byte
-	if err := s.tx.QueryRowContext(ctx, "SELECT "+b.identCol+" FROM assets WHERE id = ?", pk).Scan(&persisted); err != nil {
+	stmt := "SELECT " + b.identCol + " FROM assets WHERE id = ? FOR UPDATE"
+	if err := s.tx.QueryRowContext(ctx, stmt, pk).Scan(&persisted); err != nil {
 		return fmt.Errorf("assets: identity recheck on %d: %w", pk, err)
 	}
 	if !bytes.Equal(persisted, b.identity) {
@@ -976,13 +1028,18 @@ func (s *AssetStore) assetVerifyIdentity(ctx context.Context, b assetBranch, pk 
 	return nil
 }
 
-// assetReadCols 在持锁保护下回读指定的非身份业务列。
+// assetReadCols 在**已持有该物理 PK 行锁**的前提下，用锁定当前读回读指定的非身份业务列。
+//
+// R2：必须是 `SELECT … FROM assets WHERE id = ? FOR UPDATE`，不能是普通 SELECT。
+// 本事务更早的候选定位 / 归属解析已经建立了 REPEATABLE-READ 快照，PK 行锁本身不会
+// 把后续普通 SELECT 变成当前读；用快照读去 merge 就会把并发写者已提交的业务元素
+// 覆盖掉（lost update）。PK 锁此刻由本事务持有，FOR UPDATE 不会引入新的等待对象。
 func (s *AssetStore) assetReadCols(pk int64, cols []string) (*assetSnapshot, error) {
 	snapshot := &assetSnapshot{cols: map[string]any{}}
 	if len(cols) == 0 {
 		return snapshot, nil
 	}
-	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM assets WHERE id = ?"
+	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM assets WHERE id = ? FOR UPDATE"
 	row := s.tx.QueryRow(stmt, pk)
 	targets := make([]any, 0, len(cols))
 	for range cols {
@@ -1120,7 +1177,11 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 		}, assetCompanyCols(companyID, false)...),
 		mergeCols: []string{"task_ids", "icp", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
-			set := []assetCol{{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))}}
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
+			set := []assetCol{{"task_ids", taskIDs}}
 			if req.ICP != "" && old.str("icp") == "" {
 				set = append(set, assetCol{"icp", req.ICP})
 			}
@@ -1216,8 +1277,12 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 		}, assetCompanyCols(companyID, false)...),
 		mergeCols: []string{"task_ids", "bound_domains", "open_ports", "c_segment", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
 			set := []assetCol{
-				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"task_ids", taskIDs},
 				{"bound_domains", assetUnionStrings(old.str("bound_domains"), req.BoundDomains)},
 			}
 			merged, err := assetMergeObjects(old.str("open_ports"), addedPorts, assetPortKey, assetPreferService)
@@ -1236,12 +1301,20 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 }
 
 // AppendIPPort appends a {port, service} entry to an existing IP asset's open_ports.
+//
+// 入参必须先 canonicalIP：`::ffff:127.0.0.1` 与 `127.0.0.1` 是同一个地址，
+// 直接拿原文去算 identity 会得到另一个 hash，从而把既有 IP 资产误判成"不存在"，
+// 追加被静默丢弃（R4）。
 func (s *AssetStore) AppendIPPort(ipStr string, port int, serviceName string) error {
 	if ipStr == "" || port == 0 {
 		return nil
 	}
+	canonical, ok := canonicalIP(ipStr)
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrAssetIPInvalid, ipStr)
+	}
 	entry := map[string]any{"port": port, "service": serviceName}
-	return s.appendIPJSONArray(ipStr, "open_ports", func(old string) (string, error) {
+	return s.appendIPJSONArray(canonical, "open_ports", func(old string) (string, error) {
 		return assetMergeObjects(old, []map[string]any{entry}, assetPortKey, assetPreferService)
 	})
 }
@@ -1260,40 +1333,80 @@ func (s *AssetStore) AppendIPBoundDomain(ipStr, domain string) error {
 	})
 }
 
-// appendIPJSONArray 在 IP 资产的 hash 行锁保护下读改写一个 JSON 数组列
+// appendIPJSONArray 往既有 IP 资产的一个 JSON 数组列里追加元素
 // （TiDB 8.5 不支持 JSON_TABLE，数组展开/去重一律在 Go 内存里完成）。
+//
+// 追加路径不是"协议之外"的捷径（R4）：它必须复用与 writeAsset 完全相同的公共契约，
+//
+//  1. 候选定位：按 hash 唯一索引做**普通**查询（只选路，不加锁）；
+//  2. 物理 PK 预锁：SELECT id FROM assets WHERE id = ? FOR UPDATE；
+//  3. 写前仲裁 + PK 匹配：schema.VerifyHashArbitration 命中的 PK 必须等于候选 PK；
+//  4. 当前读回读：assetReadCols（持 PK 锁的 SELECT … FOR UPDATE）；
+//  5. 非身份 UPDATE + 更新后身份零漂移复核。
+//
+// 按 hash 直接 FOR UPDATE 抢锁被 schema.VerifyHashArbitration 的前置契约明确禁止
+// （hash 不是允许的物理预定位器）。IP 资产确实不存在时保持原实现的静默 no-op。
 func (s *AssetStore) appendIPJSONArray(ipStr, column string, merge func(string) (string, error)) error {
-	identity := schema.AssetsIPIdentity(ipStr)
-	hash := schema.CanonicalHash(identity)
+	if _, forbidden := assetForbiddenUpdateCols[column]; forbidden {
+		return fmt.Errorf("assets: append target %q is an identity column", column)
+	}
+	branch := newAssetBranch("assets_ip", schema.AssetsIPIdentity(ipStr))
 
 	run := func(store *AssetStore) (int64, error) {
-		var pk int64
-		err := store.tx.QueryRow("SELECT id FROM assets WHERE hash_ip = ? FOR UPDATE", hash[:]).Scan(&pk)
-		if errors.Is(err, sql.ErrNoRows) {
+		candidate, err := store.assetCandidatePK(branch)
+		if err != nil {
+			return 0, err
+		}
+		if candidate == 0 {
 			return 0, nil // IP 资产不存在：与原实现一致，静默 no-op
 		}
+
+		// 1) 物理 PK 预锁（与 Path A 同一条语句、同一个锁序）。
+		var locked int64
+		err = store.tx.QueryRow("SELECT id FROM assets WHERE id = ? FOR UPDATE", candidate).Scan(&locked)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("%w: append %s candidate %d vanished before lock", errAssetWriteRetry, column, candidate)
+		}
 		if err != nil {
 			return 0, err
 		}
-		if _, err := schema.VerifyHashArbitration(context.Background(), store.tx, "assets", "id",
-			"identity_ip", "hash_ip", hash, identity); err != nil {
-			return 0, fmt.Errorf("assets: append %s arbitration: %w", column, err)
+		if locked != candidate {
+			return 0, fmt.Errorf("%w: append %s pk lock returned %d, want %d", errAssetWriteRetry, column, locked, candidate)
 		}
-		var current string
-		if err := store.tx.QueryRow("SELECT "+column+" FROM assets WHERE id = ?", pk).Scan(&current); err != nil {
-			return 0, fmt.Errorf("assets: read %s on %d: %w", column, pk, err)
+
+		// 2) 写前仲裁：持锁保护下核验 identity 逐字节相等且 PK 与候选一致。
+		verified, err := schema.VerifyHashArbitration(context.Background(), store.tx, "assets", "id",
+			branch.identCol, branch.hashCol, branch.hash, branch.identity)
+		if err != nil {
+			return 0, fmt.Errorf("assets: append %s write-ahead arbitration: %w", column, err)
 		}
-		merged, err := merge(current)
+		if uint64(candidate) != verified {
+			return 0, fmt.Errorf("%w: append %s arbitration pk %d != candidate %d",
+				errAssetWriteRetry, column, verified, candidate)
+		}
+
+		// 3) 当前读回读 + 内存合并 + 非身份更新 + 身份零漂移复核。
+		snapshot, err := store.assetReadCols(candidate, []string{column})
 		if err != nil {
 			return 0, err
 		}
-		if _, err := store.tx.Exec("UPDATE assets SET "+column+" = ?, last_seen = NOW(3) WHERE id = ?", merged, pk); err != nil {
-			return 0, fmt.Errorf("assets: write %s on %d: %w", column, pk, err)
+		merged, err := merge(snapshot.str(column))
+		if err != nil {
+			return 0, err
 		}
-		return pk, nil
+		set := []assetCol{{column, merged}, {"last_seen", assetRawExpr("NOW(3)")}}
+		if err := store.assetUpdate(candidate, set); err != nil {
+			return 0, fmt.Errorf("assets: write %s on %d: %w", column, candidate, err)
+		}
+		if err := store.assetVerifyIdentity(context.Background(), branch, candidate); err != nil {
+			return 0, err
+		}
+		return candidate, nil
 	}
 
 	if s.tx != nil {
+		// 同一事务：任何错误（含碰撞 / 1062 / 锁冲突）都必须原样上抛，由最外层
+		// 事务运行器统一回滚或重放，绝不能在子写入里就地吞掉（R1）。
 		_, err := run(s)
 		return err
 	}
@@ -1338,11 +1451,15 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		return 0, err
 	}
 
-	// side effect 1: ensure root domain exists
-	_, _ = s.UpsertRootDomain(UpsertRootDomainReq{
+	// side effect 1: ensure root domain exists.
+	// **必须传播错误（R1）**：这是同一事务内的子写入，它复用 s.tx，自己无法回滚；
+	// 吞掉 ErrIdentityHashCollision / 1062 会让外层带着半完成的写入直接 Commit。
+	if _, err := s.UpsertRootDomain(UpsertRootDomainReq{
 		Domain: rootDomain,
 		TaskID: req.TaskID,
-	})
+	}); err != nil {
+		return 0, fmt.Errorf("assets: subdomain side effect root_domain %q: %w", rootDomain, err)
+	}
 
 	// side effect 2: if A/AAAA record, upsert each IP + bind domain.
 	// RecordValue is []string; each element may itself be comma-separated (legacy).
@@ -1361,18 +1478,24 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 				if ipStr == "" {
 					ipStr = canonical
 				}
-				_, _ = s.UpsertIP(UpsertIPReq{
+				if _, err := s.UpsertIP(UpsertIPReq{
 					IP:           canonical,
 					BoundDomains: []string{domain},
 					TaskID:       req.TaskID,
-				})
+				}); err != nil {
+					return 0, fmt.Errorf("assets: subdomain side effect ip %q: %w", canonical, err)
+				}
 			}
 		}
 	}
 
 	cseg := calcCSegment(ipStr)
 	if companyID == nil && ipStr != "" {
-		companyID, _ = s.resolveCompanyWithICP("", ipStr, "")
+		resolved, err := s.resolveCompanyWithICP("", ipStr, "")
+		if err != nil {
+			return 0, err
+		}
+		companyID = resolved
 	}
 
 	var icpVal, csegVal, ipVal any
@@ -1411,8 +1534,12 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		}, assetCompanyCols(companyID, false)...),
 		mergeCols: []string{"task_ids", "record_value", "ip", "c_segment", "icp", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
 			set := []assetCol{
-				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"task_ids", taskIDs},
 				{"record_value", assetUnionStrings(old.str("record_value"), req.RecordValue)},
 			}
 			if ipVal != nil && old.str("ip") == "" {
@@ -1503,8 +1630,12 @@ func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 		}, assetCompanyCols(companyID, explicit)...),
 		mergeCols: []string{"task_ids", "category", "app_description", "app_icp", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
 			set := []assetCol{
-				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"task_ids", taskIDs},
 			}
 			if catVal != nil && old.str("category") == "" {
 				set = append(set, assetCol{"category", catVal})
@@ -1621,8 +1752,12 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 		mergeCols: []string{"task_ids", "technologies", "auth", "status_code", "content_length",
 			"page_title", "favicon_mmh3", "ip", "c_segment", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
 			set := []assetCol{
-				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"task_ids", taskIDs},
 				{"technologies", assetUnionStrings(old.str("technologies"), req.Technologies)},
 			}
 			mergedAuth, err := assetMergeObjects(old.str("auth"), req.Auth, assetJSONText, nil)
@@ -1656,8 +1791,12 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 		return 0, err
 	}
 
-	// side effects: register root_domain + subdomain as their own assets too
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	// side effects: register root_domain + subdomain as their own assets too.
+	// 主写入已完成也不代表可以吞错（R1）：子写入失败时整笔事务必须回滚，
+	// 上面那条 service_http INSERT 一起作废，绝不允许"半提交"。
+	if err := s.linkHostAssets(domain, rootDomain, req.TaskID); err != nil {
+		return 0, err
+	}
 	if canonicalIPStr != "" {
 		var boundDomains []string
 		if domain != "" {
@@ -1667,12 +1806,14 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 		if port > 0 {
 			openPorts = []PortService{{Port: port, Service: serviceName}}
 		}
-		_, _ = s.UpsertIP(UpsertIPReq{
+		if _, err := s.UpsertIP(UpsertIPReq{
 			IP:           canonicalIPStr,
 			BoundDomains: boundDomains,
 			OpenPorts:    openPorts,
 			TaskID:       req.TaskID,
-		})
+		}); err != nil {
+			return 0, fmt.Errorf("assets: http service side effect ip %q: %w", canonicalIPStr, err)
+		}
 	}
 	return id, nil
 }
@@ -1779,8 +1920,12 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 		}, assetCompanyCols(companyID, false)...),
 		mergeCols: []string{"task_ids", "auth", "c_segment", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
 			set := []assetCol{
-				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"task_ids", taskIDs},
 			}
 			mergedAuth, err := assetMergeObjects(old.str("auth"), req.Auth, assetJSONText, nil)
 			if err != nil {
@@ -1799,33 +1944,45 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 		return 0, err
 	}
 
-	// side effects
+	// side effects（同事务子写入：错误必须上抛，见 R1）
 	if canonicalIPStr != "" && req.Port > 0 {
 		var boundDomains []string
 		if domain != "" {
 			boundDomains = []string{domain}
 		}
-		_, _ = s.UpsertIP(UpsertIPReq{
+		if _, err := s.UpsertIP(UpsertIPReq{
 			IP:           canonicalIPStr,
 			BoundDomains: boundDomains,
 			OpenPorts:    []PortService{{Port: req.Port, Service: serviceName}},
 			TaskID:       req.TaskID,
-		})
+		}); err != nil {
+			return 0, fmt.Errorf("assets: service_other side effect ip %q: %w", canonicalIPStr, err)
+		}
 	}
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	if err := s.linkHostAssets(domain, rootDomain, req.TaskID); err != nil {
+		return 0, err
+	}
 	return id, nil
 }
 
 // linkHostAssets ensures a service/endpoint's host is also registered as its own
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
-// asset — so those asset types stay populated and can anchor task scope. Best-effort.
-func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
+// asset — so those asset types stay populated and can anchor task scope.
+//
+// 它**不是 best-effort**（R1）：这两个 upsert 与调用方共用同一事务，任何碰撞 / 1062 /
+// 锁冲突都必须原样返回给最外层事务边界，由它统一回滚或在新事务里重放。
+func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) error {
 	if rootDomain != "" {
-		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
+		if _, err := s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID}); err != nil {
+			return fmt.Errorf("assets: link root_domain %q: %w", rootDomain, err)
+		}
 	}
 	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {
-		_, _ = s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID})
+		if _, err := s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID}); err != nil {
+			return fmt.Errorf("assets: link subdomain %q: %w", domain, err)
+		}
 	}
+	return nil
 }
 
 // =====================================================================
@@ -1916,8 +2073,12 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 		}, assetCompanyCols(companyID, false)...),
 		mergeCols: []string{"task_ids", "params", "ip", "c_segment", "company_id", "company_source"},
 		merge: func(old *assetSnapshot) ([]assetCol, error) {
+			taskIDs, err := assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))
+			if err != nil {
+				return nil, err
+			}
 			set := []assetCol{
-				{"task_ids", assetUnionTaskIDs(old.str("task_ids"), assetTaskIDsOf(req.TaskID))},
+				{"task_ids", taskIDs},
 			}
 			mergedParams, err := assetMergeObjects(old.str("params"), req.Params, assetParamKey, func(cur, next map[string]any) bool {
 				// 同 (location, name)：元素 JSON 文本 DESC 优先（spec §3.3.1 params 去重）。
@@ -1942,9 +2103,14 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	}
 	// side effects: endpoint previously registered none — register its host as
 	// root_domain + subdomain(+IP) so those asset types get populated too.
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	// 同事务子写入：错误一律上抛（R1）。
+	if err := s.linkHostAssets(domain, rootDomain, req.TaskID); err != nil {
+		return 0, err
+	}
 	if canonicalIPStr != "" {
-		_, _ = s.UpsertIP(UpsertIPReq{IP: canonicalIPStr, TaskID: req.TaskID})
+		if _, err := s.UpsertIP(UpsertIPReq{IP: canonicalIPStr, TaskID: req.TaskID}); err != nil {
+			return 0, fmt.Errorf("assets: endpoint side effect ip %q: %w", canonicalIPStr, err)
+		}
 	}
 	return id, nil
 }
@@ -2125,8 +2291,14 @@ func (s *AssetStore) deleteByTaskIDTx(tx *sql.Tx, taskID int64) (int64, error) {
 			rows.Close()
 			return 0, err
 		}
+		persisted, perr := parseTaskIDArray(raw)
+		if perr != nil {
+			// 归属列损坏时**绝不**按"空归属"处理：那会把整行判成 taskID 独占并删除。
+			rows.Close()
+			return 0, perr
+		}
 		kept := make([]int64, 0, 4)
-		for _, ownedID := range decodeInt64Array(raw) {
+		for _, ownedID := range persisted {
 			if ownedID != taskID {
 				kept = append(kept, ownedID)
 			}
