@@ -483,15 +483,28 @@ func expDropSideQuestionSessions(ex expQueryExecer, intentID int64) error {
 }
 
 // expDropNodes 删除一批节点，并把它名下的关联行与弱引用一次收尾。
-//
-// 旧库靠外键收尾（exploration_edges / exploration_anchors 是 ON DELETE CASCADE，
-// activity.node_id 与 findings.node_id 是 ON DELETE SET NULL）；新库**没有外键**，
-// 这些动作不写就永久残留成孤儿。顺序固定为「先清关联、后置空、最后删节点」：反过来
-// 先删节点，边就会指向已经不存在的 id，播报板与血缘渲染都会拿到断链。
-// 返回真正被删掉的节点行数，调用方据此复核并发漂移。
+// 0) 前置锁定待删除全部节点（FOR UPDATE）：杜绝并发写者（如 AddDigest）在清边后、
+//    删节点前向本节点建立新的 covers 边留下悬挂引用（闭环 I1）；
+// 1) 边：两端任一在删除集内即断开（含 covers 这类非产出边）；
+// 2) 锚点：node_id 是锚点的归属键，节点没了锚点就没有意义；
+// 3) 弱引用置空：活动、漏洞、资产绑定均改设为 NULL；
+// 4) 节点：逐行删并核对行数。
 func expDropNodes(ex expExecer, expID int64, ids []int64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
+	}
+
+	// 0) 前置锁：若支持 Query（如在事务内），按升序显式锁定全部待删除节点行，
+	//    确保与并发写者（AddDigest 等）形成全局写锁互斥。
+	if qe, ok := ex.(expQueryExecer); ok {
+		sortedIDs := make([]int64, len(ids))
+		copy(sortedIDs, ids)
+		sort.Slice(sortedIDs, func(i, j int) bool { return sortedIDs[i] < sortedIDs[j] })
+		lockArgs := []any{expID}
+		lockList := expInPlaceholders(sortedIDs, &lockArgs)
+		if _, err := expCollect[int64](qe, `SELECT id FROM exploration_nodes WHERE exploration_id = ? AND id IN (`+lockList+`) FOR UPDATE`, lockArgs...); err != nil {
+			return 0, err
+		}
 	}
 
 	// 1) 边：两端任一再删除集内即断开（含 covers 这类非产出边）。
