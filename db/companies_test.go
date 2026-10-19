@@ -331,61 +331,80 @@ func TestCompanyScope_AllBranches_ExplicitNullUnactivated(t *testing.T) {
 		{ParsedScope{Kind: "keyword", Value: "Corp", Raw: "Corp"}, "value"},
 	}
 	for _, tc := range rules {
-		branch, args, err := computeScopeInsertArgs(100, tc.rule, "test")
-		if err != nil {
-			t.Fatalf("computeScopeInsertArgs(%s): %v", tc.rule.Kind, err)
-		}
-		if len(args) != 13 {
-			t.Fatalf("expected 13 insert args, got %d", len(args))
-		}
-		// args 布局：
-		// 0: company_id
-		// 1: kind
-		// 2: domain (*string)
-		// 3: net (*string)
-		// 4: value (*string)
-		// 5: raw
-		// 6: reason
-		// 7: identity_scope_domain ([]byte)
-		// 8: hash_scope_domain ([]byte)
-		// 9: identity_scope_net ([]byte)
-		// 10: hash_scope_net ([]byte)
-		// 11: identity_scope_value ([]byte)
-		// 12: hash_scope_value ([]byte)
+		t.Run(tc.rule.Kind, func(t *testing.T) {
+			branch, args, err := computeScopeInsertArgs(100, tc.rule, "test_reason")
+			if err != nil {
+				t.Fatalf("computeScopeInsertArgs(%s): %v", tc.rule.Kind, err)
+			}
+			if len(args) != 13 {
+				t.Fatalf("expected 13 insert args, got %d", len(args))
+			}
 
-		valDomain := args[2].(*string)
-		valNet := args[3].(*string)
-		valVal := args[4].(*string)
-		identDomain, _ := args[7].([]byte)
-		hashDomain, _ := args[8].([]byte)
-		identNet, _ := args[9].([]byte)
-		hashNet, _ := args[10].([]byte)
-		identVal, _ := args[11].([]byte)
-		hashVal, _ := args[12].([]byte)
+			// 0, 1, 5, 6: 基本字段断言
+			if args[0] != int64(100) || args[1] != tc.rule.Kind || args[5] != tc.rule.Raw || args[6] != "test_reason" {
+				t.Fatalf("base fields mismatch: cid=%v kind=%v raw=%v reason=%v", args[0], args[1], args[5], args[6])
+			}
 
-		switch tc.valueCol {
-		case "domain":
-			if valDomain == nil || *valDomain != branch.Value || len(identDomain) == 0 || len(hashDomain) != 32 {
-				t.Fatalf("domain branch must be active: val=%v ident=%v hash=%v", valDomain, identDomain, hashDomain)
+			// 2, 3, 4: 载荷列
+			valDomain, okD := args[2].(*string)
+			valNet, okN := args[3].(*string)
+			valVal, okV := args[4].(*string)
+
+			// 7..12: identity/hash 列。必须严格检查类型断言，若参数为非 nil 的非 []byte 类型必须直接判错
+			checkBytesArg := func(idx int, name string) []byte {
+				if args[idx] == nil {
+					return nil
+				}
+				b, ok := args[idx].([]byte)
+				if !ok {
+					t.Fatalf("arg[%d] (%s) is not []byte: %T (%v)", idx, name, args[idx], args[idx])
+				}
+				return b
 			}
-			if valNet != nil || valVal != nil || identNet != nil || hashNet != nil || identVal != nil || hashVal != nil {
-				t.Fatalf("domain branch must have net and value columns set to nil: net=%v val=%v identNet=%v identVal=%v", valNet, valVal, identNet, identVal)
+
+			identDomain := checkBytesArg(7, "identity_scope_domain")
+			hashDomain := checkBytesArg(8, "hash_scope_domain")
+			identNet := checkBytesArg(9, "identity_scope_net")
+			hashNet := checkBytesArg(10, "hash_scope_net")
+			identVal := checkBytesArg(11, "identity_scope_value")
+			hashVal := checkBytesArg(12, "hash_scope_value")
+
+			switch tc.valueCol {
+			case "domain":
+				if !okD || valDomain == nil || *valDomain != branch.Value {
+					t.Fatalf("domain payload inactive or mismatch: %v", valDomain)
+				}
+				if !bytes.Equal(identDomain, branch.Identity) || !bytes.Equal(hashDomain, branch.Hash) {
+					t.Fatalf("domain identity/hash bytes mismatch: ident=%x hash=%x", identDomain, hashDomain)
+				}
+				// 其余列严格为 nil
+				if valNet != nil || valVal != nil || identNet != nil || hashNet != nil || identVal != nil || hashVal != nil {
+					t.Fatalf("unactivated net/val columns must be strictly nil: net=%v val=%v identNet=%v identVal=%v", valNet, valVal, identNet, identVal)
+				}
+			case "net":
+				if !okN || valNet == nil || *valNet != branch.Value {
+					t.Fatalf("net payload inactive or mismatch: %v", valNet)
+				}
+				if !bytes.Equal(identNet, branch.Identity) || !bytes.Equal(hashNet, branch.Hash) {
+					t.Fatalf("net identity/hash bytes mismatch: ident=%x hash=%x", identNet, hashNet)
+				}
+				// 其余列严格为 nil
+				if valDomain != nil || valVal != nil || identDomain != nil || hashDomain != nil || identVal != nil || hashVal != nil {
+					t.Fatalf("unactivated domain/val columns must be strictly nil: domain=%v val=%v identDomain=%v identVal=%v", valDomain, valVal, identDomain, identVal)
+				}
+			case "value":
+				if !okV || valVal == nil || *valVal != branch.Value {
+					t.Fatalf("value payload inactive or mismatch: %v", valVal)
+				}
+				if !bytes.Equal(identVal, branch.Identity) || !bytes.Equal(hashVal, branch.Hash) {
+					t.Fatalf("value identity/hash bytes mismatch: ident=%x hash=%x", identVal, hashVal)
+				}
+				// 其余列严格为 nil
+				if valDomain != nil || valNet != nil || identDomain != nil || hashDomain != nil || identNet != nil || hashNet != nil {
+					t.Fatalf("unactivated domain/net columns must be strictly nil: domain=%v net=%v identDomain=%v identNet=%v", valDomain, valNet, identDomain, identNet)
+				}
 			}
-		case "net":
-			if valNet == nil || *valNet != branch.Value || len(identNet) == 0 || len(hashNet) != 32 {
-				t.Fatalf("net branch must be active for %s: val=%v ident=%v hash=%v", tc.rule.Kind, valNet, identNet, hashNet)
-			}
-			if valDomain != nil || valVal != nil || identDomain != nil || hashDomain != nil || identVal != nil || hashVal != nil {
-				t.Fatalf("net branch must have domain and value columns set to nil: domain=%v val=%v identDomain=%v identVal=%v", valDomain, valVal, identDomain, identVal)
-			}
-		case "value":
-			if valVal == nil || *valVal != branch.Value || len(identVal) == 0 || len(hashVal) != 32 {
-				t.Fatalf("value branch must be active for %s: val=%v ident=%v hash=%v", tc.rule.Kind, valVal, identVal, hashVal)
-			}
-			if valDomain != nil || valNet != nil || identDomain != nil || hashDomain != nil || identNet != nil || hashNet != nil {
-				t.Fatalf("value branch must have domain and net columns set to nil: domain=%v net=%v identDomain=%v identNet=%v", valDomain, valNet, identDomain, identNet)
-			}
-		}
+		})
 	}
 }
 
