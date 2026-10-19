@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -97,13 +98,22 @@ func TestConfigStores(t *testing.T) {
 
 	// 记录原有的 active profile（如果存在），以便测试结束时恢复
 	var origActiveID *int64
-	if act, err := d.ActiveProfile(); err == nil && act != nil {
+	act, err := d.ActiveProfile()
+	if err != nil && err != sql.ErrNoRows {
+		t.Fatalf("query initial active profile failed: %v", err)
+	} else if err == nil && act != nil {
 		id := act.ID
 		origActiveID = &id
 	}
 	t.Cleanup(func() {
 		if origActiveID != nil {
-			_ = d.SetActiveProfile(*origActiveID)
+			if err := d.SetActiveProfile(*origActiveID); err != nil {
+				t.Errorf("restore original active profile %d failed: %v", *origActiveID, err)
+			}
+			curAct, err := d.ActiveProfile()
+			if err != nil || curAct == nil || curAct.ID != *origActiveID {
+				t.Errorf("verify restored active profile failed: got (%+v, %v), want ID=%d", curAct, err, *origActiveID)
+			}
 		}
 	})
 
@@ -130,7 +140,7 @@ func TestConfigStores(t *testing.T) {
 	if err := d.DeleteProfile(pid); !errors.Is(err, ErrActiveLLMProfileDelete) {
 		t.Fatalf("deleting active profile error=%v, want %v", err, ErrActiveLLMProfileDelete)
 	}
-	act, err := d.ActiveProfile()
+	act, err = d.ActiveProfile()
 	if err != nil || act == nil || act.APIKey != "secret123" {
 		t.Fatalf("active profile/key: %+v err=%v", act, err)
 	}
@@ -148,9 +158,9 @@ func TestConfigStores(t *testing.T) {
 		}
 	}
 
-	// agents seeded; prompt versioning (使用独立的测试 agent，绝不污染内置 planner 状态，彻底闭环 F7)
+	// agents seeded; prompt versioning (使用独立的测试 agent，builtin=false，彻底闭环 F7)
 	testAgentKey := fmt.Sprintf("t-ag-%d", time.Now().UnixNano())
-	_, err = d.seedAgent(builtinAgent{key: testAgentKey, name: "Test Planner", role: "planner"})
+	ag, err := d.CreateAgent(testAgentKey, "Test Planner", "custom test planner")
 	if err != nil {
 		t.Fatalf("create test agent failed: %v", err)
 	}
@@ -165,12 +175,16 @@ func TestConfigStores(t *testing.T) {
 		if count != 0 {
 			t.Errorf("residual test agent %s found after cleanup", testAgentKey)
 		}
+		// 校验其 prompt 子表也完全清除
+		var pCount int
+		if err := d.QueryRow("SELECT count(*) FROM agent_prompts WHERE agent_id = ?", ag.ID).Scan(&pCount); err != nil {
+			t.Errorf("query residual agent_prompts failed: %v", err)
+		}
+		if pCount != 0 {
+			t.Errorf("residual agent_prompts for %s found after cleanup", testAgentKey)
+		}
 	})
 
-	ag, err := d.GetAgentByKey(testAgentKey)
-	if err != nil || ag == nil {
-		t.Fatalf("get test agent: %v", err)
-	}
 	v1, err := d.SavePrompt(ag.ID, "你是规划者 {{.Goal}}", "init", "test")
 	if err != nil {
 		t.Fatal(err)
@@ -210,9 +224,13 @@ func TestConfigStores(t *testing.T) {
 
 	tSkillName := fmt.Sprintf("t-skill-%d", time.Now().UnixNano())
 	t.Cleanup(func() {
-		_ = d.DeleteSkillVisibility(tSkillName)
+		if err := d.DeleteSkillVisibility(tSkillName); err != nil {
+			t.Errorf("cleanup skill visibility %s failed: %v", tSkillName, err)
+		}
 		var sCount int
-		_ = d.QueryRow("SELECT count(*) FROM agent_skill_visibility WHERE skill_name = ?", tSkillName).Scan(&sCount)
+		if err := d.QueryRow("SELECT count(*) FROM agent_skill_visibility WHERE skill_name = ?", tSkillName).Scan(&sCount); err != nil {
+			t.Errorf("query residual skill visibility failed: %v", err)
+		}
 		if sCount != 0 {
 			t.Errorf("residual skill visibility %s found after cleanup", tSkillName)
 		}
