@@ -113,9 +113,14 @@ func toolAgentLiteral(agentKey string) ([]byte, bool) {
 
 // toolAgentStrValue 从 json.RawMessage 元素解码为真实 string 值（按 JSON 字符串规范解码，
 // 完美支持 Unicode 转义如 "\u0077orker" 等，杜绝文本比较假阴性，闭环 I3）。
+// 严格区分 JSON null 与空字符串：若为 null 则直接返回 ("", false)（闭环 Minor N1）。
 func toolAgentStrValue(item json.RawMessage) (string, bool) {
 	trimmed := bytes.TrimSpace(item)
-	if len(trimmed) == 0 {
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", false
+	}
+	// 仅当首字符和末字符为双引号时才为合法的 JSON 字符串表示
+	if len(trimmed) < 2 || trimmed[0] != '"' || trimmed[len(trimmed)-1] != '"' {
 		return "", false
 	}
 	var s string

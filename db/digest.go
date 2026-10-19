@@ -13,8 +13,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/Autumn-27/artex/db/lockorder"
 )
@@ -154,10 +156,51 @@ func (s *ExplorationStore) AddDigest(payload map[string]any, memberIDs []int64) 
 	raw, _ := json.Marshal(payload)
 	var id int64
 	err := s.db.taskTxRunner().Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true}, func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
-		// 核验所属 exploration 仍真实存活，杜绝向正在被删除的任务/探索写入孤儿节点和边
+		// 1. 若探索关联了任务，按全局锁序（tasks=1 -> explorations=6）核验父任务存活且未被软删除（闭环 I1 残留 1）
+		var taskDeletedAt sql.NullTime
+		err := tx.QueryRowContext(ctx, "SELECT deleted_at FROM tasks WHERE exploration_id = ? FOR UPDATE", s.expID).Scan(&taskDeletedAt)
+		if err == nil {
+			if taskDeletedAt.Valid {
+				return fmt.Errorf("add digest: parent task for exploration %d is deleted", s.expID)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		// 2. 核验所属 exploration 仍真实存活，杜绝向正在被删除的任务/探索写入孤儿节点和边
 		var expExists int
 		if err := tx.QueryRowContext(ctx, "SELECT 1 FROM explorations WHERE id = ? FOR UPDATE", s.expID).Scan(&expExists); err != nil {
 			return fmt.Errorf("add digest: exploration %d not found or deleting: %w", s.expID, err)
+		}
+
+		// 3. 过滤并锁定真实属于本 exploration 且当前存活的 memberIDs（闭环 I1 残留 2，杜绝悬空 covers）
+		var validMemberIDs []int64
+		if len(memberIDs) > 0 {
+			sort.Slice(memberIDs, func(i, j int) bool { return memberIDs[i] < memberIDs[j] })
+			ph := make([]string, len(memberIDs))
+			args := make([]any, 0, len(memberIDs)+1)
+			args = append(args, s.expID)
+			for i, m := range memberIDs {
+				ph[i] = "?"
+				args = append(args, m)
+			}
+			rows, err := tx.QueryContext(ctx, fmt.Sprintf(
+				"SELECT id FROM exploration_nodes WHERE exploration_id = ? AND id IN (%s) FOR UPDATE",
+				strings.Join(ph, ",")), args...)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var mid int64
+				if err := rows.Scan(&mid); err != nil {
+					return err
+				}
+				validMemberIDs = append(validMemberIDs, mid)
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 		}
 
 		res, err := tx.ExecContext(ctx, `
@@ -172,7 +215,7 @@ VALUES (?, ?, ?, 0, ?, 'compactor')`,
 			return err
 		}
 		id = insertedID
-		for _, m := range memberIDs {
+		for _, m := range validMemberIDs {
 			if m == id {
 				continue
 			}
