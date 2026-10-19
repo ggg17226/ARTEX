@@ -4,7 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
+	"time"
+
+	"github.com/Autumn-27/artex/db/schema"
 )
 
 // TestPoolProfilesOrder pins the failover chain query: keyless profiles can't
@@ -15,7 +20,7 @@ import (
 func TestPoolProfilesOrder(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		t.Fatalf("open TiDB failed: %v", err)
 	}
 	defer d.Close()
 
@@ -27,7 +32,7 @@ func TestPoolProfilesOrder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+		t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=?`, id) })
 		return id
 	}
 	lo := mk("t-pool-lo", 1, false, "k1")
@@ -67,7 +72,7 @@ func TestDeleteProfileContextHonorsCancellation(t *testing.T) {
 func TestConfigStores(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		t.Fatalf("open TiDB failed: %v", err)
 	}
 	defer d.Close()
 
@@ -76,7 +81,7 @@ func TestConfigStores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, pid)
+	defer d.Exec(`DELETE FROM llm_profiles WHERE id=?`, pid)
 	if err := d.SetActiveProfile(pid); err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +132,8 @@ func TestConfigStores(t *testing.T) {
 	if len(pv) < 2 {
 		t.Fatalf("planner catalog want >=2 vars, got %d", len(pv))
 	}
-	d.Exec(`DELETE FROM agent_prompts WHERE agent_id=$1`, ag.ID)
-	d.Exec(`UPDATE agents SET current_prompt_id=NULL WHERE id=$1`, ag.ID)
+	d.Exec(`DELETE FROM agent_prompts WHERE agent_id=?`, ag.ID)
+	d.Exec(`UPDATE agents SET current_prompt_id=NULL WHERE id=?`, ag.ID)
 
 	// mcp + skill + visibility (bidirectional via one join)
 	// Clean up any leftover MCP from prior runs to keep this test idempotent.
@@ -141,7 +146,7 @@ func TestConfigStores(t *testing.T) {
 	// filesystem-based, so their visibility is keyed by skill (directory) name in a
 	// dedicated table. Clear any pre-existing MCP visibility rows so the assertions
 	// below isolate on exactly what this test sets.
-	d.Exec(`DELETE FROM agent_visibility WHERE agent_id = $1 AND resource_kind = 'mcp'`, ag.ID)
+	d.Exec(`DELETE FROM agent_visibility WHERE agent_id = ? AND resource_kind = 'mcp'`, ag.ID)
 	if err := d.ToggleVisibility(ag.ID, "mcp", mid, true); err != nil {
 		t.Fatal(err)
 	}
@@ -193,4 +198,70 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestSettings_GetSetting_TiDBRequirement 是 Task 1.4 Step 1 的设置项原生持久化用例：
+// 写入必须同时补齐 key_identity/key_hash（新库唯一键落在 key_hash 上），读取走
+// 反引号保护的 `key` 谓词，upsert 用 TiDB 原生 ON DUPLICATE KEY UPDATE。
+// 未配置 ARTEX_TIDB_DSN 时显式声明跳过；配置后必须真实连库并 PASS。
+func TestSettings_GetSetting_TiDBRequirement(t *testing.T) {
+	dsn := os.Getenv("ARTEX_TIDB_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_TIDB_DSN not set, skipping integration test")
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close DB failed: %v", err)
+		}
+	})
+
+	testKey := fmt.Sprintf("p08_setting_%d", time.Now().UnixNano())
+	testVal := "p08_val"
+	if err := d.SetSetting(testKey, testVal); err != nil {
+		t.Fatalf("SetSetting failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := d.Exec("DELETE FROM settings WHERE `key` = ?", testKey); err != nil {
+			t.Errorf("cleanup setting failed: %v", err)
+		}
+	})
+
+	val, ok, err := d.GetSetting(testKey)
+	if err != nil || !ok || val != testVal {
+		t.Fatalf("GetSetting failed: got (%q, %v, %v), want (%q, true, nil)", val, ok, err, testVal)
+	}
+
+	// 覆盖写必须走 ON DUPLICATE KEY UPDATE：同 key 再写一次只改值，不新增行。
+	if err := d.SetSetting(testKey, "p08_val2"); err != nil {
+		t.Fatalf("SetSetting overwrite failed: %v", err)
+	}
+	var rows int
+	if err := d.QueryRow("SELECT COUNT(*) FROM settings WHERE `key` = ?", testKey).Scan(&rows); err != nil {
+		t.Fatalf("count settings failed: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("upsert produced %d rows, want 1", rows)
+	}
+	val, ok, err = d.GetSetting(testKey)
+	if err != nil || !ok || val != "p08_val2" {
+		t.Fatalf("GetSetting after upsert failed: got (%q, %v, %v), want (%q, true, nil)", val, ok, err, "p08_val2")
+	}
+
+	// 身份列必须落库：key_hash 是这条记录唯一的自然键载体。
+	var identity, hash []byte
+	if err := d.QueryRow("SELECT key_identity, key_hash FROM settings WHERE `key` = ?", testKey).Scan(&identity, &hash); err != nil {
+		t.Fatalf("read identity columns failed: %v", err)
+	}
+	wantIdentity := schema.SettingsKeyIdentity(testKey)
+	wantHash := schema.CanonicalHash(wantIdentity)
+	if string(identity) != string(wantIdentity) {
+		t.Fatalf("key_identity = %x, want %x", identity, wantIdentity)
+	}
+	if len(hash) != 32 || string(hash) != string(wantHash[:]) {
+		t.Fatalf("key_hash = %x, want %x", hash, wantHash)
+	}
 }

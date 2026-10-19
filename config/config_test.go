@@ -343,16 +343,6 @@ func TestLoad_ExplicitConfigBroken(t *testing.T) {
 	}
 }
 
-// 兼容层：PostgreSQL 连接串已彻底废除，旧入口只返回错误，绝不静默连错库。
-func TestPostgresDSN_Abolished(t *testing.T) {
-	isolateEnv(t)
-	t.Setenv("ARTEX_CONFIG", "/dev/null")
-	_, _, err := PostgresDSN()
-	if err == nil {
-		t.Fatalf("PostgresDSN must always fail after the TiDB migration")
-	}
-}
-
 func TestSkillDir(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("ARTEX_CONFIG", "/dev/null")

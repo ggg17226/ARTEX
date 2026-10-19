@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 )
@@ -76,39 +75,73 @@ func (d *DB) ListInterceptRules() ([]InterceptRule, error) {
 }
 
 // CreateInterceptRule inserts a new rule.
+//
+// 原生 TiDB 没有 INSERT … RETURNING：自增 id 由 LastInsertId 取得，再按 id 回读整行
+// （created_at/updated_at 由 DDL 默认值生成，回读保证返回体与库内一致）。
 func (d *DB) CreateInterceptRule(name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
-	row := d.QueryRow(`
+	res, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING `+interceptRuleCols,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
-	return scanInterceptRule(row)
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return InterceptRule{}, err
+	}
+	return d.getInterceptRule(id)
 }
 
 // UpdateInterceptRule replaces all editable fields of an existing rule.
 func (d *DB) UpdateInterceptRule(id int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
-	row := d.QueryRow(`
+	if _, err := d.Exec(`
 UPDATE intercept_rules
-   SET name=$2, enabled=$3, priority=$4, match_target=$5,
-       match_type=$6, pattern=$7, action=$8, message=$9,
-       timeout_enabled=$10, timeout_seconds=$11, timeout_action=$12
-WHERE id=$1
-RETURNING `+interceptRuleCols,
-		id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
-	return scanInterceptRule(row)
+   SET name=?, enabled=?, priority=?, match_target=?,
+       match_type=?, pattern=?, action=?, message=?,
+       timeout_enabled=?, timeout_seconds=?, timeout_action=?
+ WHERE id=?`,
+		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction, id); err != nil {
+		return InterceptRule{}, err
+	}
+	return d.getInterceptRule(id)
+}
+
+// getInterceptRule 按主键回读一条规则；行不存在时返回 sql.ErrNoRows，
+// 与旧的 INSERT/UPDATE … RETURNING 行为一致（调用方据此区分"没这条规则"）。
+func (d *DB) getInterceptRule(id int64) (InterceptRule, error) {
+	return scanInterceptRule(d.QueryRow(`SELECT `+interceptRuleCols+` FROM intercept_rules WHERE id=?`, id))
 }
 
 // DeleteInterceptRule removes a rule.
+//
+// 旧库里 intercept_pending.rule_id 通过 ON DELETE SET NULL 与规则脱钩；基线不带
+// 外键，必须显式把待审/已审记录的 rule_id 置空，否则审批行会挂在一条已经不存在的
+// 规则上（decision_source 仍写着 rule，前端会误判规则还在）。
 func (d *DB) DeleteInterceptRule(id int64) error {
-	_, err := d.Exec(`DELETE FROM intercept_rules WHERE id=$1`, id)
-	return err
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE intercept_pending SET rule_id=NULL WHERE rule_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM intercept_rules WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ToggleInterceptRule flips the enabled state of a rule.
 func (d *DB) ToggleInterceptRule(id int64, enabled bool) error {
-	_, err := d.Exec(`UPDATE intercept_rules SET enabled=$2 WHERE id=$1`, id, enabled)
+	_, err := d.Exec(`UPDATE intercept_rules SET enabled=? WHERE id=?`, enabled, id)
 	return err
 }
+
+// interceptPendingInsertCols 是待审记录的两套插入列（是否已定论）。
+// status 在基线里是 MEDIUMTEXT NOT NULL 且没有 DDL 默认值，必须由写入方显式给出。
+const interceptPendingInsertCols = `rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, decision_source, audit`
 
 // CreateInterceptPending inserts a pending approval record and returns its ID.
 // convID == 0 → conversation_id stored as NULL (background task).
@@ -131,17 +164,22 @@ func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, too
 	if ruleID != 0 {
 		ruleIDPtr = &ruleID
 	}
-	var id int64
-	err := d.QueryRow(`
-INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, reason, decision_source, audit)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(ruleID, reason), firstAudit(audits)).Scan(&id)
-	return id, err
+	res, err := d.Exec(`
+INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
+VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?)`,
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(ruleID, reason), firstAudit(audits))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 // DecideInterceptPending updates a pending record's status (allowed/denied/timeout).
+//
+// 审批状态机的单向推进由调用方保证；NOW(3) 走会话时区，DSN 已强制 +00:00，
+// 与 created_at 同一时间基准。
 func (d *DB) DecideInterceptPending(id int64, status string) error {
-	_, err := d.Exec(`UPDATE intercept_pending SET status=$2, decided_at=NOW() WHERE id=$1`, id, status)
+	_, err := d.Exec(`UPDATE intercept_pending SET status=?, decided_at=NOW(3) WHERE id=?`, status, id)
 	return err
 }
 
@@ -167,12 +205,14 @@ func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, too
 	if ruleID != 0 {
 		ruleIDPtr = &ruleID
 	}
-	var id int64
-	err := d.QueryRow(`
-INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, decision_source, audit)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10) RETURNING id`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits)).Scan(&id)
-	return id, err
+	res, err := d.Exec(`
+INSERT INTO intercept_pending(`+interceptPendingInsertCols+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(3), ?, ?)`,
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source`
@@ -204,7 +244,7 @@ func (d *DB) ListPendingIntercepts() ([]InterceptPending, error) {
 func (d *DB) GetInterceptPending(id int64) (*InterceptPending, error) {
 	var p InterceptPending
 	err := scanInterceptPending(
-		d.QueryRow(`SELECT `+interceptPendingCols+` FROM intercept_pending WHERE id=$1`, id),
+		d.QueryRow(`SELECT `+interceptPendingCols+` FROM intercept_pending WHERE id=?`, id),
 		&p,
 	)
 	if err == sql.ErrNoRows {
@@ -272,7 +312,7 @@ func firstAudit(audits []*InterceptAudit) any {
 // ListAllIntercepts returns up to limit intercept_pending rows (newest first)
 // joined with conversation and rule info.
 func (d *DB) ListAllIntercepts(limit int) ([]InterceptApprovalRow, error) {
-	rows, err := d.Query(approvalRowSelect+` ORDER BY ip.created_at DESC LIMIT $1`, limit)
+	rows, err := d.Query(approvalRowSelect+` ORDER BY ip.created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +342,7 @@ func (d *DB) ListAllInterceptsPage(page, size int, filter InterceptApprovalFilte
 
 // ListTaskIntercepts returns all intercept_pending rows for a specific task (newest first).
 func (d *DB) ListTaskIntercepts(taskID string) ([]InterceptApprovalRow, error) {
-	rows, err := d.Query(approvalRowSelect+` WHERE ip.task_id=$1 ORDER BY ip.created_at DESC`, taskID)
+	rows, err := d.Query(approvalRowSelect+` WHERE ip.task_id=? ORDER BY ip.created_at DESC`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -339,8 +379,9 @@ func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptA
 	args := []any{}
 	add := func(column, value string) {
 		if value != "" {
+			// 位置占位符：值按出现顺序追加，无需再算 $n 的下标。
 			args = append(args, value)
-			conditions = append(conditions, column+"=$"+fmt.Sprint(len(args)))
+			conditions = append(conditions, column+"= ?")
 		}
 	}
 	add("ip.task_id", taskID)
@@ -355,11 +396,7 @@ func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptA
 		return nil, 0, err
 	}
 
-	limitArg := len(args) + 1
-	offsetArg := limitArg + 1
-	dataQ := approvalRowSelect + where +
-		" ORDER BY ip.created_at DESC, ip.id DESC LIMIT $" + fmt.Sprint(limitArg) +
-		" OFFSET $" + fmt.Sprint(offsetArg)
+	dataQ := approvalRowSelect + where + " ORDER BY ip.created_at DESC, ip.id DESC LIMIT ? OFFSET ?"
 	args = append(args, size, offset)
 	rows, err := d.Query(dataQ, args...)
 	if err != nil {

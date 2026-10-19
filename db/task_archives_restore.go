@@ -37,7 +37,7 @@ func (d *DB) CompleteTaskArchive(
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := coordinateWithSchemaMigration(tx); err != nil {
+	if err := d.coordinateWithSchemaMigration(tx); err != nil {
 		return err
 	}
 	var taskID, expID int64
@@ -181,7 +181,7 @@ func (d *DB) restoreTaskArchive(
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := coordinateWithSchemaMigration(tx); err != nil {
+	if err := d.coordinateWithSchemaMigration(tx); err != nil {
 		return nil, err
 	}
 	var taskID, expID int64
@@ -740,7 +740,7 @@ func (d *DB) DeleteTaskArchiveStub(archiveID int64) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := coordinateWithSchemaMigration(tx); err != nil {
+	if err := d.coordinateWithSchemaMigration(tx); err != nil {
 		return err
 	}
 	var taskID, expID int64

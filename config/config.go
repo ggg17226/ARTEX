@@ -524,23 +524,3 @@ func SkillDir() string {
 	_ = os.MkdirAll(d, 0o755)
 	return d
 }
-
-// Redact 返回脱敏后的连接串（密码替换为 ****），供启动日志使用。
-// 解析失败时返回安全占位符而不是原串。
-//
-// Deprecated: 请直接使用 db/tidb.RedactDSN；此别名仅为 P08 迁移期间的旧调用方
-// （db/db.go，Task 1.4 收尾）保留。
-func Redact(dsn string) string {
-	return tidb.RedactDSN(dsn)
-}
-
-// PostgresDSN 已随 PostgreSQL 依赖一并废除：它永远返回错误，绝不返回连接串，
-// 从而杜绝“静默连错库”。
-//
-// Deprecated: 请改用 TiDBDSN。本符号仅为 P08 Task 1.4 改造 db/db.go 之前的
-// 调用方保留编译兼容。
-func PostgresDSN() (dsn, source string, err error) {
-	return "", "", fmt.Errorf(
-		"PostgreSQL 连接配置已彻底废除（ARTEX 已迁移至 TiDB）：请改用 %s 或 config.yaml 的 database 段（TiDB go-sql-driver 语法）",
-		EnvTiDBDSN)
-}

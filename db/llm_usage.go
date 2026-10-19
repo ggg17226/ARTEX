@@ -54,7 +54,7 @@ func (d *DB) EnsureLLMUsageTable() error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := coordinateWithSchemaMigration(tx); err != nil {
+	if err := d.coordinateWithSchemaMigration(tx); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(llmUsageSchema); err != nil {

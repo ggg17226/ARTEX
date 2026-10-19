@@ -559,7 +559,7 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := coordinateWithSchemaMigration(tx); err != nil {
+	if err := d.coordinateWithSchemaMigration(tx); err != nil {
 		return nil, err
 	}
 	var expID int64

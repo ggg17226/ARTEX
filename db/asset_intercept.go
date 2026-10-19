@@ -47,34 +47,49 @@ func (d *DB) ListAssetInterceptRules() ([]AssetInterceptRule, error) {
 }
 
 // CreateAssetInterceptRule inserts a new user rule (builtin is always false here).
+//
+// 原生 TiDB 没有 INSERT … RETURNING：自增 id 走 LastInsertId，再按 id 回读整行，
+// 让 created_at/updated_at 这类由 DDL 默认值生成的列与库内保持一字不差。
 func (d *DB) CreateAssetInterceptRule(kind, pattern, note string, enabled bool) (AssetInterceptRule, error) {
-	row := d.QueryRow(`
+	res, err := d.Exec(`
 INSERT INTO asset_intercept_rules(enabled, kind, pattern, note, builtin)
-VALUES ($1, $2, $3, $4, false)
-RETURNING `+assetInterceptRuleCols,
-		enabled, kind, pattern, note)
-	return scanAssetInterceptRule(row)
+VALUES (?, ?, ?, ?, FALSE)`, enabled, kind, pattern, note)
+	if err != nil {
+		return AssetInterceptRule{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return AssetInterceptRule{}, err
+	}
+	return d.getAssetInterceptRule(id)
 }
 
 // UpdateAssetInterceptRule replaces the editable fields of an existing rule.
 func (d *DB) UpdateAssetInterceptRule(id int64, kind, pattern, note string, enabled bool) (AssetInterceptRule, error) {
-	row := d.QueryRow(`
+	if _, err := d.Exec(`
 UPDATE asset_intercept_rules
-   SET enabled=$2, kind=$3, pattern=$4, note=$5
-WHERE id=$1
-RETURNING `+assetInterceptRuleCols,
-		id, enabled, kind, pattern, note)
-	return scanAssetInterceptRule(row)
+   SET enabled=?, kind=?, pattern=?, note=?
+ WHERE id=?`, enabled, kind, pattern, note, id); err != nil {
+		return AssetInterceptRule{}, err
+	}
+	return d.getAssetInterceptRule(id)
+}
+
+// getAssetInterceptRule 按主键回读一条规则；行不存在时返回 sql.ErrNoRows，
+// 与旧的 INSERT/UPDATE … RETURNING 行为一致。
+func (d *DB) getAssetInterceptRule(id int64) (AssetInterceptRule, error) {
+	return scanAssetInterceptRule(d.QueryRow(
+		`SELECT `+assetInterceptRuleCols+` FROM asset_intercept_rules WHERE id=?`, id))
 }
 
 // DeleteAssetInterceptRule removes a rule (built-in rules are deletable too).
 func (d *DB) DeleteAssetInterceptRule(id int64) error {
-	_, err := d.Exec(`DELETE FROM asset_intercept_rules WHERE id=$1`, id)
+	_, err := d.Exec(`DELETE FROM asset_intercept_rules WHERE id=?`, id)
 	return err
 }
 
 // ToggleAssetInterceptRule flips the enabled state of a rule.
 func (d *DB) ToggleAssetInterceptRule(id int64, enabled bool) error {
-	_, err := d.Exec(`UPDATE asset_intercept_rules SET enabled=$2 WHERE id=$1`, id, enabled)
+	_, err := d.Exec(`UPDATE asset_intercept_rules SET enabled=? WHERE id=?`, enabled, id)
 	return err
 }
