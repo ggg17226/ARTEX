@@ -26,6 +26,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/db/schema"
 )
 
 // =====================================================================
@@ -1196,6 +1198,497 @@ func TestNodesPageQueryMatchesID(t *testing.T) {
 }
 
 // =====================================================================
+// 10) 修复轮次 1 —— 审查 Important 1～4 的回归
+//
+// 这一节全部是**离线可判定**的：不依赖真实 TiDB 也能证明"发出去的语句在原生 Catalog
+// 上真的成立、删除路径把无 FK 的子表真的收尾了、存在性判定不再挂在 changed rows 上"。
+// =====================================================================
+
+// ---- Catalog 一致性守卫（Important 1 的通用防线）----
+
+// expCatalogColumns 返回原生 Catalog 里某张表的物理列集合（含 STORED 生成列）。
+func expCatalogColumns(t *testing.T, table string) map[string]bool {
+	t.Helper()
+	for _, tb := range schema.AllTables() {
+		if tb.Name != table {
+			continue
+		}
+		cols := make(map[string]bool, len(tb.Columns))
+		for _, c := range tb.Columns {
+			cols[c.Name] = true
+		}
+		return cols
+	}
+	t.Fatalf("table %q missing from native catalog", table)
+	return nil
+}
+
+var (
+	expOrderByRe = regexp.MustCompile(`(?i)ORDER BY\s+(.*?)(?:\s+LIMIT\b|\s+OFFSET\b|\s+FOR\b|$)`)
+	expAliasRe   = regexp.MustCompile(`(?i)\bAS\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	expFromRe    = regexp.MustCompile(`(?i)(?:FROM|UPDATE|INTO)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+)
+
+// expOrderByIdents 抽出一条语句里的裸排序列：`a.id` 这类限定名与 `AS day` 别名都不是
+// 表列，跳过它们才不会误判，剩下的就必须是该表的物理列。
+func expOrderByIdents(query string) []string {
+	body := strings.ReplaceAll(query, "\n", " ")
+	match := expOrderByRe.FindStringSubmatch(body)
+	if match == nil {
+		return nil
+	}
+	aliases := map[string]bool{}
+	for _, a := range expAliasRe.FindAllStringSubmatch(body, -1) {
+		aliases[strings.ToLower(a[1])] = true
+	}
+	var out []string
+	for _, part := range strings.Split(match[1], ",") {
+		field := strings.ToLower(strings.TrimSpace(part))
+		if fields := strings.Fields(field); len(fields) > 0 {
+			field = fields[0] // 去掉 ASC / DESC
+		}
+		if field == "" || strings.Contains(field, ".") || aliases[field] {
+			continue
+		}
+		out = append(out, field)
+	}
+	return out
+}
+
+// expAssertOrderByInCatalog 断言语句的每个排序列都是该语句主表在原生 Catalog 里的
+// **物理列**。exploration_edges 的原复合主键被改成隐藏自增 row_id 之后，任何按记忆写
+// 出来的 `ORDER BY id` 都会以 1054 结束，替身不会替你发现这件事。
+func expAssertOrderByInCatalog(t *testing.T, c expMockCall) {
+	t.Helper()
+	idents := expOrderByIdents(c.Query)
+	if len(idents) == 0 {
+		return
+	}
+	table := expFromRe.FindStringSubmatch(c.Query)
+	if table == nil {
+		return
+	}
+	cols := expCatalogColumns(t, table[1])
+	for _, ident := range idents {
+		if !cols[ident] {
+			t.Errorf("排序列 %q 不是 %s 的物理列（真实 TiDB 报 1054）: %s", ident, table[1], strings.TrimSpace(c.Query))
+		}
+	}
+}
+
+func expIndexCall(calls []expMockCall, substr string) int {
+	for i, c := range calls {
+		if strings.Contains(c.Query, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+func expCallFor(t *testing.T, calls []expMockCall, substr string) expMockCall {
+	t.Helper()
+	for _, c := range calls {
+		if strings.Contains(c.Query, substr) {
+			return c
+		}
+	}
+	t.Fatalf("missing statement containing %q; emitted: %v", substr, queriesOf(calls))
+	return expMockCall{}
+}
+
+// TestExploration_Fix1_LineageEdgeOrderIsCatalogColumn 复核血缘整表取边的排序键：
+// 原生 Catalog 的 exploration_edges 只有 row_id/exploration_id/src_id/dst_id/rel/
+// created_at，**没有 id 列**，`ORDER BY id` 在真实 TiDB 上是 1054，血缘永远回不来。
+func TestExploration_Fix1_LineageEdgeOrderIsCatalogColumn(t *testing.T) {
+	cols := expCatalogColumns(t, "exploration_edges")
+	if cols["id"] {
+		t.Fatal("前提失效：原生 Catalog 的 exploration_edges 不该有 id 列")
+	}
+	if !cols["row_id"] {
+		t.Fatal("前提失效：exploration_edges 的物理主键必须是隐藏自增 row_id")
+	}
+
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+		[]driver.Value{int64(1), "spawns", int64(10)},
+		[]driver.Value{int64(10), "yields", int64(30)},
+	)
+	eng.on("FROM exploration_nodes", expNodeColumns(),
+		expNodeRow(1, "fact", "origin"),
+		expNodeRow(10, "intent", "done"),
+		expNodeRow(30, "finding", "confirmed"),
+	)
+
+	nodes, edges, err := d.Exploration(501).FindingLineage(30)
+	if err != nil {
+		t.Fatalf("FindingLineage: %v", err)
+	}
+	if len(nodes) != 3 || len(edges) == 0 {
+		t.Fatalf("血缘必须走完整条祖先链，got nodes=%d edges=%d", len(nodes), len(edges))
+	}
+
+	scan := expCallFor(t, eng.snapshotCalls(), "FROM exploration_edges")
+	order := expOrderByIdents(scan.Query)
+	if len(order) == 0 {
+		t.Fatalf("血缘取边必须有确定性排序键，否则邻接表构造不可重放: %s", scan.Query)
+	}
+	for _, ident := range order {
+		if !cols[ident] {
+			t.Fatalf("排序键 %q 不是 exploration_edges 的物理列: %s", ident, scan.Query)
+		}
+	}
+	if order[0] != "row_id" {
+		t.Fatalf("排序键必须是物理主键 row_id，got %v", order)
+	}
+
+	// 同一道防线覆盖血缘轨迹里的每一条语句。
+	for _, c := range eng.snapshotCalls() {
+		expAssertOrdinal(t, c)
+		expAssertOrderByInCatalog(t, c)
+	}
+}
+
+// TestExploration_Fix1_LineageTopologyCorners 补齐血缘回溯的边界形状：无边、多级、
+// 共享父节点（DAG 汇合）与环防护。TiDB 侧没有递归 CTE，回溯完全跑在 Go 内存里，因此
+// 这四条形状必须在替身层就锁死：环不终止会挂死请求，汇合点漏一层血缘就渲染不出链路。
+func TestExploration_Fix1_LineageTopologyCorners(t *testing.T) {
+	t.Run("无边", func(t *testing.T) {
+		eng := newExpMockEngine()
+		d := openExpMockDB(t, eng)
+		eng.on("FROM exploration_edges", []string{"src_id", "rel", "dst_id"})
+		eng.on("FROM exploration_nodes", expNodeColumns())
+
+		nodes, edges, err := d.Exploration(501).FindingLineage(30)
+		if err != nil {
+			t.Fatalf("无边的血缘必须是空结果而不是错误: %v", err)
+		}
+		if len(nodes) != 0 || len(edges) != 0 {
+			t.Fatalf("nodes=%d edges=%d, want empty", len(nodes), len(edges))
+		}
+		for _, c := range eng.snapshotCalls() {
+			expAssertOrdinal(t, c)
+			expAssertOrderByInCatalog(t, c)
+		}
+	})
+
+	t.Run("环防护", func(t *testing.T) {
+		eng := newExpMockEngine()
+		d := openExpMockDB(t, eng)
+		eng.on("FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+			[]driver.Value{int64(10), "yields", int64(20)},
+			[]driver.Value{int64(20), "derived_from", int64(10)},
+		)
+		eng.on("FROM exploration_nodes", expNodeColumns(),
+			expNodeRow(10, "intent", "done"),
+			expNodeRow(20, "finding", "confirmed"),
+		)
+
+		nodes, edges, err := d.Exploration(501).FindingLineage(20) // 挂死时由 go test 超时兜底
+		if err != nil {
+			t.Fatalf("FindingLineage(cycle): %v", err)
+		}
+		if len(nodes) != 2 || len(edges) != 2 {
+			t.Fatalf("nodes=%d edges=%d, want 环内两点两条边全部收敛", len(nodes), len(edges))
+		}
+	})
+
+	t.Run("共享父节点", func(t *testing.T) {
+		eng := newExpMockEngine()
+		d := openExpMockDB(t, eng)
+		eng.on("FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+			[]driver.Value{int64(1), "spawns", int64(10)},
+			[]driver.Value{int64(1), "spawns", int64(20)},
+			[]driver.Value{int64(10), "yields", int64(30)},
+			[]driver.Value{int64(20), "yields", int64(30)},
+			[]driver.Value{int64(30), "proves", int64(99)},
+		)
+		eng.on("FROM exploration_nodes", expNodeColumns(),
+			expNodeRow(1, "fact", "origin"),
+			expNodeRow(10, "intent", "done"),
+			expNodeRow(20, "intent", "done"),
+			expNodeRow(30, "finding", "confirmed"),
+		)
+
+		nodes, edges, err := d.Exploration(501).FindingLineage(30)
+		if err != nil {
+			t.Fatalf("FindingLineage(join): %v", err)
+		}
+		if len(nodes) != 4 || len(edges) != 4 {
+			t.Fatalf("nodes=%d edges=%d, want 汇合点两侧祖先全收，且下游 goal 排除", len(nodes), len(edges))
+		}
+		for _, e := range edges {
+			if e.From == 99 || e.To == 99 {
+				t.Fatalf("下游 goal 泄漏进血缘: %+v", e)
+			}
+		}
+		for _, c := range eng.snapshotCalls() {
+			expAssertOrdinal(t, c)
+			expAssertOrderByInCatalog(t, c)
+		}
+	})
+}
+
+// TestExploration_Fix2_CancelIntentClosesFindingChildTables 复核取消意图时对 findings
+// 无 FK 子表的收尾：证据绑定整行删除、未收尾的复测封成终态，且都发生在删 findings 行
+// 之前；复测历史保留（只封状态不物理删）。
+func TestExploration_Fix2_CancelIntentClosesFindingChildTables(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+
+	eng.on("SELECT 1 FROM exploration_nodes", []string{"one"}, []driver.Value{int64(1)})
+	eng.on("SELECT id, kind, state FROM exploration_nodes", []string{"id", "kind", "state"},
+		[]driver.Value{int64(10), "intent", "running"},
+		[]driver.Value{int64(30), "finding", "confirmed"},
+		[]driver.Value{int64(31), "finding", "confirmed"},
+	)
+	eng.on("SELECT src_id, rel, dst_id FROM exploration_edges", []string{"src_id", "rel", "dst_id"},
+		[]driver.Value{int64(10), "yields", int64(30)},
+		[]driver.Value{int64(10), "yields", int64(31)},
+	)
+	// 两个 finding 节点名下各挂一行漏洞（701/702），其中一行有证据绑定与活跃复测。
+	eng.on("SELECT id FROM findings", []string{"id"},
+		[]driver.Value{int64(701)},
+		[]driver.Value{int64(702)},
+	)
+
+	cleanup, err := d.Exploration(501).CancelIntent(10)
+	if err != nil {
+		t.Fatalf("CancelIntent: %v", err)
+	}
+	if cleanup.Findings != 2 {
+		t.Fatalf("cleanup=%+v, want 2 findings", cleanup)
+	}
+
+	calls := eng.snapshotCalls()
+	for _, c := range calls {
+		expAssertOrdinal(t, c)
+		expAssertOrderByInCatalog(t, c)
+	}
+
+	// 顺序：绑定/复测 → findings 行 → 节点行，任何一环倒序都会留下孤儿。
+	order := map[string]int{
+		"DELETE FROM finding_traffic_bindings": expIndexCall(calls, "DELETE FROM finding_traffic_bindings"),
+		"UPDATE finding_retests":               expIndexCall(calls, "UPDATE finding_retests"),
+		"DELETE FROM findings WHERE id IN":     expIndexCall(calls, "DELETE FROM findings WHERE id IN"),
+		"DELETE FROM exploration_nodes":        expIndexCall(calls, "DELETE FROM exploration_nodes"),
+	}
+	for want, at := range order {
+		if at < 0 {
+			t.Fatalf("取消意图必须发出 %q；实际语句: %v", want, queriesOf(calls))
+		}
+	}
+	if !(order["DELETE FROM finding_traffic_bindings"] < order["DELETE FROM findings WHERE id IN"] &&
+		order["UPDATE finding_retests"] < order["DELETE FROM findings WHERE id IN"] &&
+		order["DELETE FROM findings WHERE id IN"] < order["DELETE FROM exploration_nodes"]) {
+		t.Fatalf("必须先子表、再 findings、最后节点: %+v", order)
+	}
+
+	// 证据绑定按查到的 finding 主键整行删除（无 FK，没有置空这条路）。
+	bindings := expCallFor(t, calls, "DELETE FROM finding_traffic_bindings")
+	if !strings.Contains(bindings.Query, "finding_id IN (?, ?)") {
+		t.Fatalf("证据绑定必须按主键 IN 列表删除: %s", bindings.Query)
+	}
+	if got := fmt.Sprint(bindings.Args); got != "[701 702]" {
+		t.Fatalf("证据绑定参数=%v, want [701 702]", bindings.Args)
+	}
+
+	// 复测封终态：只碰 pending/running，finished_at 由 Go 端盖同一时钟。
+	retests := expCallFor(t, calls, "UPDATE finding_retests")
+	if !strings.Contains(retests.Query, "status='stopped'") {
+		t.Fatalf("活跃复测必须封成 stopped 终态（active_finding_id 生成列才会归 NULL）: %s", retests.Query)
+	}
+	if !strings.Contains(retests.Query, "status IN ('pending','running')") {
+		t.Fatalf("只能封未收尾的复测，历史结论不得改写: %s", retests.Query)
+	}
+	if _, ok := retests.Args[0].(time.Time); !ok {
+		t.Fatalf("finished_at 必须是 Go 端算好后显式绑定的时间，got %T", retests.Args[0])
+	}
+	if got := fmt.Sprint(retests.Args[1:]); got != "[701 702]" {
+		t.Fatalf("复测收尾参数=%v, want [701 702]", retests.Args[1:])
+	}
+	if left := eng.statements(func(c expMockCall) bool {
+		return strings.Contains(c.Query, "DELETE FROM finding_retests")
+	}); len(left) != 0 {
+		t.Fatalf("复测历史是审计事实，必须封终态而非物理删除: %v", queriesOf(left))
+	}
+
+	// 旧的"按未索引 node_id 裸删漏洞"必须消失，改为先枚举主键再按主键删。
+	for _, c := range calls {
+		if strings.Contains(c.Query, "DELETE FROM findings WHERE node_id") {
+			t.Fatalf("不得再按未索引列 node_id 做裸范围删除: %s", c.Query)
+		}
+	}
+	if counts := eng.txCounts(); counts.Commits != 1 {
+		t.Fatalf("commits=%d, want the whole cascade in one transaction", counts.Commits)
+	}
+}
+
+// TestExploration_Fix3_IntentCleanupDropsSideQuestionRequests 复核软删除与物理取消两条
+// 路径都在同一事务内先按 session_key 删掉副问答请求，再删会话行。
+func TestExploration_Fix3_IntentCleanupDropsSideQuestionRequests(t *testing.T) {
+	for _, mode := range []string{"soft-delete", "cancel"} {
+		mode := mode
+		t.Run(mode, func(t *testing.T) {
+			eng := newExpMockEngine()
+			d := openExpMockDB(t, eng)
+			if mode == "soft-delete" {
+				eng.on("SELECT state, payload FROM exploration_nodes", []string{"state", "payload"},
+					[]driver.Value{"running", `{"summary":"drop me"}`})
+			} else {
+				eng.on("SELECT 1 FROM exploration_nodes", []string{"one"}, []driver.Value{int64(1)})
+				eng.on("SELECT id, kind, state FROM exploration_nodes", []string{"id", "kind", "state"},
+					[]driver.Value{int64(10), "intent", "running"})
+				eng.on("SELECT src_id, rel, dst_id FROM exploration_edges", []string{"src_id", "rel", "dst_id"})
+			}
+			// 该意图名下两个副会话（其一可能还挂着 running 请求）。
+			eng.on("SELECT session_key FROM side_question_sessions", []string{"session_key"},
+				[]driver.Value{"sq-k1"}, []driver.Value{"sq-k2"})
+
+			var err error
+			if mode == "soft-delete" {
+				_, err = d.Exploration(501).SoftDeleteIntent(10, "不再需要")
+			} else {
+				_, err = d.Exploration(501).CancelIntent(10)
+			}
+			if err != nil {
+				t.Fatalf("%s: %v", mode, err)
+			}
+
+			calls := eng.snapshotCalls()
+			for _, c := range calls {
+				expAssertOrdinal(t, c)
+				expAssertOrderByInCatalog(t, c)
+			}
+
+			// 1) 先按 intent_id 锁定会话并取出 session_key（intent_id 命中 idx_side_sessions_intent）。
+			lock := expCallFor(t, calls, "SELECT session_key FROM side_question_sessions")
+			if !strings.Contains(strings.ToUpper(lock.Query), "FOR UPDATE") {
+				t.Fatalf("会话映射必须锁定后再读，否则可能与并发写入错位: %s", lock.Query)
+			}
+			if got := fmt.Sprint(lock.Args); got != "[10]" {
+				t.Fatalf("会话锁定参数=%v, want [10]", lock.Args)
+			}
+
+			// 2) 请求历史按刚取到的 session_key 删除。
+			requests := expCallFor(t, calls, "DELETE FROM side_question_requests")
+			if !strings.Contains(requests.Query, "session_key IN (?, ?)") {
+				t.Fatalf("请求必须按 session_key IN 列表删除: %s", requests.Query)
+			}
+			if got := fmt.Sprint(requests.Args); got != "[sq-k1 sq-k2]" {
+				t.Fatalf("请求删除参数=%v, want [sq-k1 sq-k2]", requests.Args)
+			}
+
+			// 3) 顺序必须是 读 key → 删请求 → 删会话；先删会话就丢掉了定位请求的映射。
+			iLock := expIndexCall(calls, "SELECT session_key FROM side_question_sessions")
+			iRequests := expIndexCall(calls, "DELETE FROM side_question_requests")
+			iSessions := expIndexCall(calls, "DELETE FROM side_question_sessions")
+			if !(iLock < iRequests && iRequests < iSessions) {
+				t.Fatalf("%s: 必须 lock=%d < requests=%d < sessions=%d；语句: %v",
+					mode, iLock, iRequests, iSessions, queriesOf(calls))
+			}
+			if counts := eng.txCounts(); counts.Commits != 1 {
+				t.Fatalf("%s: commits=%d, want the whole cleanup in one transaction", mode, counts.Commits)
+			}
+		})
+	}
+}
+
+// TestExploration_Fix3_NoSessionMeansNoRequestDelete 确认没有会话时不会发出
+// `IN ()` 这类非法语句。
+func TestExploration_Fix3_NoSessionMeansNoRequestDelete(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("SELECT state, payload FROM exploration_nodes", []string{"state", "payload"},
+		[]driver.Value{"open", `{"summary":"s"}`})
+	eng.on("SELECT session_key FROM side_question_sessions", []string{"session_key"}) // 无会话
+
+	if _, err := d.Exploration(501).SoftDeleteIntent(12, "不再需要"); err != nil {
+		t.Fatalf("SoftDeleteIntent: %v", err)
+	}
+	calls := eng.snapshotCalls()
+	for _, c := range calls {
+		expAssertOrdinal(t, c)
+	}
+	if left := eng.statements(func(c expMockCall) bool {
+		return strings.Contains(c.Query, "DELETE FROM side_question_requests")
+	}); len(left) != 0 {
+		t.Fatalf("没有会话时不得发出请求删除: %v", queriesOf(left))
+	}
+	if got := eng.statements(func(c expMockCall) bool {
+		return strings.Contains(c.Query, "IN ()")
+	}); len(got) != 0 {
+		t.Fatalf("空集合不得渲染成 IN (): %v", queriesOf(got))
+	}
+	if expIndexCall(calls, "DELETE FROM side_question_sessions") < 0 {
+		t.Fatal("会话删除语句仍须发出（幂等命中 0 行）")
+	}
+}
+
+// TestExploration_Fix4_UpdateGoalPayloadTreatsNoChangeAsSuccess 钉住 TiDB 的
+// changed-rows 语义：目标存在、payload 与库里完全相同时 ROW_COUNT()=0，重复保存必须是
+// 幂等成功，不能再报「目标不存在」。
+func TestExploration_Fix4_UpdateGoalPayloadTreatsNoChangeAsSuccess(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("SELECT id FROM exploration_nodes", []string{"id"}, []driver.Value{int64(7)})
+	eng.forceAffectedRows(0) // 真实 MySQL/TiDB 协议：内容未变 → changed rows = 0
+
+	if err := d.Exploration(501).UpdateGoalPayload(7, "拿下后台", "authz"); err != nil {
+		t.Fatalf("目标存在但内容未变必须是幂等成功，不得报「目标不存在」: %v", err)
+	}
+	calls := eng.snapshotCalls()
+	for _, c := range calls {
+		expAssertOrdinal(t, c)
+	}
+
+	lock := expCallFor(t, calls, "SELECT id FROM exploration_nodes")
+	if !strings.Contains(strings.ToUpper(lock.Query), "FOR UPDATE") {
+		t.Fatalf("存在性必须由锁定读判定，与 changed rows 解耦: %s", lock.Query)
+	}
+	if !strings.Contains(lock.Query, "kind='goal'") {
+		t.Fatalf("存在性判定必须留在 kind='goal' 的 scope 内: %s", lock.Query)
+	}
+	update := expCallFor(t, calls, "UPDATE exploration_nodes")
+	if !strings.Contains(update.Query, "kind='goal'") {
+		t.Fatalf("UPDATE 必须留在 kind='goal' 的 scope 内: %s", update.Query)
+	}
+	if fmt.Sprint(update.Args[1:]) != "[7 501]" {
+		t.Fatalf("UPDATE 目标 scope=%v, want [7 501]", update.Args[1:])
+	}
+	if payload := fmt.Sprint(update.Args[0]); !strings.Contains(payload, "拿下后台") || !strings.Contains(payload, "authz") {
+		t.Fatalf("payload=%s", payload)
+	}
+	if counts := eng.txCounts(); counts.Commits != 1 {
+		t.Fatalf("commits=%d, want 1", counts.Commits)
+	}
+}
+
+// TestExploration_Fix4_UpdateGoalPayloadMissingStillFails 另一半：目标真的不存在时照旧
+// 报错，且一条 UPDATE 都不发出、不提交。
+func TestExploration_Fix4_UpdateGoalPayloadMissingStillFails(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	eng.on("SELECT id FROM exploration_nodes", []string{"id"}) // 0 行 → 目标不存在
+
+	err := d.Exploration(501).UpdateGoalPayload(7, "拿下后台", "")
+	if err == nil {
+		t.Fatal("目标不存在必须报错")
+	}
+	if !strings.Contains(err.Error(), "目标不存在") {
+		t.Fatalf("err=%v, want 目标不存在", err)
+	}
+	if left := eng.statements(func(c expMockCall) bool {
+		return strings.Contains(c.Query, "UPDATE exploration_nodes")
+	}); len(left) != 0 {
+		t.Fatalf("目标不存在时不得发出 UPDATE: %v", queriesOf(left))
+	}
+	if counts := eng.txCounts(); counts.Commits != 0 {
+		t.Fatalf("commits=%d, want 0", counts.Commits)
+	}
+}
+
+// =====================================================================
 // 语句级替身驱动（离线）
 // =====================================================================
 
@@ -1221,6 +1714,7 @@ type expMockEngine struct {
 	calls     []expMockCall
 	rules     []expMockRule
 	nextID    int64
+	affected  *int64 // 非 INSERT 语句的 changed rows 注入（nil = 1）
 	commits   int
 	rollbacks int
 }
@@ -1247,6 +1741,24 @@ func (e *expMockEngine) nextInsertID() int64 {
 	id := e.nextID
 	e.nextID++
 	return id
+}
+
+// forceAffectedRows 把非 INSERT 语句的 ROW_COUNT() 钉成给定值。MySQL/TiDB 协议返回的是
+// **changed rows**：把同一行原样再更新一次，合法语句也会返回 0，替身必须能复现这个 0，
+// 否则"更新 0 行 = 记录不存在"这类误判永远测不出来。
+func (e *expMockEngine) forceAffectedRows(rows int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.affected = &rows
+}
+
+func (e *expMockEngine) affectedRows() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.affected != nil {
+		return *e.affected
+	}
+	return 1
 }
 
 func (e *expMockEngine) record(c expMockCall) {
@@ -1362,7 +1874,7 @@ func (c *expMockConn) ExecContext(_ context.Context, query string, args []driver
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "INSERT") {
 		return expMockResult{id: c.eng.nextInsertID(), rows: 1}, nil
 	}
-	return expMockResult{id: 0, rows: 1}, nil
+	return expMockResult{id: 0, rows: c.eng.affectedRows()}, nil
 }
 
 type expMockTx struct{ eng *expMockEngine }

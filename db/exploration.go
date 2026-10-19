@@ -355,6 +355,111 @@ type expExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
+// expQueryExecer 同上，但这段清理还要先**枚举**子行的物理主键（新库没有 FK，删除
+// 父行前必须自己把子行找出来），因此除 Exec 还需要 Query。
+type expQueryExecer interface {
+	expExecer
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// expCollect 跑一条单列 SELECT 并把结果收成切片；Rows 在返回前必定关闭。
+// 泛型只放 int64/string 两种主键形态（row_id/task 主键 vs session_key 自然键）。
+func expCollect[T int64 | string](ex expQueryExecer, query string, args ...any) ([]T, error) {
+	rows, err := ex.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []T
+	for rows.Next() {
+		var v T
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// expDropFindingRows 删掉一批 finding **节点**名下的 findings 行及其子表。
+//
+// findings 的子表在 DDL 里都没有指向 findings 的外键（历史设计），删了漏洞行它们谁也
+// 不会跟着动，只能按「先子后父」在同一事务里显式收尾（与 DeleteFinding /
+// DeleteFindingsByTask 同一业务口径）：
+//   - finding_traffic_bindings：finding_id NOT NULL，没有置空这条路，整行删除；证据
+//     快照文件本身由证据存储的 GC 负责，这里只断开绑定；
+//   - finding_retests：历史复测是审计事实，保留，但 pending/running 必须封成 stopped
+//     终态。active_finding_id 是 IF(status IN ('pending','running'), finding_id, NULL)
+//     的生成列，漏封就让前端永久显示「复测中」，并且这些漏洞的后续复测会被
+//     uq_finding_retests_active 去重吞掉；
+//   - findings：按上一步查到的主键删，绝不写 `WHERE node_id=?` 这种按未索引列的裸范围
+//     删除。
+//
+// 这里的 SELECT 不加 FOR UPDATE：findings.node_id 没有索引，按未索引列做锁定读会在
+// TiDB 上升级成近乎全表加锁；并发正确性由调用方已持有的意图行锁 + 本事务随后按主键的
+// DELETE 保证，SELECT 与 DELETE 之间新插入的漏洞行也会被 expDropNodes 的
+// `UPDATE findings SET node_id=NULL` 断链，不会留下孤儿。
+func expDropFindingRows(ex expQueryExecer, nodeIDs []int64) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	selectArgs := make([]any, 0, len(nodeIDs))
+	nodeList := expInPlaceholders(nodeIDs, &selectArgs)
+	findingRowIDs, err := expCollect[int64](ex, `SELECT id FROM findings WHERE node_id IN (`+nodeList+`)`, selectArgs...)
+	if err != nil {
+		return err
+	}
+	if len(findingRowIDs) == 0 {
+		return nil
+	}
+
+	bindingArgs := make([]any, 0, len(findingRowIDs))
+	bindingList := expInPlaceholders(findingRowIDs, &bindingArgs)
+	if _, err := ex.Exec(`DELETE FROM finding_traffic_bindings WHERE finding_id IN (`+bindingList+`)`, bindingArgs...); err != nil {
+		return err
+	}
+
+	// 时序列同样由 Go 端盖：finished_at 与本次取消发生在同一时刻、同一个时钟。
+	retestArgs := make([]any, 0, len(findingRowIDs)+1)
+	retestArgs = append(retestArgs, expNow())
+	retestList := expInPlaceholders(findingRowIDs, &retestArgs)
+	if _, err := ex.Exec(`UPDATE finding_retests
+	SET status='stopped', error='意图已删除，复测随之终止', finished_at=?
+	WHERE status IN ('pending','running') AND finding_id IN (`+retestList+`)`, retestArgs...); err != nil {
+		return err
+	}
+
+	deleteArgs := make([]any, 0, len(findingRowIDs))
+	deleteList := expInPlaceholders(findingRowIDs, &deleteArgs)
+	_, err = ex.Exec(`DELETE FROM findings WHERE id IN (`+deleteList+`)`, deleteArgs...)
+	return err
+}
+
+// expDropSideQuestionSessions 在同一事务内收尾一个意图名下的副问答会话及其请求。
+//
+// side_question_requests 只靠 session_key 关联会话，两张表之间**没有外键**：只删会话
+// 会把请求历史永久留成孤儿，而 running 请求更糟——它的 running_session_key 生成列带
+// 唯一键，父会话消失后这个唯一键继续占位，迟到的回调也再也找不到父会话把请求改成终态。
+// 因此顺序固定为「锁定会话 → 按 session_key 删请求 → 删会话」：先删会话就丢掉了从
+// intent 定位 request 的唯一映射，事后无法补救。
+// 会话行用 FOR UPDATE 锁定：intent_id 命中 idx_side_sessions_intent，锁范围就是这几行。
+func expDropSideQuestionSessions(ex expQueryExecer, intentID int64) error {
+	keys, err := expCollect[string](ex, `SELECT session_key FROM side_question_sessions WHERE intent_id=? FOR UPDATE`, intentID)
+	if err != nil {
+		return err
+	}
+
+	if len(keys) > 0 {
+		args := make([]any, 0, len(keys))
+		list := expInPlaceholders(keys, &args)
+		if _, err := ex.Exec(`DELETE FROM side_question_requests WHERE session_key IN (`+list+`)`, args...); err != nil {
+			return err
+		}
+	}
+	_, err = ex.Exec(`DELETE FROM side_question_sessions WHERE intent_id=?`, intentID)
+	return err
+}
+
 // expDropNodes 删除一批节点，并把它名下的关联行与弱引用一次收尾。
 //
 // 旧库靠外键收尾（exploration_edges / exploration_anchors 是 ON DELETE CASCADE，
@@ -423,20 +528,39 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 // UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);
 // scoped to kind='goal' so it can never mutate an intent/fact by id. Returns an
 // error if no such goal exists in this exploration.
+//
+// 存在性与 changed rows 必须分开判定。MySQL/TiDB 协议的 ROW_COUNT() 返回的是 **changed
+// rows**，不是 matched rows：把同一份文本原样再保存一次（或客户端重试同一次保存）时
+// UPDATE 命中的是真实存在的行，changed rows 却是 0。旧实现直接 `RowsAffected()==0 →
+// 目标不存在`，于是「重复保存」被误报成 404/500（server/goals_api.go 直接把错误抛给
+// 调用方）。db/tidb 的强制 DSN 参数并没有打开 clientFoundRows，不能指望配置兜底。
+// 现在改成：先在同一事务里按完整 scope（id + exploration_id + kind='goal'）行锁确认
+// 目标存在，再执行 UPDATE。目标存在而 UPDATE 一行未改 = 内容无变更的合法幂等 no-op；
+// 目标不存在则由锁定读直接判定，且此时一条 UPDATE 都不会发出。
 func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) error {
 	payload := map[string]any{"text": text}
 	if vulnclass != "" {
 		payload["vulnclass"] = vulnclass
 	}
 	raw, _ := json.Marshal(payload)
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload=? WHERE id=? AND exploration_id=? AND kind='goal'`, string(raw), id, s.expID)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("目标不存在")
+	defer tx.Rollback()
+
+	var goalID int64
+	if err := tx.QueryRow(`SELECT id FROM exploration_nodes
+		WHERE id=? AND exploration_id=? AND kind='goal' FOR UPDATE`, id, s.expID).Scan(&goalID); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("目标不存在")
+		}
+		return err
 	}
-	return nil
+	if _, err := tx.Exec(`UPDATE exploration_nodes SET payload=? WHERE id=? AND exploration_id=? AND kind='goal'`, string(raw), goalID, s.expID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteGoal hard-deletes a goal node; scoped to kind='goal' so it can never drop
@@ -586,8 +710,9 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 		WHERE id=? AND exploration_id=?`, reason, expNow(), id, s.expID); err != nil {
 		return "", err
 	}
-	// 主意图审计轨迹保留,但副问答会话随删除态原子清理(延迟快照会拒绝它)。
-	if _, err := tx.Exec(`DELETE FROM side_question_sessions WHERE intent_id=?`, id); err != nil {
+	// 主意图审计轨迹保留,但副问答会话随删除态原子清理(延迟快照会拒绝它)。会话的
+	// 请求历史按 session_key 一并删除,不留孤儿(见 expDropSideQuestionSessions)。
+	if err := expDropSideQuestionSessions(tx, id); err != nil {
 		return "", err
 	}
 	var summary string
@@ -604,7 +729,10 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 // yields/derived_from 向下可达、且所有父节点(所有指向它的边的源)都落在删除集内的节点。
 // goal 与 origin fact 永不删除;还被删除集之外的意图/digest 引用的共享节点也保留,以免破坏
 // 其它分支、产生断链。被删的每个 intent 先做 token rollup(保留不可逆计量)并清理其 activity
-// 与副会话;被删的 finding 先删 findings 表行(node_id FK 为 ON DELETE SET NULL,否则留孤儿)。
+// 与副会话(会话连同 session_key 名下的请求历史一并删除);被删的 finding 先按主键删除
+// findings 行,并在删漏洞行之前先清掉无外键的 finding_traffic_bindings、把 pending/running
+// 的 finding_retests 封成 stopped 终态(新库没有 FK,也没有 ON DELETE CASCADE/SET NULL,
+// 不写就永久残留孤儿)。
 // 边与锚点显式删除、activity/findings/task_asset_links 弱引用显式置空,整个清理保持在一个事务内。调用方须先停掉运行中的 worker 防止其后续写入。
 func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	var out IntentCleanup
@@ -742,16 +870,16 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 				return out, err
 			}
 		}
-		if _, err := tx.Exec(`DELETE FROM side_question_sessions WHERE intent_id=?`, iid); err != nil {
+		// 副会话与它名下的请求历史一并清理(无 FK,只删会话会把请求永久留成孤儿)。
+		if err := expDropSideQuestionSessions(tx, iid); err != nil {
 			return out, err
 		}
 	}
 
-	// finding 节点删除前先删 findings 表行(否则留下 node_id=NULL 的孤儿漏洞)。
-	for _, fid := range findingIDs {
-		if _, err := tx.Exec(`DELETE FROM findings WHERE node_id=?`, fid); err != nil {
-			return out, err
-		}
+	// finding 节点删除前先收尾 findings 表(否则留下 node_id=NULL 的孤儿漏洞),并在同一
+	// 事务内按「绑定 → 复测 → 漏洞行」的逆拓扑显式删净无 FK 的子表(见 expDropFindingRows)。
+	if err := expDropFindingRows(tx, findingIDs); err != nil {
+		return out, err
 	}
 
 	// 新库没有外键:边、锚点必须显式删除,activity / findings / task_asset_links 的弱引用
@@ -1244,8 +1372,14 @@ func (s *ExplorationStore) FindingLineage(nodeID int64) ([]*Node, []Edge, error)
 
 // allEdges 取回本探索的全部边。血缘遍历必须看到全图，因此不能走 Edges 的默认
 // 5000 条上限；除血缘与意图取消清理外没有调用方，图规模对真实任务很小。
+//
+// 排序键是 **row_id**，不是 id：原生 Catalog 把这张表原来的复合主键改成了隐藏自增
+// 主键 row_id（db/schema/catalog_baseline.go 的 T("exploration_edges","row_id",…)），
+// 表里根本没有 id 列，`ORDER BY id` 在真实 TiDB 上是 1054 `Unknown column 'id' in
+// 'order clause'`，血缘查询连一行都回不来。row_id 是 AUTO_INCREMENT 的物理主键，
+// 既保证遍历顺序确定（同一批边的邻接表构造可重放），也不会命中不存在的列。
 func (s *ExplorationStore) allEdges() ([]Edge, error) {
-	rows, err := s.db.Query(`SELECT src_id, rel, dst_id FROM exploration_edges WHERE exploration_id=? ORDER BY id`, s.expID)
+	rows, err := s.db.Query(`SELECT src_id, rel, dst_id FROM exploration_edges WHERE exploration_id=? ORDER BY row_id`, s.expID)
 	if err != nil {
 		return nil, err
 	}
