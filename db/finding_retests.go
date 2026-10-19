@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -226,6 +227,17 @@ func snapshotValue(value any, jsonPayload bool) any {
 	var doc any
 	if err := decoder.Decode(&doc); err != nil {
 		return string(raw) // 脏数据兜底：解不出来就原样带出，不吞值也不改型
+	}
+	// RR5：单次 Decode 只读**第一个合法 JSON 值**，尾部内容被静默跳过。
+	// `[{"id":9007199254740993}] trailing-corruption` 会解析成功，脏尾巴在这一轮
+	// Marshal 后凭空消失 —— 而 TJSON 的物理类型就是 MEDIUMTEXT，库端从不校验整段
+	// JSON 是否合法，"脏数据原样带出"是本函数的契约，不能被解码器的宽容破坏。
+	// 因此要求解码器在首个值之后立刻见到 io.EOF：合法的尾部空白（"[] \n"）依然
+	// 放行，尾部垃圾与"两个连续文档"（"[] {}"）一律按脏数据原样返回。
+	// 与 Task 2.1 RR1（parseTaskIDArray）同一实现口径。
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return string(raw)
 	}
 	switch doc.(type) {
 	case map[string]any, []any:

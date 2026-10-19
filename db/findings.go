@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/db/lockorder"
 )
 
 // DBFinding is a row in the standalone findings table. It persists across task
@@ -422,6 +424,13 @@ var ErrFindingOriginUnavailable = errors.New("finding origin is no longer availa
 // finding --derived_from--> intent lineage edge, and persists its audit activity.
 // The returned activity is the committed row and can be broadcast as-is without
 // calling AppendActivity again.
+//
+// 写者协议（规格 §3.2.2 / 全体写者协议，R2）：本函数是"向任务追加子实体"的写者，必须
+// 经要求 Business Gate 的 TxRunner，而不是自己 Begin/Commit。真正的业务门禁是
+// locks.business_relations 行锁（它排除的是并发的级联删除与归档窗口），任务行锁与
+// evidence 锚点锁都只是实体级互斥，替代不了它。Runner 另外带来两件本函数自己写不出
+// 来的东西：1213/1205/1062 的**整体回滚 + 指数退避重放**，以及提交结局未知时 hold 门禁
+// 的 fail closed（绝不允许凭 Rollback 的 ErrTxDone 反推"已经回滚、可以重放"）。
 func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int64, description string, audit Activity) (int64, Activity, error) {
 	// 先**不加锁**读出这条漏洞的归属，只为拿到要按什么顺序去锁谁。
 	//
@@ -429,7 +438,7 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	// 在事务里先 findings FOR UPDATE 再 tasks FOR UPDATE，与删除路径（先锁 task 再锁
 	// finding，见 LockFindingEvidenceTx）刚好逆序，两个事务交错时必然形成等待环，
 	// 由数据库强行中止一方。这里普通读只是定位（读到的值在持锁后一律重验），
-	// 真正的排他锁严格按全局顺序一把把地取。
+	// 真正的排他锁严格按全局顺序一把把地取，且全部落在 Runner 打开的事务里。
 	var linkedNodeID, linkedTaskID sql.NullInt64
 	if err := s.db.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ?`, findingID).Scan(&linkedNodeID, &linkedTaskID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -441,148 +450,160 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 		return 0, Activity{}, ErrFindingOriginUnavailable
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, Activity{}, err
-	}
-	defer tx.Rollback()
-
-	// TiDB 的 SELECT … FOR UPDATE 只吃单表点/范围读（PG 的 JOIN + FOR SHARE OF
-	// 不被支持），因此按全局锁序逐表逐行加锁：tasks → exploration_nodes → findings，
-	// 每一把锁拿到后立刻重验（父任务未删除、节点确属本探索且 kind='finding'、
-	// 漏洞仍挂在这个节点上），条件与原来的 JOIN 逐条对齐。
-	var taskExplorationID int64
-	var taskDeletedAt sql.NullTime
-	if err := tx.QueryRow(`SELECT exploration_id, deleted_at FROM tasks WHERE id = ? FOR UPDATE`, linkedTaskID.Int64).Scan(&taskExplorationID, &taskDeletedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, Activity{}, ErrFindingOriginUnavailable
-		}
-		return 0, Activity{}, err
-	}
-	if taskDeletedAt.Valid {
-		// 任务已打上删除标记：它正在被归档/级联清理，此时从它下面派生新意图会留下
-		// 一段永远无人执行的孤儿图。
-		return 0, Activity{}, ErrFindingOriginUnavailable
-	}
-	if taskExplorationID != s.expID {
-		return 0, Activity{}, ErrFindingOriginUnavailable
-	}
-	var nodeKind string
-	var nodeExplorationID int64
-	if err := tx.QueryRow(`SELECT kind, exploration_id FROM exploration_nodes WHERE id = ? FOR UPDATE`, findingNodeID).Scan(&nodeKind, &nodeExplorationID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, Activity{}, ErrFindingOriginUnavailable
-		}
-		return 0, Activity{}, err
-	}
-	if nodeKind != KindFinding || nodeExplorationID != s.expID {
-		return 0, Activity{}, ErrFindingOriginUnavailable
-	}
-	var heldNodeID, heldTaskID sql.NullInt64
-	if err := tx.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ? FOR UPDATE`, findingID).Scan(&heldNodeID, &heldTaskID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, Activity{}, ErrFindingOriginUnavailable
-		}
-		return 0, Activity{}, err
-	}
-	if !heldNodeID.Valid || heldNodeID.Int64 != findingNodeID || !heldTaskID.Valid || heldTaskID.Int64 != linkedTaskID.Int64 {
-		return 0, Activity{}, ErrFindingOriginUnavailable
-	}
-	liveNodeID := findingNodeID
-
-	anchors := []int64{}
-	anchorRows, err := tx.Query(`SELECT asset_id FROM exploration_anchors WHERE node_id = ? ORDER BY asset_id`, liveNodeID)
-	if err != nil {
-		return 0, Activity{}, err
-	}
-	for anchorRows.Next() {
-		var assetID int64
-		if err := anchorRows.Scan(&assetID); err != nil {
-			anchorRows.Close()
-			return 0, Activity{}, err
-		}
-		anchors = append(anchors, assetID)
-	}
-	if err := anchorRows.Err(); err != nil {
-		anchorRows.Close()
-		return 0, Activity{}, err
-	}
-	if err := anchorRows.Close(); err != nil {
-		return 0, Activity{}, err
-	}
-
-	payload := map[string]any{
-		"summary":                description,
-		"source_finding_id":      findingID,
-		"source_finding_node_id": liveNodeID,
-	}
-	if len(anchors) > 0 {
-		payload["asset_ids"] = anchors
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return 0, Activity{}, err
-	}
-	// 自增主键经 LastInsertId 取回（TiDB 没有 RETURNING）。
-	nodeRes, err := tx.Exec(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
-		VALUES (?, 'intent', ?, 10, 'open', 'human')`, s.expID, string(raw))
-	if err != nil {
-		return 0, Activity{}, err
-	}
-	intentID, err := nodeRes.LastInsertId()
-	if err != nil {
-		return 0, Activity{}, fmt.Errorf("exploration_nodes: LastInsertId after INSERT: %w", err)
-	}
-	if intentID < 1 {
-		return 0, Activity{}, fmt.Errorf("exploration_nodes: auto-increment id %d out of range", intentID)
-	}
-	// 锚点唯一键 uq_exploration_anchors(node_id,asset_id)：从来源节点复制锚点时重复
-	// 是常态，PG 的 ON CONFLICT DO NOTHING 在这里对应 INSERT IGNORE（被静默的只有
-	// 这一条唯一键，其余列都是 NOT NULL，真正的写入错误照样抛出）。
-	if _, err := tx.Exec(`INSERT IGNORE INTO exploration_anchors(node_id,asset_id)
-		SELECT ?, asset_id FROM exploration_anchors WHERE node_id = ?`, intentID, liveNodeID); err != nil {
-		return 0, Activity{}, err
-	}
-	if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
-		VALUES (?, ?, ?, ?)`, s.expID, liveNodeID, RelDerivedFrom, intentID); err != nil {
-		return 0, Activity{}, err
-	}
-
-	audit.NodeID = &intentID
-	if summary := strings.TrimSpace(audit.Summary); summary != "" {
-		audit.Summary = fmt.Sprintf("%s #%d", summary, intentID)
-	} else {
-		audit.Summary = ""
-	}
+	// payload 会被 Runner **整体重放**（冲突时换一个全新事务、全新 *sql.Tx 从头再跑一遍），
+	// 所以每一轮都必须从入参的原始副本出发：旧实现就地改写 audit，重放一次 Summary 就多
+	// 出一段 " #<id>" 后缀，第二次以后落库的审计文本与真实意图已经无关。
+	// committed* 只在完整走完的那一轮落值，失败时调用方拿到的仍是零值。
+	baseSummary := strings.TrimSpace(audit.Summary)
 	metadata := audit.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
-	// TiDB 没有 RETURNING：自增 id 走 LastInsertId，created_at 由列的
-	// CURRENT_TIMESTAMP(3) 默认值盖章后再按主键回读，Go 端绝不自造时间戳。
-	activityRes, err := tx.Exec(`
+	var committedIntentID int64
+	var committedActivity Activity
+
+	err := s.db.taskTxRunner().Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true},
+		func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
+			// TiDB 的 SELECT … FOR UPDATE 只吃单表点/范围读（PG 的 JOIN + FOR SHARE OF
+			// 不被支持），因此按全局锁序逐表逐行加锁：tasks → exploration_nodes → findings，
+			// 每一把锁拿到后立刻重验（父任务未删除、节点确属本探索且 kind='finding'、
+			// 漏洞仍挂在这个节点上），条件与原来的 JOIN 逐条对齐。
+			var taskExplorationID int64
+			var taskDeletedAt sql.NullTime
+			if err := tx.QueryRowContext(ctx, `SELECT exploration_id, deleted_at FROM tasks WHERE id = ? FOR UPDATE`, linkedTaskID.Int64).Scan(&taskExplorationID, &taskDeletedAt); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrFindingOriginUnavailable
+				}
+				return err
+			}
+			if taskDeletedAt.Valid {
+				// 任务已打上删除标记：它正在被归档/级联清理，此时从它下面派生新意图会留下
+				// 一段永远无人执行的孤儿图。
+				return ErrFindingOriginUnavailable
+			}
+			if taskExplorationID != s.expID {
+				return ErrFindingOriginUnavailable
+			}
+			var nodeKind string
+			var nodeExplorationID int64
+			if err := tx.QueryRowContext(ctx, `SELECT kind, exploration_id FROM exploration_nodes WHERE id = ? FOR UPDATE`, findingNodeID).Scan(&nodeKind, &nodeExplorationID); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrFindingOriginUnavailable
+				}
+				return err
+			}
+			if nodeKind != KindFinding || nodeExplorationID != s.expID {
+				return ErrFindingOriginUnavailable
+			}
+			var heldNodeID, heldTaskID sql.NullInt64
+			if err := tx.QueryRowContext(ctx, `SELECT node_id, task_id FROM findings WHERE id = ? FOR UPDATE`, findingID).Scan(&heldNodeID, &heldTaskID); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrFindingOriginUnavailable
+				}
+				return err
+			}
+			if !heldNodeID.Valid || heldNodeID.Int64 != findingNodeID || !heldTaskID.Valid || heldTaskID.Int64 != linkedTaskID.Int64 {
+				return ErrFindingOriginUnavailable
+			}
+			liveNodeID := findingNodeID
+
+			anchors := []int64{}
+			anchorRows, err := tx.QueryContext(ctx, `SELECT asset_id FROM exploration_anchors WHERE node_id = ? ORDER BY asset_id`, liveNodeID)
+			if err != nil {
+				return err
+			}
+			for anchorRows.Next() {
+				var assetID int64
+				if err := anchorRows.Scan(&assetID); err != nil {
+					anchorRows.Close()
+					return err
+				}
+				anchors = append(anchors, assetID)
+			}
+			if err := anchorRows.Err(); err != nil {
+				anchorRows.Close()
+				return err
+			}
+			if err := anchorRows.Close(); err != nil {
+				return err
+			}
+
+			payloadMap := map[string]any{
+				"summary":                description,
+				"source_finding_id":      findingID,
+				"source_finding_node_id": liveNodeID,
+			}
+			if len(anchors) > 0 {
+				payloadMap["asset_ids"] = anchors
+			}
+			raw, err := json.Marshal(payloadMap)
+			if err != nil {
+				return err
+			}
+			// 自增主键经 LastInsertId 取回（TiDB 没有 RETURNING）。
+			nodeRes, err := tx.ExecContext(ctx, `INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
+		VALUES (?, 'intent', ?, 10, 'open', 'human')`, s.expID, string(raw))
+			if err != nil {
+				return err
+			}
+			intentID, err := nodeRes.LastInsertId()
+			if err != nil {
+				return fmt.Errorf("exploration_nodes: LastInsertId after INSERT: %w", err)
+			}
+			if intentID < 1 {
+				return fmt.Errorf("exploration_nodes: auto-increment id %d out of range", intentID)
+			}
+			// 锚点唯一键 uq_exploration_anchors(node_id,asset_id)：从来源节点复制锚点时重复
+			// 是常态，PG 的 ON CONFLICT DO NOTHING 在这里对应 INSERT IGNORE（被静默的只有
+			// 这一条唯一键，其余列都是 NOT NULL，真正的写入错误照样抛出）。
+			if _, err := tx.ExecContext(ctx, `INSERT IGNORE INTO exploration_anchors(node_id,asset_id)
+		SELECT ?, asset_id FROM exploration_anchors WHERE node_id = ?`, intentID, liveNodeID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
+		VALUES (?, ?, ?, ?)`, s.expID, liveNodeID, RelDerivedFrom, intentID); err != nil {
+				return err
+			}
+
+			// 每一轮重放都从入参副本重新盖章：NodeID 指向**本轮**新建的意图，Summary 追加
+			// 本轮拿到的 #id；绝不在上一轮的返回值上二次累加后缀。
+			entry := audit
+			entry.NodeID = &intentID
+			if baseSummary != "" {
+				entry.Summary = fmt.Sprintf("%s #%d", baseSummary, intentID)
+			} else {
+				entry.Summary = ""
+			}
+			entry.Metadata = metadata
+			// TiDB 没有 RETURNING：自增 id 走 LastInsertId，created_at 由列的
+			// CURRENT_TIMESTAMP(3) 默认值盖章后再按主键回读，Go 端绝不自造时间戳。
+			activityRes, err := tx.ExecContext(ctx, `
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
 VALUES (?,?,NULLIF(?, ''),NULLIF(?, ''),NULLIF(?, ''),NULLIF(?, ''),?,NULLIF(?, ''),NULLIF(?, ''),?,?,?,?,?)`,
-		s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8Clean(audit.Kind), utf8Clean(audit.Tool), utf8Clean(audit.ToolUseID), audit.IsError,
-		utf8Clean(audit.Summary), utf8Clean(audit.Detail), metadata, audit.InputTokens, audit.OutputTokens, audit.CacheReadTokens, audit.CacheWriteTokens)
+				s.expID, entry.NodeID, utf8Clean(entry.Worker), utf8Clean(entry.Kind), utf8Clean(entry.Tool), utf8Clean(entry.ToolUseID), entry.IsError,
+				utf8Clean(entry.Summary), utf8Clean(entry.Detail), metadata, entry.InputTokens, entry.OutputTokens, entry.CacheReadTokens, entry.CacheWriteTokens)
+			if err != nil {
+				return err
+			}
+			entry.ID, err = activityRes.LastInsertId()
+			if err != nil {
+				return fmt.Errorf("activity: LastInsertId after INSERT: %w", err)
+			}
+			if entry.ID < 1 {
+				return fmt.Errorf("activity: auto-increment id %d out of range", entry.ID)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT created_at FROM activity WHERE id = ?`, entry.ID).Scan(&entry.CreatedAt); err != nil {
+				return err
+			}
+			// 走到这里本轮的全部写入才算完成；提交（含结局未知时的 fail closed）由 Runner
+			// 负责，所以这里只登记结果，Run 返回成功后才交给调用方。
+			committedIntentID, committedActivity = intentID, entry
+			return nil
+		})
 	if err != nil {
 		return 0, Activity{}, err
 	}
-	audit.ID, err = activityRes.LastInsertId()
-	if err != nil {
-		return 0, Activity{}, fmt.Errorf("activity: LastInsertId after INSERT: %w", err)
-	}
-	if audit.ID < 1 {
-		return 0, Activity{}, fmt.Errorf("activity: auto-increment id %d out of range", audit.ID)
-	}
-	if err := tx.QueryRow(`SELECT created_at FROM activity WHERE id = ?`, audit.ID).Scan(&audit.CreatedAt); err != nil {
-		return 0, Activity{}, err
-	}
-	audit.Metadata = metadata
-	if err := tx.Commit(); err != nil {
-		return 0, Activity{}, err
-	}
-	return intentID, audit, nil
+	return committedIntentID, committedActivity, nil
 }
 
 // ListFindingsForExport returns findings for the 发现 page 导出功能，携带完整

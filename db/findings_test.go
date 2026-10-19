@@ -868,26 +868,43 @@ func TestFindings_StrictInsertsPopulateEveryNotNullTextColumn(t *testing.T) {
 	}
 }
 
-// TestFindings_FollowUpIntentLocksInGlobalOrder 钉死 I4：AddFindingFollowUpIntent
-// 必须按「普通读定位 → 按全局锁序加锁」实现。全局锁序是 tasks(1) →
-// exploration_nodes(7) → findings(9)；旧实现先锁 findings 再锁 tasks，与删除路径
-// （先 task 后 finding）逆序，两个事务交错时必死锁。
+// TestFindings_FollowUpIntentLocksInGlobalOrder 钉死 I4 + R2：AddFindingFollowUpIntent
+// 必须「普通读定位 → 要求 Business Gate 的 TxRunner → 事务内按全局锁序加锁并重验」。
+// 全局锁序是 tasks(1) → exploration_nodes(7) → findings(9)；旧实现先锁 findings 再锁
+// tasks，与删除路径（先 task 后 finding）逆序，两个事务交错时必死锁。
+//
+// R2（上轮 I4 续项）：门禁从"必须有 Begin"改成"必须没有裸 Begin"。裸 Begin/Commit 的
+// 事务没有业务门禁（真正的 gate 是 locks.business_relations 行锁，不是任务行锁或
+// evidence 锚点锁）、没有 1213/1205/1062 的整体回滚 + 退避重放、也没有提交结局未知时
+// 的 fail closed。局部三表顺序正确不能代替全写者协议。
 func TestFindings_FollowUpIntentLocksInGlobalOrder(t *testing.T) {
 	body := task32FuncBody(t, "findings.go", "func (s *ExplorationStore) AddFindingFollowUpIntent(")
-	begin := strings.Index(body, "s.db.Begin()")
-	if begin < 0 {
-		t.Fatalf("AddFindingFollowUpIntent: transaction boundary not found")
+	for _, bare := range []string{"s.db.Begin()", "tx.Commit()", "defer tx.Rollback()"} {
+		if strings.Contains(body, bare) {
+			t.Errorf("AddFindingFollowUpIntent must not manage its own transaction (%s); run it under taskTxRunner().Run with RequiresBusinessGate", bare)
+		}
 	}
-	// 定位读必须发生在开事务之前，且不得携带任何行锁。
-	locating := body[:begin]
+	// 业务门禁开关必须是 true，且 Runner 就是这条路径唯一的事务入口。
+	if !strings.Contains(body, "taskTxRunner().Run(") {
+		t.Errorf("AddFindingFollowUpIntent must run through s.db.taskTxRunner().Run (spec §3.2.2 writer protocol)")
+	}
+	if !strings.Contains(body, "lockorder.TxRunnerOptions{RequiresBusinessGate: true}") {
+		t.Errorf("AddFindingFollowUpIntent must require the DB business gate (locks.business_relations), not just a tx")
+	}
+	gate := strings.Index(body, "RequiresBusinessGate: true")
+	if gate < 0 {
+		t.Fatalf("AddFindingFollowUpIntent: business gate option not found")
+	}
+	// 定位读必须发生在进入 Runner（门禁 + 事务）之前，且不得携带任何行锁。
+	locating := body[:gate]
 	if !strings.Contains(locating, "s.db.QueryRow(`SELECT node_id, task_id FROM findings WHERE id = ?`") {
-		t.Errorf("AddFindingFollowUpIntent must locate the finding with a plain (unlocked) read before opening the tx")
+		t.Errorf("AddFindingFollowUpIntent must locate the finding with a plain (unlocked) read before the gated transaction starts")
 	}
 	if strings.Contains(locating, "FOR UPDATE") {
 		t.Errorf("AddFindingFollowUpIntent must not take any row lock before the global lock order starts")
 	}
-	// 三把排他锁的先后顺序就是全局锁序本身。
-	step := begin
+	// 三把排他锁的先后顺序就是全局锁序本身，且全部在门禁之后取得。
+	step := gate
 	for _, want := range []string{
 		"FROM tasks WHERE id = ? FOR UPDATE",
 		"FROM exploration_nodes WHERE id = ? FOR UPDATE",
@@ -902,6 +919,39 @@ func TestFindings_FollowUpIntentLocksInGlobalOrder(t *testing.T) {
 	// 父任务的删除标记必须在持锁后核验，否则正在归档/清理的任务仍会被派生意图。
 	if !strings.Contains(body, "deleted_at") || !strings.Contains(body, "taskDeletedAt.Valid") {
 		t.Errorf("AddFindingFollowUpIntent must verify the task deleted_at marker after locking it")
+	}
+	// Runner 会整体重放 payload：payload 里就地累加 audit 的话，重试一次就多发一条
+	// 带 " #<id>" 后缀的审计文本。所以必须从入参副本出发，不能改写形参。
+	if strings.Contains(body, "audit.NodeID = ") || strings.Contains(body, "audit.Summary = ") {
+		t.Errorf("AddFindingFollowUpIntent must not mutate the audit argument inside a replayable payload; copy it per attempt")
+	}
+}
+
+// TestFindings_CRUDDefaultsAreAssertedBeforeAnyStatusMutation 是 R1 的离线门禁：
+// 默认值（status='pending' / report=”）只在 INSERT 那一刻成立，先按 seed 改状态再断言
+// 初态，实现全对也会稳定误报两条。真机缺席时这条用例负责把"先断言、后改状态"的顺序
+// 钉死在源码形状上；setter 之后还必须按 seed 目标状态回读一次。
+func TestFindings_CRUDDefaultsAreAssertedBeforeAnyStatusMutation(t *testing.T) {
+	// decl 拼串而成：task32FuncBody 取的是**首个**匹配，若这里写成完整的
+	// "func TestFindings_CRUDRoundTrip(" 字面量，本测试自己的调用参数就会先被匹配上，
+	// 抠出来的是本测试这一段，断言全部落空（真机 R1 又躲过门禁）。
+	body := task32FuncBody(t, "findings_test.go", "func "+"TestFindings_CRUDRoundTrip(")
+	defaults := strings.Index(body, "SELECT status, report FROM findings WHERE id = ?")
+	setter := strings.Index(body, "d.SetFindingStatus(")
+	if defaults < 0 {
+		t.Fatalf("CRUD test lost the strict defaults read-back (SELECT status, report FROM findings WHERE id = ?)")
+	}
+	if setter < 0 {
+		t.Fatalf("CRUD test lost its SetFindingStatus coverage")
+	}
+	if defaults > setter {
+		t.Errorf("the default value read-back must precede the first SetFindingStatus call (index %d > %d): asserting 'pending' after the seed changed the status is a guaranteed false failure", defaults, setter)
+	}
+	// setter 之后必须按 seed 断言目标状态，而不是继续核默认值。
+	lastSetter := strings.LastIndex(body, "d.SetFindingStatus(")
+	seeded := strings.Index(body[lastSetter:], "SELECT status FROM findings WHERE id = ?")
+	if seeded < 0 {
+		t.Errorf("the CRUD test must read the row back after SetFindingStatus and assert the seeded status")
 	}
 }
 
@@ -1011,6 +1061,20 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 		}
 		ids = append(ids, id)
 		task32TrackFinding(t, d, id)
+		// I1：TiDB 严格模式下这些 NOT NULL 文本列没有默认值可补，新增漏洞必须已经
+		// 带上应用层默认值（'pending' / 空报告），而不是留到读取时才"看起来对"。
+		//
+		// R1：这条回读**必须紧跟 AddFinding、排在一切 SetFindingStatus 之前**。默认值
+		// 只在 INSERT 那一刻成立，先按 seed 把 high 改成 in_progress、low 改成
+		// resolved 再去断言 pending，实现完全正确也会稳定误报两条 —— 那不是产品缺陷，
+		// 而是测试自己把初态改掉了。
+		var status, report string
+		if err := d.QueryRow(`SELECT status, report FROM findings WHERE id = ?`, id).Scan(&status, &report); err != nil {
+			t.Fatalf("read back strict defaults (%d): %v", id, err)
+		}
+		if status != FindingPending || report != "" {
+			t.Errorf("AddFinding defaults (%d): status=%q report=%q, want %q/%q", id, status, report, FindingPending, "")
+		}
 		if s.status != FindingPending {
 			if n, err := d.SetFindingStatus(id, s.status); err != nil || n != 1 {
 				t.Fatalf("SetFindingStatus(%d,%s): n=%d err=%v", id, s.status, n, err)
@@ -1021,17 +1085,14 @@ func TestFindings_CRUDRoundTrip(t *testing.T) {
 		if n, err := d.SetFindingStatus(id, s.status); err != nil || n != 1 {
 			t.Fatalf("SetFindingStatus idempotent rewrite (%d,%s): n=%d err=%v", id, s.status, n, err)
 		}
-	}
-
-	// I1：TiDB 严格模式下这些 NOT NULL 文本列没有默认值可补，新增漏洞必须已经
-	// 带上应用层默认值（'pending' / 空报告），而不是留到读取时才"看起来对"。
-	for _, id := range ids {
-		var status, report string
-		if err := d.QueryRow(`SELECT status, report FROM findings WHERE id = ?`, id).Scan(&status, &report); err != nil {
-			t.Fatalf("read back strict defaults (%d): %v", id, err)
+		// R1：setter 之后按 seed 断言**目标状态**（这里核的已经不是默认值，而是状态
+		// 推进真的落到了这一行；RowsAffected=1 与库里的值可能来自不同的读）。
+		var settled string
+		if err := d.QueryRow(`SELECT status FROM findings WHERE id = ?`, id).Scan(&settled); err != nil {
+			t.Fatalf("read back seeded status (%d): %v", id, err)
 		}
-		if status != FindingPending || report != "" {
-			t.Errorf("AddFinding defaults (%d): status=%q report=%q, want %q/%q", id, status, report, FindingPending, "")
+		if settled != s.status {
+			t.Errorf("status after SetFindingStatus (%d) = %q, want %q", id, settled, s.status)
 		}
 	}
 
@@ -1502,6 +1563,10 @@ func TestFindings_CreateFindingRetestWritesStrictDefaults(t *testing.T) {
 	if !created || retest == nil || conversation == nil {
 		t.Fatalf("CreateFindingRetest must dispatch a fresh run, got created=%v retest=%+v", created, retest)
 	}
+	// R4：CreateFindingRetest 成功提交时必然连带写一条 conversation 与一条首轮活动，
+	// 只登记 finding 的 cleanup 会让这条测试在"全绿"的同时每次留下一整套会话残渣。
+	// 拿到主键后**立即**登记，因此其后任何一步 Fatal 也不会漏清理。
+	task32TrackRetestConversation(t, d, conversation.ID)
 	var status, notes, verdict, summary, evidence, failure string
 	if err := d.QueryRow(`SELECT status, notes, verdict, summary, evidence, error FROM finding_retests WHERE id = ?`, retest.ID).
 		Scan(&status, &notes, &verdict, &summary, &evidence, &failure); err != nil {
@@ -1543,10 +1608,16 @@ func TestFindings_RetestSnapshotKeepsIDsAndTextTypes(t *testing.T) {
 	}
 	task32TrackFinding(t, d, findingID)
 
-	retest, _, created, err := d.CreateFindingRetest(context.Background(), findingID, "")
+	retest, conversation, created, err := d.CreateFindingRetest(context.Background(), findingID, "")
 	if err != nil || !created || retest == nil {
 		t.Fatalf("CreateFindingRetest: created=%v err=%v", created, err)
 	}
+	// R4：返回的 conversation 不能被丢掉就走 —— 它连同首轮 activity 一样是这次测试
+	// 造出来的行，必须按主键登记清理并核查终态。
+	if conversation == nil {
+		t.Fatalf("CreateFindingRetest must return the conversation it created")
+	}
+	task32TrackRetestConversation(t, d, conversation.ID)
 	var raw []byte
 	if err := d.QueryRow(`SELECT snapshot FROM finding_retests WHERE id = ?`, retest.ID).Scan(&raw); err != nil {
 		t.Fatalf("read snapshot: %v", err)
@@ -1602,8 +1673,24 @@ func task32Count(t *testing.T, d *DB, query string, args ...any) int {
 
 // task32TrackFinding 为一条 fixture 漏洞主键登记 cleanup：创建成功后**立即**调用，
 // 按子表 → 父表的顺序删除，逐条检查错误，且父表那条必须最多只动一行（按主键删）。
+//
+// R4：终态核查按**记录下来的 finding 主键**直接数子表，绝不 JOIN findings ——
+// JOIN 只能看见父行还在的子行，父行被删光之后真正悬挂的孤儿根本进不了 JOIN，
+// 那种断言拿到 0 什么也证明不了。断言**先注册**（cleanup 逆序，所以最后运行），
+// 因此它核的是按主键清理真正跑完之后的库状态。
 func task32TrackFinding(t *testing.T, d *DB, findingID int64) {
 	t.Helper()
+	t.Cleanup(func() {
+		for _, check := range []struct{ table, query string }{
+			{"finding_traffic_bindings", `SELECT COUNT(*) FROM finding_traffic_bindings WHERE finding_id = ?`},
+			{"finding_retests", `SELECT COUNT(*) FROM finding_retests WHERE finding_id = ?`},
+			{"findings", `SELECT COUNT(*) FROM findings WHERE id = ?`},
+		} {
+			if left := task32Count(t, d, check.query, findingID); left != 0 {
+				t.Errorf("residual %s rows for fixture finding %d = %d, want 0 (primary-key check, no JOIN on the parent)", check.table, findingID, left)
+			}
+		}
+	})
 	t.Cleanup(func() {
 		for _, query := range []string{
 			`DELETE FROM finding_traffic_bindings WHERE finding_id = ?`,
@@ -1624,8 +1711,56 @@ func task32TrackFinding(t *testing.T, d *DB, findingID int64) {
 	})
 }
 
+// task32TrackRetestConversation 为一条复测会话登记完整清理链（会话活动 → 复测子行 →
+// 会话本身），并在按主键清理之后按**同一批主键**核查零残留（R4）。
+//
+// 为什么必须单独登记：CreateFindingRetest 成功提交时**必然**连带写一条 conversations
+// 与一条首轮 conversation_activities（见 finding_retests.go 的写入序列），而 finding 的
+// cleanup 只覆盖 bindings/retests/findings 三张表。只登记 finding 的复测测试即使全绿，
+// 也会每次在共享库里留下一整套会话/活动 —— 那是"M1 fixture 残留"，不是产品行为。
+func task32TrackRetestConversation(t *testing.T, d *DB, conversationID int64) {
+	t.Helper()
+	if conversationID <= 0 {
+		t.Fatalf("track retest conversation: conversation id %d is not a primary key", conversationID)
+	}
+	// 先注册 → 最后运行：核的是下面那条按主键清理真正跑完之后的库状态。
+	t.Cleanup(func() {
+		for _, check := range []struct{ table, query string }{
+			{"conversation_activities", `SELECT COUNT(*) FROM conversation_activities WHERE conversation_id = ?`},
+			{"finding_retests", `SELECT COUNT(*) FROM finding_retests WHERE conversation_id = ?`},
+			{"conversations", `SELECT COUNT(*) FROM conversations WHERE id = ?`},
+		} {
+			if left := task32Count(t, d, check.query, conversationID); left != 0 {
+				t.Errorf("residual %s rows for fixture conversation %d = %d, want 0", check.table, conversationID, left)
+			}
+		}
+	})
+	t.Cleanup(func() {
+		for _, query := range []string{
+			`DELETE FROM conversation_activities WHERE conversation_id = ?`,
+			`DELETE FROM finding_retests WHERE conversation_id = ?`,
+		} {
+			task32MustExec(t, d, query, conversationID)
+		}
+		res, err := d.Exec(`DELETE FROM conversations WHERE id = ?`, conversationID)
+		if err != nil {
+			t.Errorf("cleanup conversation %d failed: %v", conversationID, err)
+			return
+		}
+		if rows, err := res.RowsAffected(); err != nil {
+			t.Errorf("cleanup conversation %d rows: %v", conversationID, err)
+		} else if rows > 1 {
+			t.Errorf("cleanup conversation %d removed %d rows, want at most 1 (primary key)", conversationID, rows)
+		}
+	})
+}
+
 // task32AssertNoFindingResidue 断言这几个 vulnclass 的 fixture 连子行一起清零。
 // 它注册在按主键 cleanup 之前（所以最后运行），是 M1 要求的终态残留核查。
+//
+// 局限（R4）：这里按 vulnclass 过滤必须 JOIN findings，父行一旦先被删掉，孤儿子行
+// 就统计不到。所以它只是"类别视图"，真正不依赖父行的孤儿核查由 task32TrackFinding /
+// task32TrackRetestConversation 按**记录下来的主键**完成，两者互补，缺一不可。
 func task32AssertNoFindingResidue(t *testing.T, d *DB, vulnClasses ...string) {
 	t.Helper()
 	if len(vulnClasses) == 0 {
@@ -1666,6 +1801,9 @@ func task32EvidenceSnapshot(sourceTrafficID string) TrafficEvidenceSnapshot {
 
 // task32BindEvidence 给漏洞绑一条流量证据快照，返回 snapshot id。绑定成功后立即登记
 // 按主键（snapshot id）的 cleanup，因此 seed 之后任何一步 Fatal 都不会漏清理。
+//
+// R4：清理之后还要按**记录下来的 snapshot 主键**核查终态 —— 它同样不 JOIN 父表，
+// 绑定行成为孤儿时照样能被逮住。
 func task32BindEvidence(t *testing.T, d *DB, findingID int64) string {
 	t.Helper()
 	snapshot := task32EvidenceSnapshot(fmt.Sprintf("p08-t32-%d", time.Now().UnixNano()))
@@ -1680,6 +1818,15 @@ func task32BindEvidence(t *testing.T, d *DB, findingID int64) string {
 	}); err != nil {
 		t.Fatalf("bind evidence: %v", err)
 	}
+	// 先注册 → 最后运行：核的是紧随其后的按主键清理真正跑完之后的库状态。
+	t.Cleanup(func() {
+		if left := task32Count(t, d, `SELECT COUNT(*) FROM finding_traffic_bindings WHERE snapshot_id = ?`, snapshot.ID); left != 0 {
+			t.Errorf("residual evidence bindings for snapshot %s = %d, want 0 (primary-key check)", snapshot.ID, left)
+		}
+		if left := task32Count(t, d, `SELECT COUNT(*) FROM traffic_evidence_snapshots WHERE id = ?`, snapshot.ID); left != 0 {
+			t.Errorf("residual traffic evidence snapshot %s = %d, want 0", snapshot.ID, left)
+		}
+	})
 	t.Cleanup(func() {
 		task32MustExec(t, d, `DELETE FROM finding_traffic_bindings WHERE snapshot_id = ?`, snapshot.ID)
 		task32MustExec(t, d, `DELETE FROM traffic_evidence_snapshots WHERE id = ?`, snapshot.ID)
@@ -1983,6 +2130,26 @@ func TestFindings_SnapshotValueKeepsJSONDocuments(t *testing.T) {
 	// JSON 载荷列里的脏数据（解不出来）原样带出，既不吞值也不改型。
 	if got := snapshotValue([]byte(`{broken`), true); got != "{broken" {
 		t.Errorf("unparsable json payload should stay verbatim, got %#v", got)
+	}
+	// RR5：合法**前缀** + 尾部脏数据。单次 Decode 只读第一个合法 JSON 值就宣告成功，
+	// 尾部被静默跳过，下一轮 Marshal 时脏尾巴凭空消失 —— 那不是"原样带出"，而是
+	// 悄悄改写脏数据（TJSON 物理上就是 MEDIUMTEXT，库端从不校验整段 JSON）。
+	// 判据：首个值之后必须立刻见到 io.EOF，否则整列按原文返回。
+	for _, dirty := range []string{
+		`[{"id":9007199254740993}] trailing-corruption`,
+		`{"asset_ids":[9007199254740993]}garbage`,
+		`[] {}`,
+		`{"a":1} {"b":2}`,
+	} {
+		if got := snapshotValue([]byte(dirty), true); got != dirty {
+			t.Errorf("json payload with trailing garbage must stay verbatim, got %#v, want %q", got, dirty)
+		}
+	}
+	// 合法的尾部空白不是脏数据：必须照常解回结构，不能因 RR5 的严格校验退化成套字符串。
+	for _, clean := range []string{`[1,2] `, " [1,2]\t", "\n[1,2]\r\n"} {
+		if got := snapshotValue([]byte(clean), true); fmt.Sprint(got) != "[1 2]" {
+			t.Errorf("trailing whitespace is not corruption: got %#v for %q", got, clean)
+		}
 	}
 	if got := snapshotValue(nil, true); got != nil {
 		t.Errorf("nil should stay nil, got %#v", got)
