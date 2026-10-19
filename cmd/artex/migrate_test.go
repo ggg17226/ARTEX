@@ -116,6 +116,20 @@ func TestMigrateCommand_UnknownArgFails(t *testing.T) {
 	}
 }
 
+func TestMigrateCommand_HelpWithConflictingActionsFails(t *testing.T) {
+	_, err := parseMigrateCommand([]string{"db-migrate", "--prepare", "--verify", "--help"})
+	if err == nil {
+		t.Fatalf("expected error for help combined with conflicting actions, got nil")
+	}
+}
+
+func TestMigrateCommand_HelpWithUnknownArgFails(t *testing.T) {
+	_, err := parseMigrateCommand([]string{"db-migrate", "--bogus", "--help"})
+	if err == nil {
+		t.Fatalf("expected error for help combined with unknown arg, got nil")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // parseMigrateCommand — 帮助
 // ---------------------------------------------------------------------------
@@ -129,17 +143,6 @@ func TestMigrateCommand_HelpFlags(t *testing.T) {
 		if cmd != migrateCmdHelp {
 			t.Fatalf("%s: got %q, want %q", flag, cmd, migrateCmdHelp)
 		}
-	}
-}
-
-// -h 优先于任何互斥冲突：帮助永远可获取。
-func TestMigrateCommand_HelpWinsOverConflict(t *testing.T) {
-	cmd, err := parseMigrateCommand([]string{"db-migrate", "--prepare", "--verify", "--help"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cmd != migrateCmdHelp {
-		t.Fatalf("got %q, want %q", cmd, migrateCmdHelp)
 	}
 }
 
@@ -162,22 +165,34 @@ func TestMigrateUsage_MentionsActionsAndDSN(t *testing.T) {
 // 分派判定 — 只有第一个位置参数是 db-migrate 才接管
 // ---------------------------------------------------------------------------
 
-func TestMigrateRequested(t *testing.T) {
-	for _, tc := range []struct {
-		args []string
-		want bool
-	}{
-		{[]string{"db-migrate", "--status"}, true},
-		{[]string{"db-migrate"}, true},
-		{[]string{"--addr", ":8787", "db-migrate", "--status"}, false}, // :8787 是 --addr 的值
-		{[]string{"--addr=:8787", "db-migrate", "--status"}, true},
-		{[]string{}, false},
-		{[]string{"--addr", ":8787"}, false},
-		{[]string{"db-migrate-x"}, false},
-		{[]string{"", "db-migrate"}, false},
+func TestDispatchMigrate_UnknownOrConflictingFlags(t *testing.T) {
+	// 任何前置 flag 或非 db-migrate 首参都不进入分派
+	for _, args := range [][]string{
+		{"--bogus", "db-migrate", "--help"},
+		{"--bogus", "db-migrate", "--prepare"},
+		{"--verify", "db-migrate", "--prepare"},
+		{"--addr", ":8787", "db-migrate", "--status"},
 	} {
-		if got := migrateRequested(tc.args); got != tc.want {
-			t.Fatalf("migrateRequested(%v) = %v, want %v", tc.args, got, tc.want)
+		_, handled := dispatchMigrate(args)
+		if handled {
+			t.Fatalf("dispatchMigrate(%v) should not be handled as db-migrate subcommand", args)
+		}
+	}
+
+	// 合法 db-migrate 开头但携带未知参数或冲突动作：必须 handled=true 且 code=1
+	for _, args := range [][]string{
+		{"db-migrate", "--bogus"},
+		{"db-migrate", "--prepare", "--verify"},
+		{"db-migrate", "--status", "--prepare"},
+		{"db-migrate", "--help", "--bogus"},
+		{"db-migrate", "--help", "--prepare"},
+	} {
+		code, handled := dispatchMigrate(args)
+		if !handled {
+			t.Fatalf("dispatchMigrate(%v) should be handled", args)
+		}
+		if code != 1 {
+			t.Fatalf("dispatchMigrate(%v) expected code 1, got %d", args, code)
 		}
 	}
 }

@@ -142,8 +142,7 @@ func firstPositionalIndex(args []string) int {
 // 只有第一个位置参数恰好等于 "db-migrate" 才算命中，
 // 从而不会把 "--addr :8787 db-migrate" 这类"flag 取值"误判成分派点。
 func migrateRequested(args []string) bool {
-	pos := firstPositionalIndex(args)
-	return pos >= 0 && args[pos] == migrateSubcommand
+	return len(args) > 0 && args[0] == migrateSubcommand
 }
 
 // parseMigrateCommand 解析 db-migrate 的动作参数，返回 "prepare" | "verify" |
@@ -153,17 +152,19 @@ func migrateRequested(args []string) bool {
 // 也允许只传 flag 片段（["--status"]）。动作只认 "--xxx" 写法：裸词 "prepare"
 // 一律按未知参数拒绝，避免任何误触发建表 DDL 的空间。
 //
-// 互斥性由"收集到的动作数量"判定：0 个 → 缺省错误（附动作清单），
-// ≥2 个 → 互斥错误（回显冲突项）。
+// 互斥性与严格校验：
+//   - 扫描全部后续参数，若存在任何未知参数（即使同时携带了 -h/--help），一律立即返回未知参数错误并拒绝；
+//   - 收集到的合法动作数量必须恰好为 1，0 个报错缺省，≥2 个报错互斥。
 func parseMigrateCommand(args []string) (string, error) {
 	var gotFlags, gotCmds []string
+	hasHelp := false
 	for i, arg := range args {
 		if i == 0 && arg == migrateSubcommand {
 			continue
 		}
 		if arg == "-h" || arg == "--help" || arg == "help" {
-			// 帮助永远可获取：即使同时给了冲突动作。
-			return migrateCmdHelp, nil
+			hasHelp = true
+			continue
 		}
 		cmd, ok := actionByFlag(arg)
 		if !ok {
@@ -172,6 +173,15 @@ func parseMigrateCommand(args []string) (string, error) {
 		gotFlags = append(gotFlags, arg)
 		gotCmds = append(gotCmds, cmd)
 	}
+
+	// 若包含帮助且没有其他未知/冲突参数
+	if hasHelp {
+		if len(gotCmds) > 0 {
+			return "", fmt.Errorf("帮助参数与具体操作动作互斥，只允许单独指定帮助或单独指定动作之一")
+		}
+		return migrateCmdHelp, nil
+	}
+
 	switch len(gotCmds) {
 	case 0:
 		return "", fmt.Errorf("必须指定且仅指定一个动作：%s", actionFlags())
@@ -193,12 +203,17 @@ func quoteArg(arg string) string {
 // dispatchMigrate 在 args（os.Args[1:]）上执行 db-migrate 分派。
 // handled=false 表示本次调用与 db-migrate 无关，调用方继续主服务启动流程；
 // handled=true 表示命令已终结，调用方必须以返回的退出码结束进程。
+//
+// 契约：
+//   - 仅当首个参数即为 "db-migrate" 时触发子命令分派；
+//   - 禁止静默丢弃任何前置参数：任何以 flag 开头或夹杂未知参数（例如 --bogus db-migrate）
+//     均不得进入子命令分支或静默忽略，必须交由标准主程序 flag.Parse 严格报错；
+//   - 若首个参数为 db-migrate，后续所有参数严格完整校验，拒绝任何未知参数与冲突动作。
 func dispatchMigrate(args []string) (code int, handled bool) {
-	pos := firstPositionalIndex(args)
-	if pos < 0 || args[pos] != migrateSubcommand {
+	if len(args) == 0 || args[0] != migrateSubcommand {
 		return 0, false
 	}
-	cmd, err := parseMigrateCommand(args[pos:])
+	cmd, err := parseMigrateCommand(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[%s] %v\n\n%s", migrateSubcommand, err, migrateUsage())
 		return 1, true
