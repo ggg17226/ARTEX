@@ -1,16 +1,454 @@
 package db
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/db/schema"
+	"github.com/Autumn-27/artex/db/tidb"
 )
+
+// =====================================================================
+// 归档恢复：真实 Catalog 写入白名单 + 全图冲突裁决（M25，闭环 F06）
+// =====================================================================
+
+// archiveImportSurrogates 声明"导入侧必须交给 TiDB 重新分配"的物理自增列。
+// 隐藏主键 row_id 由 Catalog（PKColumn == "row_id"）自动识别，这里补上两类：
+//   - side_question_requests.ordinal：逻辑身份是 id + session_key，ordinal 只是
+//     顺序号，冷包里的旧值绝不能写回线上库；
+//   - 叶子账目表的 id：归档之后线上自增早已越过这些号段，照抄回去只会在恢复时撞上
+//     别人的新行。核心图实体（exploration_nodes、findings、assets）不在其列——它们
+//     的 id 就是被引用方，必须原样保留。
+var archiveImportSurrogates = map[string]string{
+	"side_question_requests": "ordinal",
+	// 叶子账目行没有任何入向引用，冷包里的旧 id 一律不复用：归档之后线上自增早已
+	// 越过这些号段，照抄回去只会在恢复时撞上别人的行。核心图实体（exploration_nodes、
+	// findings、assets）不在其列——它们的 id 就是被引用方，必须原样保留。
+	"activity":         "id",
+	"task_constraints": "id",
+	"task_scope":       "id",
+	"llm_records":      "id",
+	"llm_usage":        "id",
+	"skill_usage":      "id",
+	"tool_usage":       "id",
+}
+
+// archiveImportReusePKWhenFree 是"旧物理键仍空闲就复用、被占用才重新分配"的表集合。
+// intercept_pending.id 会被审计查询与前端按号引用，因此优先保住原号；一旦撞上别人
+// 的新行就摘掉旧号交给 TiDB，绝不用 nextval 造号。
+var archiveImportReusePKWhenFree = map[string]bool{"intercept_pending": true}
+
+// archiveImportAllowList 是允许被恢复流程写回的表集合；不在集合内的表名一律拒绝，
+// 防止 manifest 被篡改后把任意表灌回线上库。
+var archiveImportAllowList = map[string]bool{
+	"assets":            true,
+	"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
+	"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
+	"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
+	"side_question_sessions": true, "side_question_requests": true,
+	"task_scope": true, "task_llm_profiles": true, "intercept_pending": true,
+}
+
+// archiveImportColumns 返回一张表的写入列白名单：真实 Catalog 列，去掉隐藏主键
+// row_id、导入侧代理键、STORED 生成列与 canonical identity 派生列。
+func archiveImportColumns(table string) ([]string, error) {
+	if !archiveImportAllowList[table] {
+		return nil, fmt.Errorf("archive restore table %q is not allowed", table)
+	}
+	item, ok := archiveCatalogTable(table)
+	if !ok {
+		return nil, fmt.Errorf("archive restore: table %q is absent from the real catalog", table)
+	}
+	hidden := archiveHiddenPhysicalKey(table)
+	surrogate := archiveImportSurrogates[table]
+	columns := make([]string, 0, len(item.Columns))
+	for _, column := range item.Columns {
+		switch {
+		case column.Generated != "":
+			continue
+		case hidden != "" && column.Name == hidden:
+			continue
+		case surrogate != "" && column.Name == surrogate:
+			continue
+		case archiveIsDerivedColumn(table, column.Name):
+			continue
+		}
+		columns = append(columns, column.Name)
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("archive restore: table %q has no writable columns", table)
+	}
+	return columns, nil
+}
+
+// archiveDecodeValue 把 manifest 里的一个 JSON 值还原成该 Catalog 列的绑定参数。
+// 冷包既可能来自新 TiDB 导出（JSON 列是嵌套对象、时间是 RFC3339），也可能来自
+// 历史 PG 冷包（bytea 的 \x 十六进制、jsonb 的嵌套对象），两侧都要能吃下。
+func archiveDecodeValue(column schema.Column, raw json.RawMessage) (any, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	switch column.Type {
+	case schema.TJSON:
+		if strings.HasPrefix(trimmed, `"`) {
+			var text string
+			if err := json.Unmarshal(raw, &text); err != nil {
+				return nil, err
+			}
+			return text, nil
+		}
+		// 嵌套对象/数组：TiDB 的 JSON 列其实是 MEDIUMTEXT，直接落 JSON 文本。
+		return trimmed, nil
+	case schema.TBool:
+		var boolean bool
+		if err := json.Unmarshal(raw, &boolean); err == nil {
+			if boolean {
+				return 1, nil
+			}
+			return 0, nil
+		}
+		var number json.Number
+		if err := json.Unmarshal(raw, &number); err == nil {
+			parsed, err := strconv.ParseFloat(number.String(), 64)
+			if err != nil {
+				return nil, err
+			}
+			if parsed != 0 {
+				return 1, nil
+			}
+			return 0, nil
+		}
+		var text string
+		if err := json.Unmarshal(raw, &text); err == nil {
+			if archiveBoolText(text) {
+				return 1, nil
+			}
+			return 0, nil
+		}
+		return nil, fmt.Errorf("cannot decode boolean from %s", trimmed)
+	case schema.TDate3:
+		at, ok := archiveJSONTimestamp(raw)
+		if ok {
+			return at.UTC(), nil
+		}
+		return nil, fmt.Errorf("cannot decode datetime from %s", trimmed)
+	case schema.TBinary, schema.TVarbinary, schema.TMediumBlob:
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return nil, err
+		}
+		if text == "" {
+			return []byte(nil), nil
+		}
+		// 历史 PG 冷包的 bytea 是 "\x<hex>"；新导出走 encoding/json 的 base64。
+		if strings.HasPrefix(text, `\x`) || strings.HasPrefix(text, `\X`) {
+			decoded, err := hex.DecodeString(text[2:])
+			if err != nil {
+				return nil, err
+			}
+			return decoded, nil
+		}
+		decoded, err := base64.StdEncoding.DecodeString(text)
+		if err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	case schema.TText, schema.TVarchar, schema.TChar:
+		if strings.HasPrefix(trimmed, `"`) {
+			var text string
+			if err := json.Unmarshal(raw, &text); err != nil {
+				return nil, err
+			}
+			return text, nil
+		}
+		// 数字/嵌套结构落进文本列：原样保留 JSON 文本（task_ids 一类数组列就是这个形状）。
+		return trimmed, nil
+	default:
+		if strings.HasPrefix(trimmed, `"`) {
+			var text string
+			if err := json.Unmarshal(raw, &text); err != nil {
+				return nil, err
+			}
+			if text == "" {
+				return nil, nil
+			}
+			return text, nil
+		}
+		if parsed, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			return parsed, nil
+		}
+		var number json.Number
+		if err := json.Unmarshal(raw, &number); err == nil {
+			if parsed, err := number.Int64(); err == nil {
+				return parsed, nil
+			}
+			parsed, err := number.Float64()
+			if err != nil {
+				return nil, err
+			}
+			return parsed, nil
+		}
+		return trimmed, nil
+	}
+}
+
+// archiveRowProjection 把一行 manifest 折成 (列名, 绑定值)，顺序即写入白名单顺序。
+// manifest 里没有的列一律缺席，交给列默认值（v3 老冷包的 memory/context_info 兜底
+// 就依赖这一点，不再需要 json_populate_recordset 时代的空对象补齐）。
+func archiveRowProjection(table string, row map[string]json.RawMessage) ([]string, []any, error) {
+	columns, err := archiveImportColumns(table)
+	if err != nil {
+		return nil, nil, err
+	}
+	names := make([]string, 0, len(columns))
+	values := make([]any, 0, len(columns))
+	for _, name := range columns {
+		raw, ok := row[name]
+		if !ok {
+			continue
+		}
+		column, err := archiveColumnOf(table, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		value, err := archiveDecodeValue(column, raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("archive restore %s.%s: %w", table, name, err)
+		}
+		names = append(names, name)
+		values = append(values, value)
+	}
+	return names, values, nil
+}
+
+// archiveIdentityWrite 是一次 hash 表写入：canonical identity 载荷、摘要与落库列对。
+type archiveIdentityWrite struct {
+	pkCol    string
+	identCol string
+	hashCol  string
+	identity []byte
+	hash     [32]byte
+}
+
+// columns 返回追加到写入白名单之后的两列（identity 载荷 + BINARY(32) 摘要）。
+func (w archiveIdentityWrite) columns() ([]string, []any) {
+	return []string{w.identCol, w.hashCol}, []any{w.identity, w.hash[:]}
+}
+
+func (w archiveIdentityWrite) validate(table string) error {
+	if w.identCol == "" || w.hashCol == "" || len(w.identity) == 0 {
+		return fmt.Errorf("archive restore %s: missing canonical identity", table)
+	}
+	return nil
+}
+
+// archiveInsertRowTx 按写入白名单落回一行。
+//   - identity 非空：追加重算后的 canonical identity/hash，并在**同一事务内**用
+//     schema.VerifyHashArbitration 做写后自洽仲裁（命中的物理 PK 必须是本行）；
+//   - explicitPK 非空：按调用方指定的物理 PK 插入（核心图实体必须保持原 PK）；
+//     为空则交给 TiDB 自增重新分配（隐藏 row_id 与 ordinal 永远走这条分支）。
+func archiveInsertRowTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	table string,
+	row map[string]json.RawMessage,
+	identity *archiveIdentityWrite,
+	explicitPK any,
+) (int64, error) {
+	columns, values, err := archiveRowProjection(table, row)
+	if err != nil {
+		return 0, err
+	}
+	if identity != nil {
+		if err := identity.validate(table); err != nil {
+			return 0, err
+		}
+		extraColumns, extraValues := identity.columns()
+		columns = append(columns, extraColumns...)
+		values = append(values, extraValues...)
+	}
+	if explicitPK != nil {
+		pkColumn, err := archivePrimaryKeyColumn(table)
+		if err != nil {
+			return 0, err
+		}
+		columns = append([]string{pkColumn}, columns...)
+		values = append([]any{explicitPK}, values...)
+	}
+	query := "INSERT INTO `" + table + "` (" + archiveQuoteColumns(columns) + ") VALUES (" +
+		questionPlaceholders(len(values)) + ")"
+	res, err := tx.ExecContext(ctx, query, values...)
+	if err != nil {
+		return 0, fmt.Errorf("archive restore %s: %w", table, err)
+	}
+	declared, _ := jsonInt64Value(explicitPK)
+	pk := declared
+	if pk <= 0 {
+		// 没有显式物理键（隐藏 row_id、ordinal 代理键、被占用的旧 id）时才向 TiDB 取号。
+		if pk, err = res.LastInsertId(); err != nil {
+			return 0, fmt.Errorf("archive restore %s last insert id: %w", table, err)
+		}
+	}
+	if identity != nil {
+		// 本行的物理写锁由刚完成的 INSERT 持有，满足 VerifyHashArbitration 的锁序前置；
+		// 命中到别的物理 PK 说明 hash 撞车或身份漂移，必须 fail-closed。
+		if err := archiveVerifyIdentityArbitration(ctx, tx, table, *identity, pk); err != nil {
+			return 0, err
+		}
+	}
+	return pk, nil
+}
+
+// archiveVerifyIdentityArbitration 在同一事务内回读 identity 并做精确字节比对。
+func archiveVerifyIdentityArbitration(ctx context.Context, tx *sql.Tx, table string, identity archiveIdentityWrite, pk int64) error {
+	found, err := schema.VerifyHashArbitration(ctx, tx, table, identity.pkCol, identity.identCol, identity.hashCol, identity.hash, identity.identity)
+	if err != nil {
+		return fmt.Errorf("archive restore %s hash arbitration: %w", table, err)
+	}
+	if pk > 0 && int64(found) != pk {
+		return fmt.Errorf("archive restore %s hash arbitration collided with row %d", table, found)
+	}
+	return nil
+}
+
+// archivePrimaryKeyColumn 返回该表在导入时可以显式指定的物理主键列（隐藏 row_id
+// 与代理键绝不允许显式指定）。
+func archivePrimaryKeyColumn(table string) (string, error) {
+	item, ok := archiveCatalogTable(table)
+	if !ok {
+		return "", fmt.Errorf("archive restore: table %q is absent from the real catalog", table)
+	}
+	if archiveHiddenPhysicalKey(table) != "" || archiveImportSurrogates[table] != "" {
+		return "", fmt.Errorf("archive restore %s: surrogate primary key must be reassigned by TiDB", table)
+	}
+	if item.PKColumn == "" {
+		return "", fmt.Errorf("archive restore: table %q has no primary key", table)
+	}
+	return item.PKColumn, nil
+}
+
+func jsonInt64Value(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, typed > 0
+	case int:
+		return int64(typed), typed > 0
+	default:
+		return 0, false
+	}
+}
+
+// archiveDecodeRawRows 把 manifest 里的一张表解成逐行 JSON（保留数字原文，避免
+// float64 把 BIGINT 的大 id 打回科学计数法）。
+func archiveDecodeRawRows(raw json.RawMessage) ([]map[string]json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// insertArchiveRows 按写入白名单逐行落回一张归档表（老入口，签名保留给既有测试）。
+func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
+	return insertArchiveTableRows(context.Background(), tx, table, raw)
+}
+
+// insertArchiveTableRows 落回一张表的全部行。重复键一律 fail-closed：核心图实体
+// （节点/边/锚点/漏洞）与纯关联行（task_asset_links）冲突都必须上抛，由调用方
+// 事务整体回滚，绝不"跳过一行继续"。
+func insertArchiveTableRows(ctx context.Context, tx *sql.Tx, table string, raw json.RawMessage) error {
+	rows, err := archiveDecodeRawRows(raw)
+	if err != nil {
+		return err
+	}
+	if _, err := archiveImportColumns(table); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		identity, err := archiveRowIdentity(table, row)
+		if err != nil {
+			return err
+		}
+		explicitPK, err := archivePrepareLeafPrimaryKey(ctx, tx, table, row)
+		if err != nil {
+			return err
+		}
+		if _, err := archiveInsertRowTx(ctx, tx, table, row, identity, explicitPK); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// archivePrepareLeafPrimaryKey 处理叶子行的旧物理键：仍空闲就复用（保住历史按号引用），
+// 已被占用就把它从行里摘掉，交给 TiDB 自增重新分配。
+func archivePrepareLeafPrimaryKey(ctx context.Context, tx *sql.Tx, table string, row map[string]json.RawMessage) (any, error) {
+	if !archiveImportReusePKWhenFree[table] {
+		return nil, nil
+	}
+	column, err := archivePrimaryKeyColumn(table)
+	if err != nil {
+		return nil, err
+	}
+	raw, present := row[column]
+	if !present {
+		return nil, nil
+	}
+	delete(row, column)
+	id, ok := jsonInt64(rawAny(raw))
+	if !ok || id <= 0 {
+		return nil, nil
+	}
+	var taken int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM `"+table+"` WHERE `"+column+"`=?", id).Scan(&taken); err != nil {
+		return nil, fmt.Errorf("archive restore %s primary key probe: %w", table, err)
+	}
+	if taken > 0 {
+		return nil, nil
+	}
+	return id, nil
+}
+
+// archiveRowIdentity 按表重算 canonical identity/hash。冷包里即便带着旧的
+// identity 派生列也一律不采信（导出白名单里已经没有它们），缺失语义列直接 fail-closed。
+func archiveRowIdentity(table string, row map[string]json.RawMessage) (*archiveIdentityWrite, error) {
+	switch table {
+	case "task_scope":
+		identity, err := archiveTaskScopeIdentity(row)
+		if err != nil {
+			return nil, err
+		}
+		return &identity, nil
+	case "side_question_requests":
+		identity, err := archiveSideRequestIdentity(row)
+		if err != nil {
+			return nil, err
+		}
+		return &identity, nil
+	case "assets":
+		// 资产有 8 个身份分支，必须由 restoreArchiveAssets 逐分支激活后写入。
+		return nil, errors.New("archive restore assets: assets must be restored through the asset branch engine")
+	}
+	return nil, nil
+}
+
+// =====================================================================
+// 冷包落库前的热库压缩
+// =====================================================================
 
 // CompleteTaskArchive performs the hot-store compaction only after the external
 // package has been fully written and checksummed. The task/exploration rows remain
@@ -44,7 +482,7 @@ func (d *DB) CompleteTaskArchive(
 	var state string
 	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
 FROM task_archives archive JOIN tasks task ON task.id=archive.task_id
-WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state); err != nil {
+WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err != nil {
 		return err
 	}
 	if state != Archiving || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
@@ -53,93 +491,219 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	var dependent int64
 	err = tx.QueryRow(`SELECT child.id FROM task_relations relation
 JOIN tasks child ON child.id=relation.task_id AND child.deleted_at IS NULL
-WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
+WHERE relation.source_task_id=? LIMIT 1 FOR UPDATE`, taskID).Scan(&dependent)
 	if err == nil {
 		return fmt.Errorf("%w: task %d", ErrTaskArchiveDependent, dependent)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	// Prevent task/asset ownership from changing while exclusivity is rechecked.
-	if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(taskID, 10)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(taskID, 10)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2`, strconv.FormatInt(taskID, 10), expID); err != nil {
-		return err
-	}
-	for _, table := range []string{"skill_usage", "tool_usage"} {
-		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE task_id=$1 OR exploration_id=$2`, taskID, expID); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(`DELETE FROM side_question_sessions WHERE task_id=$1`, taskID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM findings WHERE task_id=$1`, taskID); err != nil {
+	// 防止独占性判定期间资产归属被改写：原实现是一条 PG 表级
+	// `LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`，
+	// 会把整库归档之外的资产写入全部堵死。TiDB 上换成"按物理 PK 升序对本任务
+	// 真正涉及的资产行 FOR UPDATE"，锁粒度降到行级且加锁顺序全局一致。
+	if err := lockArchiveAssets(tx, taskID, expID, snapshot); err != nil {
 		return err
 	}
 	for _, statement := range []struct {
 		query string
 		args  []any
 	}{
-		{`DELETE FROM task_relations WHERE task_id=$1 OR source_task_id=$1`, []any{taskID}},
-		{`DELETE FROM task_asset_links WHERE task_id=$1`, []any{taskID}},
-		{`DELETE FROM task_llm_profiles WHERE task_id=$1`, []any{taskID}},
-		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
-		{`DELETE FROM task_constraints WHERE exploration_id=$1`, []any{expID}},
-		{`DELETE FROM activity WHERE exploration_id=$1`, []any{expID}},
-		{`DELETE FROM exploration_nodes WHERE exploration_id=$1`, []any{expID}},
+		{`DELETE FROM intercept_pending WHERE COALESCE(task_id,'')=?`, []any{strconv.FormatInt(taskID, 10)}},
+		{`DELETE FROM llm_records WHERE COALESCE(task_id,'')=?`, []any{strconv.FormatInt(taskID, 10)}},
+		{`DELETE FROM llm_usage WHERE COALESCE(task_id,'')=? OR exploration_id=?`, []any{strconv.FormatInt(taskID, 10), expID}},
+		{`DELETE FROM skill_usage WHERE task_id=? OR exploration_id=?`, []any{taskID, expID}},
+		{`DELETE FROM tool_usage WHERE task_id=? OR exploration_id=?`, []any{taskID, expID}},
+		{`DELETE FROM side_question_requests WHERE session_key IN (SELECT session_key FROM side_question_sessions WHERE task_id=?)`, []any{taskID}},
+		{`DELETE FROM side_question_sessions WHERE task_id=?`, []any{taskID}},
+		{`DELETE FROM findings WHERE task_id=?`, []any{taskID}},
+		{`DELETE FROM task_relations WHERE task_id=? OR source_task_id=?`, []any{taskID, taskID}},
+		{`DELETE FROM task_asset_links WHERE task_id=?`, []any{taskID}},
+		{`DELETE FROM task_llm_profiles WHERE task_id=?`, []any{taskID}},
+		{`DELETE FROM task_scope WHERE task_id=?`, []any{taskID}},
+		{`DELETE FROM task_constraints WHERE exploration_id=?`, []any{expID}},
+		{`DELETE FROM activity WHERE exploration_id=?`, []any{expID}},
+		{`DELETE FROM exploration_nodes WHERE exploration_id=?`, []any{expID}},
 	} {
 		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`UPDATE assets SET task_ids=array_remove(task_ids,$1) WHERE $1=ANY(task_ids)`, taskID); err != nil {
+	if err := stripTaskFromAssetOwnership(tx, taskID); err != nil {
 		return err
 	}
-	if len(snapshot.ExclusiveAssetIDs) > 0 {
-		if _, err := tx.Exec(`DELETE FROM assets asset
-WHERE asset.id=ANY($2::bigint[]) AND asset.company_id IS NULL
-AND NOT EXISTS (SELECT 1 FROM tasks task WHERE task.id<>$1 AND task.deleted_at IS NULL AND task.id=ANY(asset.task_ids))
-AND NOT EXISTS (
- SELECT 1 FROM exploration_anchors anchor JOIN exploration_nodes node ON node.id=anchor.node_id
- JOIN tasks task ON task.exploration_id=node.exploration_id
- WHERE anchor.asset_id=asset.id AND task.id<>$1 AND task.deleted_at IS NULL
-)`, taskID, snapshot.ExclusiveAssetIDs); err != nil {
-			return err
-		}
+	if err := deleteExclusiveArchiveAssets(tx, taskID, snapshot.ExclusiveAssetIDs); err != nil {
+		return err
 	}
-	if _, err := tx.Exec(`UPDATE explorations SET description='',goal='',status='open' WHERE id=$1`, expID); err != nil {
+	if _, err := tx.Exec(`UPDATE explorations SET description='',goal='',status='open' WHERE id=?`, expID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE tasks SET
  name='',category_id=NULL,description='',goal='',paused=true,queued=false,queued_at=NULL,queue_mode='',
  llm_profile_id=NULL,active_llm_profile_id=NULL,llm_chain_revision=llm_chain_revision+1,
  company_id=NULL,parent_ref=NULL,timeout_seconds=0,coverage_enabled=true,pinned_at=NULL,
- first_run_at=NULL,deadline_at=NULL,archived_at=now(),deleted_at=now()
-WHERE id=$1`, taskID); err != nil {
+ first_run_at=NULL,deadline_at=NULL,archived_at=NOW(3),deleted_at=NOW(3)
+WHERE id=?`, taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE task_archives SET
-	 state=$2,phase='ready',progress=100,error='',archive_path=$3,sha256=$4,
-	 original_size=$5,compressed_size=$6,data_counts=$7,aggregate_stats=$8,
-	 format_version=$9,archived_at=now(),warnings='[]'
-WHERE id=$1`, archiveID, ArchiveReady, archivePath, sha256, originalSize, compressedSize,
-		string(countsRaw), string(statsRaw), snapshot.FormatVersion); err != nil {
+ state=?,phase='ready',progress=100,error='',archive_path=?,sha256=?,
+ original_size=?,compressed_size=?,data_counts=?,aggregate_stats=?,
+ format_version=?,archived_at=NOW(3),warnings='[]'
+WHERE id=?`, ArchiveReady, archivePath, sha256, originalSize, compressedSize,
+		string(countsRaw), string(statsRaw), snapshot.FormatVersion, archiveID); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// RestoreTaskArchive restores PostgreSQL rows from a verified manifest. It is
-// idempotent for accounting/traffic retry scenarios and returns non-fatal
-// warnings for global objects that intentionally are not recreated.
+// lockArchiveAssets 按物理 PK 升序给本任务涉及的资产行加悲观行锁，替代原 PG 的
+// 全表 SHARE ROW EXCLUSIVE 锁。三批加锁顺序固定（task_ids 归属 → 探索锚点 → 冷包
+// 快照自带 id），批内 ORDER BY id，避免与并发资产写入交叉死锁。
+func lockArchiveAssets(tx *sql.Tx, taskID, expID int64, snapshot *TaskArchiveSnapshot) error {
+	if err := drainLockedRows(tx, `SELECT id FROM assets WHERE `+
+		assetJSONContains("COALESCE(task_ids, '[]')", "?")+` ORDER BY id FOR UPDATE`, taskID); err != nil {
+		return err
+	}
+	if err := drainLockedRows(tx, `SELECT asset.id FROM assets asset
+JOIN exploration_anchors anchor ON anchor.asset_id = asset.id
+JOIN exploration_nodes node ON node.id = anchor.node_id
+WHERE node.exploration_id = ? ORDER BY asset.id FOR UPDATE`, expID); err != nil {
+		return err
+	}
+	for _, batch := range archiveIDBatches(snapshot.ExclusiveAssetIDs) {
+		args := make([]any, 0, len(batch))
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		if err := drainLockedRows(tx, `SELECT id FROM assets WHERE id IN (`+
+			questionPlaceholders(len(batch))+`) ORDER BY id FOR UPDATE`, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// drainLockedRows 执行一条 FOR UPDATE 查询并把结果读干净——行锁只有在结果集被完整
+// 消费后才真正落到这些行上。
+func drainLockedRows(tx *sql.Tx, query string, args ...any) error {
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	var ignored int64
+	for rows.Next() {
+		if err := rows.Scan(&ignored); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	return rows.Close()
+}
+
+// stripTaskFromAssetOwnership 把任务 id 从 assets.task_ids（JSON 数组文本）里摘掉。
+// 原 array_remove(task_ids,$1) 是标量函数，新库的 JSON 数组只能在 Go 侧改写。
+func stripTaskFromAssetOwnership(tx *sql.Tx, taskID int64) error {
+	rows, err := tx.Query(`SELECT id, COALESCE(task_ids,'[]') FROM assets WHERE `+
+		assetJSONContains("COALESCE(task_ids, '[]')", "?")+` ORDER BY id FOR UPDATE`, taskID)
+	if err != nil {
+		return err
+	}
+	type ownership struct {
+		id      int64
+		taskIDs string
+	}
+	var pending []ownership
+	for rows.Next() {
+		var item ownership
+		if err := rows.Scan(&item.id, &item.taskIDs); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range pending {
+		var ids []int64
+		if err := json.Unmarshal([]byte(item.taskIDs), &ids); err != nil {
+			ids = nil
+		}
+		kept := make([]int64, 0, len(ids))
+		for _, id := range ids {
+			if id != taskID {
+				kept = append(kept, id)
+			}
+		}
+		encoded, err := json.Marshal(kept)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE assets SET task_ids=? WHERE id=?`, string(encoded), item.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteExclusiveArchiveAssets 删除只属于本任务的资产。归属判定在 DELETE 里重算
+// 一遍（与冷包导出时的独占判据一致），避免导出与压缩之间的窗口里被别的任务认领后
+// 仍然被误删。
+func deleteExclusiveArchiveAssets(tx *sql.Tx, taskID int64, exclusiveIDs []int64) error {
+	for _, batch := range archiveIDBatches(exclusiveIDs) {
+		// 绑定顺序必须与 SQL 里占位符出现的顺序一致：先 IN 列表，再两个 task.id<>?。
+		args := make([]any, 0, len(batch)+2)
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		args = append(args, taskID, taskID)
+		query := `DELETE FROM assets WHERE id IN (` + questionPlaceholders(len(batch)) + `) AND company_id IS NULL
+AND NOT EXISTS (SELECT 1 FROM tasks task WHERE task.id<>? AND task.deleted_at IS NULL AND
+  JSON_CONTAINS(COALESCE(assets.task_ids, '[]'), CAST(task.id AS JSON)))
+AND NOT EXISTS (
+ SELECT 1 FROM exploration_anchors anchor JOIN exploration_nodes node ON node.id=anchor.node_id
+ JOIN tasks task ON task.exploration_id=node.exploration_id
+ WHERE anchor.asset_id=assets.id AND task.id<>? AND task.deleted_at IS NULL
+)`
+		if _, err := tx.Exec(query, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// archiveIDBatches 把 id 列表切成有界批次，避免 IN (...) 的占位符无限膨胀。
+func archiveIDBatches(ids []int64) [][]int64 {
+	const size = 200
+	batches := [][]int64{}
+	for start := 0; start < len(ids); start += size {
+		end := start + size
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batches = append(batches, ids[start:end])
+	}
+	return batches
+}
+
+// RestoreTaskArchive restores TiDB rows from a verified manifest. It returns
+// non-fatal warnings for global objects that intentionally are not recreated.
+//
+// 全图冲突裁决（M25）：
+//   - 核心图实体（task / exploration / exploration_nodes / exploration_edges /
+//     exploration_anchors / findings）冲突时**报错拒绝**，整个事务回滚；
+//   - 纯关联表与叶子行不重取冷包里的物理 row_id，由 TiDB 重新分配；
+//   - 带 hash 的实体（assets / task_scope / side_question_requests）在事务内重算
+//     canonical identity 并执行 VerifyHashArbitration 验证。
 func (d *DB) RestoreTaskArchive(archiveID int64, snapshot *TaskArchiveSnapshot, remainingTimeoutSeconds int64) ([]string, error) {
 	return d.restoreTaskArchive(archiveID, snapshot, remainingTimeoutSeconds, nil)
 }
@@ -176,6 +740,7 @@ func (d *DB) restoreTaskArchive(
 	if streamedLLMRecords != "" && llmRecords == nil {
 		return nil, fmt.Errorf("%w: streamed LLM records are missing", ErrTaskArchiveFormatMismatch)
 	}
+	ctx := context.Background()
 	tx, err := d.Begin()
 	if err != nil {
 		return nil, err
@@ -188,14 +753,21 @@ func (d *DB) restoreTaskArchive(
 	var state string
 	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
 FROM task_archives archive JOIN tasks task ON task.id=archive.task_id
-WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state); err != nil {
+WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err != nil {
 		return nil, err
 	}
 	if state != Restoring || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
 		return nil, fmt.Errorf("%w: restore snapshot identity/state mismatch", ErrTaskArchiveState)
 	}
 	warnings := []string{}
-	assetMap, assetWarnings, err := restoreArchiveAssets(tx, taskID, snapshot.Tables["assets"])
+
+	// 全图冲突裁决：核心图实体一旦被别的行占用，立即 fail-closed，整个事务回滚，
+	// 绝不出现"恢复了半张图"的中间态。
+	if err := assertCoreGraphConflictFree(ctx, tx, expID, snapshot); err != nil {
+		return nil, err
+	}
+
+	assetMap, assetWarnings, err := restoreArchiveAssets(ctx, tx, taskID, snapshot.Tables["assets"])
 	if err != nil {
 		return nil, err
 	}
@@ -243,32 +815,35 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	// Insert graph rows in foreign-key order. The archived stub has no graph rows,
 	// so an ID conflict signals external corruption and must stop the restore.
 	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
-		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
+		if err := insertArchiveTableRows(ctx, tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
-	if warning, err := restoreTaskRelations(tx, taskID, remappedTables["task_relations"]); err != nil {
+	if warning, err := restoreTaskRelations(ctx, tx, taskID, remappedTables["task_relations"]); err != nil {
 		return nil, err
 	} else {
 		warnings = append(warnings, warning...)
 	}
-	for _, table := range []string{"side_question_sessions", "side_question_requests"} {
-		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
-			return nil, fmt.Errorf("restore %s: %w", table, err)
-		}
-	}
-	if warning, err := restoreTaskScopes(tx, remappedTables["task_scope"]); err != nil {
+	if warning, err := restoreSideQuestionSessions(ctx, tx, remappedTables["side_question_sessions"]); err != nil {
 		return nil, err
 	} else {
 		warnings = append(warnings, warning...)
 	}
-	if warning, err := restoreTaskLLMProfiles(tx, remappedTables["task_llm_profiles"]); err != nil {
+	if err := restoreSideQuestionRequests(ctx, tx, remappedTables["side_question_requests"]); err != nil {
+		return nil, fmt.Errorf("restore side_question_requests: %w", err)
+	}
+	if warning, err := restoreTaskScopes(ctx, tx, remappedTables["task_scope"]); err != nil {
+		return nil, err
+	} else {
+		warnings = append(warnings, warning...)
+	}
+	if warning, err := restoreTaskLLMProfiles(ctx, tx, taskID, remappedTables["task_llm_profiles"]); err != nil {
 		return nil, err
 	} else {
 		warnings = append(warnings, warning...)
 	}
 	for _, table := range []string{"task_asset_links", "findings"} {
-		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
+		if err := insertArchiveTableRows(ctx, tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
@@ -276,74 +851,332 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
 	if streamedLLMRecords != "" {
-		count, err := insertArchiveJSONSequenceRows(tx, "llm_records", llmRecords)
+		count, err := insertArchiveJSONSequenceRows(ctx, tx, "llm_records", llmRecords)
 		if err != nil {
 			return nil, fmt.Errorf("restore llm_records: %w", err)
 		}
 		if expected := snapshot.DataCounts["llm_records"]; count != expected {
 			return nil, fmt.Errorf("restore llm_records: row count %d does not match manifest %d", count, expected)
 		}
-	} else if err := insertArchiveRows(tx, "llm_records", remappedTables["llm_records"]); err != nil {
+	} else if err := insertArchiveTableRows(ctx, tx, "llm_records", remappedTables["llm_records"]); err != nil {
 		return nil, fmt.Errorf("restore llm_records: %w", err)
 	}
 	for _, table := range []string{"llm_usage", "skill_usage", "tool_usage"} {
-		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
+		if err := insertArchiveTableRows(ctx, tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
-	if err := restoreInterceptRows(tx, remappedTables["intercept_pending"]); err != nil {
+	if err := restoreInterceptRowsCtx(ctx, tx, remappedTables["intercept_pending"]); err != nil {
 		return nil, err
 	}
 	warningsRaw, _ := json.Marshal(warnings)
-	if _, err := tx.Exec(`UPDATE task_archives SET warnings=$2,phase='database_restored',progress=85,error='' WHERE id=$1`, archiveID, string(warningsRaw)); err != nil {
+	if _, err := tx.Exec(`UPDATE task_archives SET warnings=?,phase='database_restored',progress=85,error='' WHERE id=?`, string(warningsRaw), archiveID); err != nil {
 		return nil, err
 	}
 	return warnings, tx.Commit()
 }
 
-func restoreExplorationStub(tx *sql.Tx, raw json.RawMessage, expID int64) error {
-	_, err := tx.Exec(`UPDATE explorations current SET
- description=archived.description,goal=archived.goal,status=archived.status,
- created_at=archived.created_at,updated_at=archived.updated_at
-FROM json_populate_record(NULL::explorations,$2::json) archived
-WHERE current.id=$1 AND archived.id=$1`, expID, string(firstArchiveRow(raw)))
-	return err
+// archiveEdgeKey / archiveAnchorKey 是核心图关联的逻辑身份，用于冷包与热库的元组比对。
+type archiveEdgeKey struct {
+	src int64
+	dst int64
+	rel string
 }
 
-func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) error {
-	raw, err := json.Marshal(row)
+type archiveAnchorKey struct {
+	nodeID  int64
+	assetID int64
+}
+
+// assertCoreGraphConflictFree 在写入之前对冷包里的核心图实体做一次 current read
+// 行锁探测（按物理 PK 升序）：
+//   - findings / exploration_nodes：主键即逻辑身份，命中即说明身份已被占用；
+//   - exploration_edges / exploration_anchors：隐藏 row_id 由 TiDB 重新分配，冲突
+//     只会落在唯一键上，因此锁住同探索/同节点集合的既有边与锚点做元组比对。
+//
+// 核心图实体的身份一旦被占用就无法靠重新分配物理键绕开，因此任一命中都直接返回
+// 错误，由调用方的事务整体回滚（fail-closed，M25）。
+func assertCoreGraphConflictFree(ctx context.Context, tx *sql.Tx, expID int64, snapshot *TaskArchiveSnapshot) error {
+	probes := []struct {
+		table string
+		rows  json.RawMessage
+	}{
+		{"exploration_nodes", snapshot.Tables["exploration_nodes"]},
+		{"findings", snapshot.Tables["findings"]},
+	}
+	for _, probe := range probes {
+		ids, err := archivedRowPrimaryKeys(probe.rows)
+		if err != nil {
+			return fmt.Errorf("restore %s identity: %w", probe.table, err)
+		}
+		for _, batch := range archiveIDBatches(ids) {
+			args := make([]any, 0, len(batch))
+			for _, id := range batch {
+				args = append(args, id)
+			}
+			// 按物理 PK 升序加行锁：与并发写入者保持同一锁序，探测本身不会死锁。
+			var occupied int64
+			err := tx.QueryRowContext(ctx, `SELECT id FROM `+probe.table+` WHERE id IN (`+
+				questionPlaceholders(len(batch))+`) ORDER BY id LIMIT 1 FOR UPDATE`, args...).Scan(&occupied)
+			if err == nil {
+				return fmt.Errorf("restore %s: core graph entity %d already exists, restore refused", probe.table, occupied)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("restore probe %s: %w", probe.table, err)
+			}
+		}
+	}
+	if err := assertArchiveEdgesFree(ctx, tx, expID, snapshot.Tables["exploration_edges"]); err != nil {
+		return err
+	}
+	return assertArchiveAnchorsFree(ctx, tx, snapshot.Tables["exploration_anchors"])
+}
+
+// assertArchiveEdgesFree 锁住同探索的既有边（隐藏 row_id 会被 TiDB 重新分配，冲突
+// 只会落在 uq_exploration_edges 唯一键上），再与冷包逐条比对逻辑身份。
+func assertArchiveEdgesFree(ctx context.Context, tx *sql.Tx, expID int64, raw json.RawMessage) error {
+	archived, err := archiveDecodeRawRows(raw)
+	if err != nil {
+		return fmt.Errorf("restore exploration_edges identity: %w", err)
+	}
+	if len(archived) == 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT src_id,dst_id,rel FROM exploration_edges
+WHERE exploration_id=? ORDER BY src_id,dst_id,rel FOR UPDATE`, expID)
+	if err != nil {
+		return fmt.Errorf("restore probe exploration_edges: %w", err)
+	}
+	occupied := map[archiveEdgeKey]bool{}
+	for rows.Next() {
+		var key archiveEdgeKey
+		if err := rows.Scan(&key.src, &key.dst, &key.rel); err != nil {
+			rows.Close()
+			return err
+		}
+		occupied[key] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, row := range archived {
+		key := archiveEdgeKey{}
+		key.src, _ = jsonInt64(rawAny(row["src_id"]))
+		key.dst, _ = jsonInt64(rawAny(row["dst_id"]))
+		key.rel, _ = rawText(row["rel"])
+		if occupied[key] {
+			return fmt.Errorf("restore exploration_edges: edge %d-%s->%d already exists, restore refused", key.src, key.rel, key.dst)
+		}
+	}
+	return nil
+}
+
+// assertArchiveAnchorsFree 与边同理，比对 uq_exploration_anchors(node_id,asset_id)。
+func assertArchiveAnchorsFree(ctx context.Context, tx *sql.Tx, raw json.RawMessage) error {
+	archived, err := archiveDecodeRawRows(raw)
+	if err != nil {
+		return fmt.Errorf("restore exploration_anchors identity: %w", err)
+	}
+	if len(archived) == 0 {
+		return nil
+	}
+	nodes := make([]int64, 0, len(archived))
+	for _, row := range archived {
+		if nodeID, ok := jsonInt64(rawAny(row["node_id"])); ok {
+			nodes = append(nodes, nodeID)
+		}
+	}
+	for _, batch := range archiveIDBatches(nodes) {
+		args := make([]any, 0, len(batch))
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT node_id,asset_id FROM exploration_anchors
+WHERE node_id IN (`+questionPlaceholders(len(batch))+`) ORDER BY node_id,asset_id FOR UPDATE`, args...)
+		if err != nil {
+			return fmt.Errorf("restore probe exploration_anchors: %w", err)
+		}
+		occupied := map[archiveAnchorKey]bool{}
+		for rows.Next() {
+			var key archiveAnchorKey
+			if err := rows.Scan(&key.nodeID, &key.assetID); err != nil {
+				rows.Close()
+				return err
+			}
+			occupied[key] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, row := range archived {
+			key := archiveAnchorKey{}
+			key.nodeID, _ = jsonInt64(rawAny(row["node_id"]))
+			key.assetID, _ = jsonInt64(rawAny(row["asset_id"]))
+			if occupied[key] {
+				return fmt.Errorf("restore exploration_anchors: anchor (%d,%d) already exists, restore refused", key.nodeID, key.assetID)
+			}
+		}
+	}
+	return nil
+}
+
+// archivedRowPrimaryKeys 取出冷包某张表里显式声明的物理主键（升序、去重）。
+func archivedRowPrimaryKeys(raw json.RawMessage) ([]int64, error) {
+	rows, err := archiveDecodeRawRows(raw)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[int64]bool{}
+	ids := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		id, ok := jsonInt64(rawAny(row["id"]))
+		if !ok || id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	// 升序：探测语句按物理 PK 顺序加行锁，与并发写入者共用同一把锁序。
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+func restoreExplorationStub(tx *sql.Tx, raw json.RawMessage, expID int64) error {
+	// 原实现把整行 JSON 灌进 json_populate_record 做 UPDATE ... FROM；TiDB 没有
+	// 这个集合函数，改成显式列绑定。
+	rows, err := archiveDecodeRawRows(raw)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(`UPDATE tasks current SET
- name=archived.name,category_id=archived.category_id,description=archived.description,goal=archived.goal,
- status=archived.status,paused=archived.paused,queued=false,queued_at=NULL,queue_mode='',
- llm_profile_id=archived.llm_profile_id,active_llm_profile_id=archived.active_llm_profile_id,
- llm_chain_revision=archived.llm_chain_revision,company_id=archived.company_id,parent_ref=archived.parent_ref,
- timeout_seconds=archived.timeout_seconds,plan_heartbeat_seconds=archived.plan_heartbeat_seconds,
- coverage_enabled=archived.coverage_enabled,pinned_at=archived.pinned_at,first_run_at=archived.first_run_at,
- deadline_at=CASE WHEN archived.paused AND $3>0 THEN now()+make_interval(secs=>$3::double precision)
-                  ELSE archived.deadline_at END,
- deleted_at=NULL,archived_at=NULL,completed_at=archived.completed_at,
- created_at=archived.created_at,updated_at=archived.updated_at
-FROM json_populate_record(NULL::tasks,$2::json) archived
-WHERE current.id=$1 AND archived.id=$1`, taskID, string(raw), remaining)
+	if len(rows) == 0 {
+		return errors.New("restore explorations: expected one row")
+	}
+	row := rows[0]
+	description, err := archiveStubValue("explorations", "description", row)
+	if err != nil {
+		return err
+	}
+	goal, err := archiveStubValue("explorations", "goal", row)
+	if err != nil {
+		return err
+	}
+	status, err := archiveStubValue("explorations", "status", row)
+	if err != nil {
+		return err
+	}
+	createdAt, err := archiveStubValue("explorations", "created_at", row)
+	if err != nil {
+		return err
+	}
+	updatedAt, err := archiveStubValue("explorations", "updated_at", row)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE explorations SET description=?, goal=?, status=?, created_at=?, updated_at=? WHERE id=?`,
+		description, goal, status, createdAt, updatedAt, expID)
 	return err
 }
 
-func firstArchiveRow(raw json.RawMessage) json.RawMessage {
-	var rows []json.RawMessage
-	if json.Unmarshal(raw, &rows) != nil || len(rows) == 0 {
-		return json.RawMessage("{}")
+// archiveStubValue 从 manifest 行里取某一列的绑定值（列不存在时给 NULL）。
+func archiveStubValue(table, column string, row map[string]json.RawMessage) (any, error) {
+	raw, ok := row[column]
+	if !ok {
+		return nil, nil
 	}
-	return rows[0]
+	definition, err := archiveColumnOf(table, column)
+	if err != nil {
+		return nil, err
+	}
+	return archiveDecodeValue(definition, raw)
+}
+
+// restoreTaskStub 把冷包里的任务行写回归档 stub。
+// 原实现是 `UPDATE ... FROM json_populate_record(NULL::tasks, $2::json)`，TiDB 没有
+// 集合值函数，这里按列显式绑定；paused 且仍有剩余时长时用
+// `DATE_ADD(NOW(3), INTERVAL ? SECOND)` 续期（原 make_interval(secs=>)）。
+func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) error {
+	raw, err := archiveEncodeTaskRow(row)
+	if err != nil {
+		return err
+	}
+	set := []string{"queued=false", "queued_at=NULL", "queue_mode=''", "deleted_at=NULL", "archived_at=NULL"}
+	args := []any{}
+	for _, column := range []string{
+		"name", "category_id", "description", "goal", "status", "paused",
+		"llm_profile_id", "active_llm_profile_id", "llm_chain_revision", "company_id",
+		"parent_ref", "timeout_seconds", "plan_heartbeat_seconds", "coverage_enabled",
+		"pinned_at", "first_run_at", "completed_at", "created_at", "updated_at",
+	} {
+		value, err := archiveStubValue("tasks", column, raw)
+		if err != nil {
+			return err
+		}
+		set = append(set, column+"=?")
+		args = append(args, value)
+	}
+	paused, _ := archiveStubValue("tasks", "paused", raw)
+	if remaining > 0 && archiveIsTrue(paused) {
+		set = append(set, "deadline_at=DATE_ADD(NOW(3), INTERVAL ? SECOND)")
+		args = append(args, remaining)
+	} else {
+		deadline, err := archiveStubValue("tasks", "deadline_at", raw)
+		if err != nil {
+			return err
+		}
+		set = append(set, "deadline_at=?")
+		args = append(args, deadline)
+	}
+	_, err = tx.Exec("UPDATE tasks SET "+strings.Join(set, ",")+" WHERE id=?", append(args, taskID)...)
+	return err
+}
+
+// archiveIsTrue 判定已绑定值的真值（archiveDecodeValue 把布尔写成 0/1）。
+func archiveIsTrue(value any) bool {
+	switch typed := value.(type) {
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case bool:
+		return typed
+	case []byte:
+		return len(typed) > 0 && typed[0] != '0'
+	case string:
+		return archiveBoolText(typed)
+	default:
+		return false
+	}
+}
+
+// archiveEncodeTaskRow 把 decodeArchiveRows 的 map[string]any 重新编成逐列 JSON，
+// 让 stub 更新与普通行写入共用同一套 Catalog 驱动的类型还原。
+func archiveEncodeTaskRow(row map[string]any) (map[string]json.RawMessage, error) {
+	out := make(map[string]json.RawMessage, len(row))
+	for key, value := range row {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = encoded
+	}
+	return out, nil
 }
 
 func decodeArchiveRows(raw json.RawMessage) ([]map[string]any, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	// UseNumber：BIGINT 的 id 一旦被解成 float64，超过 2^53 的资产/节点 id 就会被
+	// 悄悄改写，重映射出来的关联会指向不存在的行。
 	decoder.UseNumber()
 	var rows []map[string]any
 	if err := decoder.Decode(&rows); err != nil {
@@ -356,59 +1189,15 @@ func rowExists(tx *sql.Tx, table string, id int64) bool {
 	if table != "task_categories" && table != "llm_profiles" && table != "companies" && table != "tasks" && table != "assets" {
 		return false
 	}
-	var exists bool
-	_ = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM `+table+` WHERE id=$1)`, id).Scan(&exists)
-	return exists
+	var exists int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE id=?`, id).Scan(&exists)
+	return exists > 0
 }
 
-func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
-	// json_populate_recordset inserts NULL for absent columns, bypassing SQL
-	// defaults. Preserve compatibility with v3 archives predating side memory.
-	if (table == "side_question_sessions" || table == "side_question_requests") && len(raw) > 0 {
-		var rows []map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &rows); err != nil {
-			return err
-		}
-		field := "memory"
-		if table == "side_question_requests" {
-			field = "context_info"
-		}
-		for _, row := range rows {
-			if len(row[field]) == 0 || string(row[field]) == "null" {
-				row[field] = json.RawMessage(`{}`)
-			}
-		}
-		var err error
-		raw, err = json.Marshal(rows)
-		if err != nil {
-			return err
-		}
-	}
-	allowed := map[string]bool{
-		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
-		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
-		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
-		"side_question_sessions": true, "side_question_requests": true,
-	}
-	if !allowed[table] {
-		return fmt.Errorf("archive restore table %q is not allowed", table)
-	}
-	if rawRowCount(raw) == 0 {
-		return nil
-	}
-	_, err := tx.Exec(`INSERT INTO `+table+` SELECT * FROM json_populate_recordset(NULL::`+table+`,$1::json)`, string(raw))
-	return err
-}
-
-func insertArchiveJSONSequenceRows(tx *sql.Tx, table string, reader io.Reader) (int64, error) {
+func insertArchiveJSONSequenceRows(ctx context.Context, tx *sql.Tx, table string, reader io.Reader) (int64, error) {
 	if table != "llm_records" {
 		return 0, fmt.Errorf("archive streamed restore table %q is not allowed", table)
 	}
-	statement, err := tx.Prepare(`INSERT INTO llm_records SELECT * FROM json_populate_record(NULL::llm_records,$1::json)`)
-	if err != nil {
-		return 0, err
-	}
-	defer statement.Close()
 	decoder := json.NewDecoder(reader)
 	var count int64
 	for {
@@ -418,11 +1207,18 @@ func insertArchiveJSONSequenceRows(tx *sql.Tx, table string, reader io.Reader) (
 		} else if err != nil {
 			return 0, err
 		}
-		trimmed := bytes.TrimSpace(raw)
-		if len(trimmed) == 0 || trimmed[0] != '{' {
+		trimmed := []byte(strings.TrimSpace(string(raw)))
+		if len(trimmed) == 0 {
+			continue
+		}
+		if trimmed[0] != '{' {
 			return 0, errors.New("streamed archive row must be a JSON object")
 		}
-		if _, err := statement.Exec(string(trimmed)); err != nil {
+		var row map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &row); err != nil {
+			return 0, err
+		}
+		if _, err := archiveInsertRowTx(ctx, tx, table, row, nil, nil); err != nil {
 			return 0, err
 		}
 		count++
@@ -430,60 +1226,187 @@ func insertArchiveJSONSequenceRows(tx *sql.Tx, table string, reader io.Reader) (
 	return count, nil
 }
 
-func restoreArchiveAssets(tx *sql.Tx, taskID int64, raw json.RawMessage) (map[int64]int64, []string, error) {
-	rows, err := decodeArchiveRows(raw)
+// restoreArchiveAssets 逐行还原资产：自然键命中就复用现有行，否则重算 canonical
+// identity/hash 后插入，物理 id 由 TiDB 重新分配（冷包里的旧 id 绝不复用）。
+func restoreArchiveAssets(ctx context.Context, tx *sql.Tx, taskID int64, raw json.RawMessage) (map[int64]int64, []string, error) {
+	rows, err := archiveDecodeRawRows(raw)
 	if err != nil {
 		return nil, nil, err
 	}
+	// 按冷包里的旧 id 升序处理：所有资产行的加锁顺序全局一致，杜绝交叉死锁。
+	sortArchiveRowsByLegacyID(rows)
 	mapping := make(map[int64]int64, len(rows))
 	warnings := []string{}
 	for _, row := range rows {
-		oldID, ok := jsonInt64(row["id"])
+		oldID, ok := jsonInt64(rawAny(row["id"]))
 		if !ok || oldID <= 0 {
 			return nil, nil, errors.New("archived asset has invalid id")
 		}
-		if companyID, ok := jsonInt64(row["company_id"]); ok && companyID > 0 && !rowExists(tx, "companies", companyID) {
-			row["company_id"] = nil
-			row["company_source"] = "explicit"
+		if companyID, ok := jsonInt64(rawAny(row["company_id"])); ok && companyID > 0 && !rowExists(tx, "companies", companyID) {
+			row["company_id"] = json.RawMessage("null")
+			row["company_source"] = json.RawMessage(`"explicit"`)
 			warnings = append(warnings, fmt.Sprintf("资产 %d 的企业 %d 已删除，已恢复为未归属", oldID, companyID))
 		}
-		if existing, found, err := findArchiveAssetNaturalID(tx, row); err != nil {
+		identity, err := archiveAssetIdentity(row)
+		if err != nil {
 			return nil, nil, err
-		} else if found {
+		}
+		existing, found, err := findArchiveAssetNaturalID(tx, row)
+		if err != nil {
+			return nil, nil, err
+		}
+		if found {
+			// 自然键命中：先锁住这一行的物理 PK，再在同一事务内做 hash 仲裁，
+			// 确认冷包里的语义列与线上 canonical identity 字节级一致（M25）。
+			if _, err := tx.Exec(`SELECT id FROM assets WHERE id=? FOR UPDATE`, existing); err != nil {
+				return nil, nil, err
+			}
+			if err := archiveVerifyIdentityArbitration(ctx, tx, "assets", identity, existing); err != nil {
+				return nil, nil, err
+			}
 			mapping[oldID] = existing
-			if _, err := tx.Exec(`UPDATE assets SET task_ids=CASE WHEN $1=ANY(task_ids) THEN task_ids ELSE array_append(task_ids,$1) END WHERE id=$2`, taskID, existing); err != nil {
+			if err := appendTaskToAssetOwnership(tx, existing, taskID); err != nil {
 				return nil, nil, err
 			}
 			continue
 		}
-		candidate := oldID
+		// 冷包里的物理 id 只有在无人占用时才复用（历史 finding/task 引用会指向它），
+		// 一旦被占用就彻底交给 TiDB 自增重新分配，绝不 nextval 造号。
+		var explicitPK any
 		if rowExists(tx, "assets", oldID) {
-			if err := tx.QueryRow(`SELECT nextval(pg_get_serial_sequence('assets','id'))`).Scan(&candidate); err != nil {
+			warnings = append(warnings, fmt.Sprintf("资产 ID %d 已被占用，恢复为 TiDB 重新分配的自增 ID", oldID))
+		} else {
+			explicitPK = oldID
+		}
+		row["task_ids"] = mergeJSONTaskIDRaw(row["task_ids"], taskID)
+		// id 一律从行里摘掉：显式复用走 explicitPK，否则由 TiDB 自增重新分配。
+		delete(row, "id")
+		pk, err := archiveInsertRowTx(ctx, tx, "assets", row, &identity, explicitPK)
+		if err != nil {
+			if !tidb.IsDuplicateKey(err) {
 				return nil, nil, err
 			}
-			row["id"] = candidate
-			warnings = append(warnings, fmt.Sprintf("资产 ID %d 已被占用，恢复为 %d", oldID, candidate))
-		}
-		row["task_ids"] = mergeJSONTaskID(row["task_ids"], taskID)
-		assetRaw, _ := json.Marshal(row)
-		res, err := tx.Exec(`INSERT INTO assets SELECT * FROM json_populate_record(NULL::assets,$1::json) ON CONFLICT DO NOTHING`, string(assetRaw))
-		if err != nil {
-			return nil, nil, err
-		}
-		inserted, _ := res.RowsAffected()
-		if inserted == 0 {
+			// 唯一 hash 冲突：并发窗口里已经有人插入了同一自然键，回读并复用。
 			existing, found, findErr := findArchiveAssetNaturalID(tx, row)
 			if findErr != nil || !found {
 				return nil, nil, errors.Join(findErr, fmt.Errorf("could not restore asset %d", oldID))
 			}
-			candidate = existing
-			if _, err := tx.Exec(`UPDATE assets SET task_ids=CASE WHEN $1=ANY(task_ids) THEN task_ids ELSE array_append(task_ids,$1) END WHERE id=$2`, taskID, existing); err != nil {
+			if _, err := tx.Exec(`SELECT id FROM assets WHERE id=? FOR UPDATE`, existing); err != nil {
 				return nil, nil, err
 			}
+			if err := archiveVerifyIdentityArbitration(ctx, tx, "assets", identity, existing); err != nil {
+				return nil, nil, err
+			}
+			if err := appendTaskToAssetOwnership(tx, existing, taskID); err != nil {
+				return nil, nil, err
+			}
+			pk = existing
 		}
-		mapping[oldID] = candidate
+		mapping[oldID] = pk
 	}
 	return mapping, warnings, nil
+}
+
+// archiveAssetIdentity 按资产类型激活对应的 canonical identity 分支。
+func archiveAssetIdentity(row map[string]json.RawMessage) (archiveIdentityWrite, error) {
+	typeName, _ := rawText(row["type"])
+	text := func(key string) string {
+		value, _ := rawText(row[key])
+		return value
+	}
+	var branch assetBranch
+	switch typeName {
+	case "root_domain":
+		branch = newAssetBranch("assets_root_domain", schema.AssetsRootDomainIdentity(text("domain")))
+	case "ip":
+		branch = newAssetBranch("assets_ip", schema.AssetsIPIdentity(text("ip")))
+	case "subdomain":
+		branch = newAssetBranch("assets_subdomain", schema.AssetsSubdomainIdentity(text("domain"), text("record_type")))
+	case "app":
+		if bundle := text("bundle_id"); bundle != "" {
+			branch = newAssetBranch("assets_app_bundle", schema.AssetsAppBundleIdentity(bundle))
+		} else {
+			branch = newAssetBranch("assets_app_name", schema.AssetsAppNameIdentity(text("app_name")))
+		}
+	case "service":
+		if text("service_type") == "http" {
+			branch = newAssetBranch("assets_service_http", schema.AssetsServiceHTTPIdentity(text("url")))
+		} else {
+			portValue, portNull := archiveUint64OrNull(row["port"])
+			nameValue, nameNull := archiveStringOrNil(row["service_name"])
+			branch = newAssetBranch("assets_service_other", schema.AssetsServiceOtherIdentity(
+				text("domain"), text("ip"), portValue, portNull, nameValue, nameNull))
+		}
+	case "endpoint":
+		branch = newAssetBranch("assets_endpoint", schema.AssetsEndpointIdentity(text("url"), text("method")))
+	default:
+		return archiveIdentityWrite{}, fmt.Errorf("unsupported archived asset type %q", typeName)
+	}
+	return archiveIdentityWrite{
+		pkCol:    "id",
+		identCol: branch.identCol,
+		hashCol:  branch.hashCol,
+		identity: branch.identity,
+		hash:     branch.hash,
+	}, nil
+}
+
+func archiveUint64OrNull(raw json.RawMessage) (uint64, bool) {
+	value, ok := jsonInt64(rawAny(raw))
+	if !ok || string(raw) == "null" || len(raw) == 0 {
+		return 0, true
+	}
+	if value < 0 {
+		return 0, true
+	}
+	return uint64(value), false
+}
+
+func archiveStringOrNil(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", true
+	}
+	text, ok := rawText(raw)
+	if !ok {
+		return "", true
+	}
+	return text, false
+}
+
+// appendTaskToAssetOwnership 把任务补进 assets.task_ids（JSON 数组文本），并同步
+// 依赖该归属的读取视图。原实现是 array_append + $1=ANY 的 SQL 端并集。
+func appendTaskToAssetOwnership(tx *sql.Tx, assetID, taskID int64) error {
+	var raw string
+	if err := tx.QueryRow(`SELECT COALESCE(task_ids,'[]') FROM assets WHERE id=? FOR UPDATE`, assetID).Scan(&raw); err != nil {
+		return err
+	}
+	var ids []int64
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		ids = nil
+	}
+	for _, id := range ids {
+		if id == taskID {
+			return nil
+		}
+	}
+	ids = append(ids, taskID)
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE assets SET task_ids=? WHERE id=?`, string(encoded), assetID)
+	return err
+}
+
+// mergeJSONTaskIDRaw 把任务 id 合入 manifest 行里的 task_ids（保持 JSON 原文形状）。
+func mergeJSONTaskIDRaw(raw json.RawMessage, taskID int64) json.RawMessage {
+	value := rawAny(raw)
+	ids := mergeJSONTaskID(value, taskID)
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		return json.RawMessage(`[]`)
+	}
+	return encoded
 }
 
 func mergeJSONTaskID(value any, taskID int64) []int64 {
@@ -503,36 +1426,36 @@ func mergeJSONTaskID(value any, taskID int64) []int64 {
 	return out
 }
 
-func findArchiveAssetNaturalID(tx *sql.Tx, row map[string]any) (int64, bool, error) {
-	typeName, _ := row["type"].(string)
+func findArchiveAssetNaturalID(tx *sql.Tx, row map[string]json.RawMessage) (int64, bool, error) {
+	typeName, _ := rawText(row["type"])
 	stringValue := func(key string) string {
-		value, _ := row[key].(string)
+		value, _ := rawText(row[key])
 		return value
 	}
 	var query string
 	var args []any
 	switch typeName {
 	case "root_domain":
-		query, args = `SELECT id FROM assets WHERE type='root_domain' AND domain=$1`, []any{stringValue("domain")}
+		query, args = `SELECT id FROM assets WHERE type='root_domain' AND domain=?`, []any{stringValue("domain")}
 	case "ip":
-		query, args = `SELECT id FROM assets WHERE type='ip' AND ip=$1`, []any{stringValue("ip")}
+		query, args = `SELECT id FROM assets WHERE type='ip' AND ip=?`, []any{stringValue("ip")}
 	case "subdomain":
-		query, args = `SELECT id FROM assets WHERE type='subdomain' AND domain=$1 AND COALESCE(record_type,'')=$2`, []any{stringValue("domain"), stringValue("record_type")}
+		query, args = `SELECT id FROM assets WHERE type='subdomain' AND domain=? AND COALESCE(record_type,'')=?`, []any{stringValue("domain"), stringValue("record_type")}
 	case "app":
 		if bundle := stringValue("bundle_id"); bundle != "" {
-			query, args = `SELECT id FROM assets WHERE type='app' AND bundle_id=$1`, []any{bundle}
+			query, args = `SELECT id FROM assets WHERE type='app' AND bundle_id=?`, []any{bundle}
 		} else {
-			query, args = `SELECT id FROM assets WHERE type='app' AND bundle_id IS NULL AND app_name=$1`, []any{stringValue("app_name")}
+			query, args = `SELECT id FROM assets WHERE type='app' AND bundle_id IS NULL AND app_name=?`, []any{stringValue("app_name")}
 		}
 	case "service":
 		if stringValue("service_type") == "http" {
-			query, args = `SELECT id FROM assets WHERE type='service' AND service_type='http' AND url=$1`, []any{stringValue("url")}
+			query, args = `SELECT id FROM assets WHERE type='service' AND service_type='http' AND url=?`, []any{stringValue("url")}
 		} else {
-			port, _ := jsonInt64(row["port"])
-			query, args = `SELECT id FROM assets WHERE type='service' AND service_type='other' AND COALESCE(domain,'')=$1 AND COALESCE(ip,'')=$2 AND port=$3 AND service_name=$4`, []any{stringValue("domain"), stringValue("ip"), port, stringValue("service_name")}
+			port, _ := jsonInt64(rawAny(row["port"]))
+			query, args = `SELECT id FROM assets WHERE type='service' AND service_type='other' AND COALESCE(domain,'')=? AND COALESCE(ip,'')=? AND port=? AND service_name=?`, []any{stringValue("domain"), stringValue("ip"), port, stringValue("service_name")}
 		}
 	case "endpoint":
-		query, args = `SELECT id FROM assets WHERE type='endpoint' AND url=$1 AND method=$2`, []any{stringValue("url"), stringValue("method")}
+		query, args = `SELECT id FROM assets WHERE type='endpoint' AND url=? AND method=?`, []any{stringValue("url"), stringValue("method")}
 	default:
 		return 0, false, fmt.Errorf("unsupported archived asset type %q", typeName)
 	}
@@ -594,71 +1517,165 @@ func remapArchiveAssetReferences(tables map[string]json.RawMessage, mapping map[
 	return out, nil
 }
 
-func restoreTaskRelations(tx *sql.Tx, taskID int64, raw json.RawMessage) ([]string, error) {
-	rows, err := decodeArchiveRows(raw)
+// restoreTaskRelations 还原继承关系：来源任务必须仍然存活（合法归档 stub 之外一律
+// 跳过并给出告警），已存在的关系不重复插入。原 ON CONFLICT DO NOTHING 改成显式判重，
+// 避免 INSERT IGNORE 顺手把非空/截断错误一起咽掉。
+func restoreTaskRelations(ctx context.Context, tx *sql.Tx, taskID int64, raw json.RawMessage) ([]string, error) {
+	rows, err := archiveDecodeRawRows(raw)
 	if err != nil {
 		return nil, err
 	}
 	warnings := []string{}
 	for _, row := range rows {
-		sourceID, ok := jsonInt64(row["source_task_id"])
+		sourceID, ok := jsonInt64(rawAny(row["source_task_id"]))
 		if !ok || !liveTaskExists(tx, sourceID) {
 			warnings = append(warnings, fmt.Sprintf("来源任务 %d 不可用，继承关系已跳过", sourceID))
 			continue
 		}
-		created, _ := row["created_at"].(string)
-		if _, err := tx.Exec(`INSERT INTO task_relations(task_id,source_task_id,created_at) VALUES($1,$2,COALESCE($3::timestamptz,now())) ON CONFLICT DO NOTHING`, taskID, sourceID, nilIfEmptyString(created)); err != nil {
+		var existing int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM task_relations WHERE task_id=? AND source_task_id=?`, taskID, sourceID).Scan(&existing); err != nil {
+			return nil, err
+		}
+		if existing > 0 {
+			continue
+		}
+		created, _ := archiveJSONTimestamp(row["created_at"])
+		if _, err := tx.ExecContext(ctx, `INSERT INTO task_relations(task_id,source_task_id,created_at) VALUES(?,?,COALESCE(?,NOW(3)))`,
+			taskID, sourceID, archiveTimeArg(created)); err != nil {
+			return nil, fmt.Errorf("restore task_relations: %w", err)
+		}
+	}
+	return warnings, nil
+}
+
+// restoreSideQuestionSessions 还原旁路会话。物理 row_id 交给 TiDB 重新分配；
+// memory/context_info 一类缺列由列默认值兜底，不再手工塞 {}。
+func restoreSideQuestionSessions(ctx context.Context, tx *sql.Tx, raw json.RawMessage) ([]string, error) {
+	if err := insertArchiveTableRows(ctx, tx, "side_question_sessions", raw); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// restoreSideQuestionRequests 还原旁路请求：生成列 running_session_key 绝不写入，
+// ordinal 由 TiDB 重新分配，identity/identity_hash 按 canonical 口径重算并在事务内仲裁。
+func restoreSideQuestionRequests(ctx context.Context, tx *sql.Tx, raw json.RawMessage) error {
+	return insertArchiveTableRows(ctx, tx, "side_question_requests", raw)
+}
+
+func archiveSideRequestIdentity(row map[string]json.RawMessage) (archiveIdentityWrite, error) {
+	sessionKey, ok := rawText(row["session_key"])
+	if !ok {
+		return archiveIdentityWrite{}, errors.New("archived side question request has no session_key")
+	}
+	clientID, ok := rawText(row["client_id"])
+	if !ok {
+		return archiveIdentityWrite{}, errors.New("archived side question request has no client_id")
+	}
+	generation, _ := jsonInt64(rawAny(row["generation"]))
+	payload := schema.SideQuestionRequestsIdentity(sessionKey, uint64(generation), clientID)
+	sum := schema.CanonicalHash(payload)
+	return archiveIdentityWrite{
+		pkCol:    "ordinal",
+		identCol: "identity",
+		hashCol:  "identity_hash",
+		identity: payload,
+		hash:     sum,
+	}, nil
+}
+
+// restoreTaskScopes 还原任务范围。identity/identity_hash 是 NOT NULL 的 canonical
+// 派生列，必须按当前行的语义列重算（冷包里的旧值不采信）。
+func restoreTaskScopes(ctx context.Context, tx *sql.Tx, raw json.RawMessage) ([]string, error) {
+	rows, err := archiveDecodeRawRows(raw)
+	if err != nil {
+		return nil, err
+	}
+	warnings := []string{}
+	for _, row := range rows {
+		if companyID, ok := jsonInt64(rawAny(row["company_id"])); ok && companyID > 0 && !rowExists(tx, "companies", companyID) {
+			warnings = append(warnings, fmt.Sprintf("企业 %d 已删除，关联范围已跳过", companyID))
+			continue
+		}
+		identity, err := archiveTaskScopeIdentity(row)
+		if err != nil {
+			return nil, err
+		}
+		var existing int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM task_scope WHERE identity_hash=?`, identity.hash[:]).Scan(&existing); err != nil {
+			return nil, err
+		}
+		if existing > 0 {
+			continue
+		}
+		if _, err := archiveInsertRowTx(ctx, tx, "task_scope", row, &identity, nil); err != nil {
+			if tidb.IsDuplicateKey(err) {
+				continue
+			}
 			return nil, err
 		}
 	}
 	return warnings, nil
 }
 
-func restoreTaskScopes(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
-	rows, err := decodeArchiveRows(raw)
-	if err != nil {
-		return nil, err
+func archiveTaskScopeIdentity(row map[string]json.RawMessage) (archiveIdentityWrite, error) {
+	taskID, ok := jsonInt64(rawAny(row["task_id"]))
+	if !ok {
+		return archiveIdentityWrite{}, errors.New("archived task scope has no task_id")
 	}
-	warnings := []string{}
-	kept := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		if companyID, ok := jsonInt64(row["company_id"]); ok && companyID > 0 && !rowExists(tx, "companies", companyID) {
-			warnings = append(warnings, fmt.Sprintf("企业 %d 已删除，关联范围已跳过", companyID))
-			continue
-		}
-		kept = append(kept, row)
+	kind, ok := rawText(row["kind"])
+	if !ok {
+		return archiveIdentityWrite{}, errors.New("archived task scope has no kind")
 	}
-	if len(kept) == 0 {
-		return warnings, nil
+	domain, _ := rawText(row["domain"])
+	network, _ := rawText(row["net"])
+	value, _ := rawText(row["value"])
+	companyID, _ := jsonInt64(rawAny(row["company_id"]))
+	if companyID < 0 {
+		companyID = 0
 	}
-	encoded, _ := json.Marshal(kept)
-	_, err = tx.Exec(`INSERT INTO task_scope SELECT * FROM json_populate_recordset(NULL::task_scope,$1::json) ON CONFLICT DO NOTHING`, string(encoded))
-	return warnings, err
+	payload := schema.TaskScopeIdentity(uint64(taskID), kind, domain, network, uint64(companyID), value)
+	sum := schema.CanonicalHash(payload)
+	return archiveIdentityWrite{
+		pkCol:    "id",
+		identCol: "identity",
+		hashCol:  "identity_hash",
+		identity: payload,
+		hash:     sum,
+	}, nil
 }
 
-func restoreTaskLLMProfiles(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
-	rows, err := decodeArchiveRows(raw)
+// restoreTaskLLMProfiles 还原配置链。profile 已被删除时跳过并告警；(task_id,
+// profile_id) 已存在时不重复插入；position 按链内顺序重新编号。
+func restoreTaskLLMProfiles(ctx context.Context, tx *sql.Tx, taskID int64, raw json.RawMessage) ([]string, error) {
+	rows, err := archiveDecodeRawRows(raw)
 	if err != nil {
 		return nil, err
 	}
 	warnings := []string{}
 	position := 0
 	for _, row := range rows {
-		profileID, ok := jsonInt64(row["profile_id"])
+		profileID, ok := jsonInt64(rawAny(row["profile_id"]))
 		if !ok || !rowExists(tx, "llm_profiles", profileID) {
 			warnings = append(warnings, fmt.Sprintf("LLM 配置 %d 已删除，配置链项已跳过", profileID))
 			continue
 		}
-		taskID, _ := jsonInt64(row["task_id"])
-		status, _ := row["status"].(string)
-		lastError, _ := row["last_error"].(string)
-		exhaustedAt, _ := row["exhausted_at"].(string)
-		createdAt, _ := row["created_at"].(string)
-		updatedAt, _ := row["updated_at"].(string)
-		if _, err := tx.Exec(`INSERT INTO task_llm_profiles(task_id,profile_id,position,status,last_error,exhausted_at,created_at,updated_at)
-	VALUES($1,$2,$3,$4,NULLIF($5,''),$6::timestamptz,COALESCE($7::timestamptz,now()),COALESCE($8::timestamptz,now()))
-	ON CONFLICT DO NOTHING`, taskID, profileID, position, status, lastError,
-			nilIfEmptyString(exhaustedAt), nilIfEmptyString(createdAt), nilIfEmptyString(updatedAt)); err != nil {
+		var existing int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM task_llm_profiles WHERE task_id=? AND profile_id=?`, taskID, profileID).Scan(&existing); err != nil {
+			return nil, err
+		}
+		if existing > 0 {
+			continue
+		}
+		row["task_id"] = mustJSON(taskID)
+		row["position"] = mustJSON(position)
+		if status, _ := rawText(row["status"]); status == "" {
+			row["status"] = json.RawMessage(`"ready"`)
+		}
+		if last, ok := rawText(row["last_error"]); ok && last == "" {
+			row["last_error"] = json.RawMessage("null")
+		}
+		if _, err := archiveInsertRowTx(ctx, tx, "task_llm_profiles", row, nil, nil); err != nil {
 			return nil, err
 		}
 		position++
@@ -666,62 +1683,63 @@ func restoreTaskLLMProfiles(tx *sql.Tx, raw json.RawMessage) ([]string, error) {
 	return warnings, nil
 }
 
+// restoreInterceptRows 还原审批记录（老入口，签名保留给既有测试）。
 func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) error {
-	rows, err := decodeArchiveRows(raw)
+	return restoreInterceptRowsCtx(context.Background(), tx, raw)
+}
+
+func restoreInterceptRowsCtx(ctx context.Context, tx *sql.Tx, raw json.RawMessage) error {
+	rows, err := archiveDecodeRawRows(raw)
 	if err != nil {
 		return err
 	}
 	for _, row := range rows {
 		// Archives predating approval snapshots lack this NOT NULL column.
-		if source, _ := row["decision_source"].(string); source == "" {
+		if source, _ := rawText(row["decision_source"]); source == "" {
 			source = "unknown"
-			if row["rule_id"] != nil {
+			if _, present := row["rule_id"]; present && string(row["rule_id"]) != "null" {
 				source = "rule"
-			} else if reason, _ := row["reason"].(string); strings.HasPrefix(reason, "[模型]") {
+			} else if reason, _ := rawText(row["reason"]); strings.HasPrefix(reason, "[模型]") {
 				source = "model"
 			}
-			row["decision_source"] = source
+			row["decision_source"] = mustJSON(source)
 		}
-		if status, _ := row["status"].(string); status == "pending" {
-			row["status"] = "timeout"
-			row["reason"] = "任务归档期间审批已超时"
-			row["decided_at"] = time.Now().UTC()
-			if audit, ok := row["audit"].(map[string]any); ok {
-				audit["effective_action"] = "deny"
-				audit["decision_reason"] = "任务归档期间审批已超时"
-				audit["execution_status"] = "not_executed"
+		status, _ := rawText(row["status"])
+		if status == "pending" {
+			row["status"] = mustJSON("timeout")
+			row["reason"] = mustJSON("任务归档期间审批已超时")
+			row["decided_at"] = mustJSON(time.Now().UTC().Format(time.RFC3339Nano))
+			if audit, ok := rawObject(row["audit"]); ok {
+				audit["effective_action"] = mustJSON("deny")
+				audit["decision_reason"] = mustJSON("任务归档期间审批已超时")
+				audit["execution_status"] = mustJSON("not_executed")
+				row["audit"] = mustJSON(audit)
 			}
-		} else if audit, ok := row["audit"].(map[string]any); ok && audit["execution_status"] == "awaiting_result" {
-			// An archived run cannot resume its former result callback.
-			audit["execution_status"] = "unknown"
+		} else if audit, ok := rawObject(row["audit"]); ok {
+			if exec, _ := rawText(audit["execution_status"]); exec == "awaiting_result" {
+				// An archived run cannot resume its former result callback.
+				audit["execution_status"] = mustJSON("unknown")
+				row["audit"] = mustJSON(audit)
+			}
+		}
+		if _, err := archiveInsertRowTx(ctx, tx, "intercept_pending", row, nil, nil); err != nil {
+			return err
 		}
 	}
-	if len(rows) == 0 {
-		return nil
-	}
-	encoded, _ := json.Marshal(rows)
-	_, err = tx.Exec(`INSERT INTO intercept_pending SELECT * FROM json_populate_recordset(NULL::intercept_pending,$1::json)`, string(encoded))
-	return err
+	return nil
 }
 
 func liveTaskExists(tx *sql.Tx, id int64) bool {
-	var exists bool
-	_ = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND deleted_at IS NULL)`, id).Scan(&exists)
-	return exists
-}
-
-func nilIfEmptyString(value string) any {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	return value
+	var exists int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM tasks WHERE id=? AND deleted_at IS NULL`, id).Scan(&exists)
+	return exists > 0
 }
 
 // CompleteTaskArchiveRestore removes compact metadata after every external
 // component has been verified and the package has been consumed.
 func (d *DB) CompleteTaskArchiveRestore(archiveID int64) error {
-	res, err := d.Exec(`DELETE FROM task_archives archive USING tasks task
-WHERE archive.id=$1 AND archive.task_id=task.id AND task.deleted_at IS NULL AND task.archived_at IS NULL`, archiveID)
+	res, err := d.Exec(`DELETE archive FROM task_archives archive JOIN tasks task ON archive.task_id=task.id
+WHERE archive.id=? AND task.deleted_at IS NULL AND task.archived_at IS NULL`, archiveID)
 	if err != nil {
 		return err
 	}
@@ -747,24 +1765,24 @@ func (d *DB) DeleteTaskArchiveStub(archiveID int64) error {
 	var state string
 	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
 FROM task_archives archive JOIN tasks task ON task.id=archive.task_id
-WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state); err != nil {
+WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err != nil {
 		return err
 	}
 	if state != Deleting {
 		return ErrTaskArchiveState
 	}
 	var dependent int64
-	err = tx.QueryRow(`SELECT task_id FROM task_archives WHERE id<>$1 AND $2=ANY(source_task_ids) LIMIT 1`, archiveID, taskID).Scan(&dependent)
+	err = tx.QueryRow(`SELECT task_id FROM task_archives WHERE id<>? AND JSON_CONTAINS(COALESCE(source_task_ids,'[]'), CAST(? AS JSON)) LIMIT 1`, archiveID, taskID).Scan(&dependent)
 	if err == nil {
 		return fmt.Errorf("%w: task %d", ErrTaskArchiveDeleteBlocked, dependent)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1 AND archived_at IS NOT NULL`, taskID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=? AND archived_at IS NOT NULL`, taskID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=$1`, expID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=?`, expID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -790,4 +1808,90 @@ WHERE task.archived_at IS NOT NULL`)
 		out = append(out, raw)
 	}
 	return out, rows.Err()
+}
+
+// =====================================================================
+// manifest 行的通用小工具
+// =====================================================================
+
+// rawAny 把 json.RawMessage 还原成 any（供 jsonInt64 一类既有取值器复用）。
+func rawAny(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil
+	}
+	return value
+}
+
+// archiveJSONTimestamp 解出按列存放的 manifest 时间值（先取 JSON 文本再交给
+// 既有的 archiveTimestamp 解析器，兼容 RFC3339 与 SQL 字面量两种冷包形态）。
+func archiveJSONTimestamp(raw json.RawMessage) (time.Time, bool) {
+	text, ok := rawText(raw)
+	if !ok {
+		return time.Time{}, false
+	}
+	return archiveTimestamp(text)
+}
+
+// rawText 解出一个 JSON 字符串列；非字符串（历史冷包的数字）转成其原文。
+func rawText(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(trimmed, `"`) {
+		var text string
+		if err := json.Unmarshal([]byte(trimmed), &text); err != nil {
+			return "", false
+		}
+		return text, true
+	}
+	return trimmed, true
+}
+
+// rawObject 解出一个 JSON 对象列。
+func rawObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func mustJSON(value any) json.RawMessage {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return encoded
+}
+
+// archiveTimeArg 把零值时间转成 NULL，交给列默认值。
+func archiveTimeArg(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC()
+}
+
+// sortArchiveRowsByLegacyID 按冷包里的旧 id 升序稳定处理资产行。
+func sortArchiveRowsByLegacyID(rows []map[string]json.RawMessage) {
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0; j-- {
+			left, _ := jsonInt64(rawAny(rows[j-1]["id"]))
+			right, _ := jsonInt64(rawAny(rows[j]["id"]))
+			if left <= right {
+				break
+			}
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+		}
+	}
 }
