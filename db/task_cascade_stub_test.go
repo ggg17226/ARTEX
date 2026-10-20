@@ -109,16 +109,7 @@ func (s *stubState) statements(pred func(stubCall) bool) []stubCall {
 func (s *stubState) answer(query string, args []driver.Value, conn int64) [][]driver.Value {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	upper := strings.ToUpper(query)
-	if strings.Contains(upper, "FOR UPDATE") {
-		// 实体锁读：`SELECT <pk> FROM <t> WHERE <pk> = ? FOR UPDATE` → 回显主键。
-		if len(args) > 0 {
-			return [][]driver.Value{{args[len(args)-1]}}
-		}
-		// 全局门禁行：`SELECT name FROM locks WHERE name = 'business_relations' FOR UPDATE`
-		// 名字直接内联、无绑定参数 → 命中即可，值不参与判定。
-		return [][]driver.Value{{""}}
-	}
+	// 优先匹配自定义 rules（允许用例按需覆盖特定 FOR UPDATE 查询的结果列）
 	for i := range s.rules {
 		if s.rules[i].match != nil && s.rules[i].match(query) {
 			hits := 1
@@ -129,6 +120,16 @@ func (s *stubState) answer(query string, args []driver.Value, conn int64) [][]dr
 			}
 			return s.rules[i].rows(hits, conn)
 		}
+	}
+	upper := strings.ToUpper(query)
+	if strings.Contains(upper, "FOR UPDATE") {
+		// 实体锁读：`SELECT <pk> FROM <t> WHERE <pk> = ? FOR UPDATE` → 回显主键。
+		if len(args) > 0 {
+			return [][]driver.Value{{args[len(args)-1]}}
+		}
+		// 全局门禁行：`SELECT name FROM locks WHERE name = 'business_relations' FOR UPDATE`
+		// 名字直接内联、无绑定参数 → 命中即可，值不参与判定。
+		return [][]driver.Value{{""}}
 	}
 	return nil
 }

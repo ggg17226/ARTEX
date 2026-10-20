@@ -1863,19 +1863,8 @@ func restoreTaskScopes(ctx context.Context, tx *sql.Tx, raw json.RawMessage) ([]
 			continue
 		}
 		if _, err := archiveInsertRowTx(ctx, tx, "task_scope", row, &identity, nil); err != nil {
-			if !tidb.IsDuplicateKey(err) {
-				return nil, err
-			}
-			// 唯一键撞车：并发窗口里已经有人写下了同一摘要。走与命中分支完全相同的
-			// 协议——锁候选 PK、仲裁完整 identity；只有字节级一致才允许跳过。
-			duplicate, arbErr := resolveArchivedHashIdentity(ctx, tx, "task_scope", &identity)
-			if arbErr != nil {
-				return nil, arbErr
-			}
-			if !duplicate {
-				return nil, fmt.Errorf("archive restore task_scope: duplicate key on a hash that no longer resolves: %w", err)
-			}
-			continue
+			// 插入失败（含 1062 唯一键冲突）：必须严格向外抛出错误，触发外层事务整体回滚（fail-closed，闭环 RR-I01）
+			return nil, err
 		}
 	}
 	return warnings, nil

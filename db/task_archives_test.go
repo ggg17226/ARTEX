@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1590,12 +1591,18 @@ func splitParenthesized(text string, open int) ([]string, int) {
 
 // TestTaskArchive_ScopeHashHitLocksCandidateAndArbitrates 让 task_scope 的 hash 探测
 // 命中一条候选行：恢复必须 (1) 先按物理 PK 取 FOR UPDATE 行锁，(2) 在同一事务里调用
-// VerifyHashArbitration 核验完整 identity，(3) 核验不出结果时报错而不是静默跳过。
-// 旧实现只 COUNT(*) 命中就 continue，既没有锁也没有仲裁。
+// VerifyHashArbitration 核验完整 identity，(3) 当返回不同 identity 时确切报 ErrIdentityHashCollision 并回滚（闭环 RR-I02）。
 func TestTaskArchive_ScopeHashHitLocksCandidateAndArbitrates(t *testing.T) {
 	state := newStubState(
 		// 非锁定定位：按 hash 命中候选物理 PK 9001。
 		stubRule{match: stubMatch("FROM `task_scope` WHERE `identity_hash`=?"), rows: stubRowsAlways(9001)},
+		// 仲裁读取两列 (id, identity)：返回不同的 identity 字节，真实触发 ErrIdentityHashCollision
+		stubRule{
+			match: stubMatch("SELECT `id`, `identity` FROM `task_scope`"),
+			rows: func(int, int64) [][]driver.Value {
+				return [][]driver.Value{{int64(9001), []byte("different-identity-payload")}}
+			},
+		},
 	)
 	d := openStubDB(t, state)
 	tx, err := d.Begin()
@@ -1605,8 +1612,12 @@ func TestTaskArchive_ScopeHashHitLocksCandidateAndArbitrates(t *testing.T) {
 	defer tx.Rollback() //nolint:errcheck
 
 	raw := json.RawMessage(`[{"task_id":101,"kind":"domain","domain":"corp.example"}]`)
-	if _, err := restoreTaskScopes(context.Background(), tx, raw); err == nil {
+	_, err = restoreTaskScopes(context.Background(), tx, raw)
+	if err == nil {
 		t.Fatal("a hash hit came back without an error: the arbitration outcome was swallowed")
+	}
+	if !errors.Is(err, schema.ErrIdentityHashCollision) {
+		t.Fatalf("expected ErrIdentityHashCollision, got: %v", err)
 	}
 
 	var lockAt, arbitrationAt = -1, -1
