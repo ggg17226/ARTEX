@@ -973,6 +973,16 @@ func ndqIntegrationFixture(t *testing.T, d *DB, evFindingID int64) (int64, int64
 		if _, err := d.ExecContext(ctx, "DELETE FROM notification_channels WHERE id = ?", chID); err != nil {
 			t.Errorf("cleanup notification_channels failed: %v", err)
 		}
+		var delCount, chCount int
+		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_deliveries WHERE channel_id = ?", chID).Scan(&delCount); err != nil {
+			t.Errorf("query residual channel deliveries failed: %v", err)
+		}
+		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_channels WHERE id = ?", chID).Scan(&chCount); err != nil {
+			t.Errorf("query residual channels failed: %v", err)
+		}
+		if delCount != 0 || chCount != 0 {
+			t.Errorf("residual channel fixtures found: deliveries=%d channels=%d", delCount, chCount)
+		}
 	})
 
 	evID, err := d.AddNotificationEvent(ctx, notify.EventFindingCreated, evFindingID,
@@ -987,18 +997,15 @@ func ndqIntegrationFixture(t *testing.T, d *DB, evFindingID int64) (int64, int64
 		if _, err := d.ExecContext(ctx, "DELETE FROM notification_events WHERE id = ?", evID); err != nil {
 			t.Errorf("cleanup notification_events failed: %v", err)
 		}
-		var delCount, eventCount, chCount int
-		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_deliveries WHERE channel_id = ? OR event_id = ?", chID, evID).Scan(&delCount); err != nil {
-			t.Errorf("query residual deliveries failed: %v", err)
+		var delCount, eventCount int
+		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_deliveries WHERE event_id = ?", evID).Scan(&delCount); err != nil {
+			t.Errorf("query residual event deliveries failed: %v", err)
 		}
 		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_events WHERE id = ?", evID).Scan(&eventCount); err != nil {
 			t.Errorf("query residual events failed: %v", err)
 		}
-		if err := d.QueryRowContext(ctx, "SELECT count(*) FROM notification_channels WHERE id = ?", chID).Scan(&chCount); err != nil {
-			t.Errorf("query residual channels failed: %v", err)
-		}
-		if delCount != 0 || eventCount != 0 || chCount != 0 {
-			t.Errorf("residual fixtures found: deliveries=%d events=%d channels=%d", delCount, eventCount, chCount)
+		if delCount != 0 || eventCount != 0 {
+			t.Errorf("residual event fixtures found: deliveries=%d events=%d", delCount, eventCount)
 		}
 	})
 	return chID, evID
