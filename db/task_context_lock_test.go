@@ -525,53 +525,27 @@ func tidbLockWaiting(observer *DB, pid int) (waiting bool, available bool) {
 // waitForBackendBlock 证明被观察的写操作**确实被对手事务挡在锁上**，返回后调用方再释放
 // blocker，并**唯一一次**消费 done（审查 F05 恢复的协议）。
 //
-// 调用方契约（每个用例都遵守）：
-//  1. 先用自己的一条事务对被观察操作**必需**的那一行取 FOR UPDATE（任务行 / agent 行 /
-//     会话行 / profile 行，锁的都是产品代码确实要加锁的行，不是 PG 外键派生的隐式锁）；
-//  2. 启动被观察操作 → waitForBackendBlock 证明它真的停在锁上（不消费 done）；
-//     期间用例还可断言 assertProfilesUnlocked —— 只有"确实阻塞了"这条断言才有意义；
-//  3. 回滚 blocker → 操作继续 → waitForMutationResult 收唯一那个完成结果。
-//
-// 观察分两级：
-//   - 强观察：information_schema.innodb_trx 里该连接处于 LOCK WAIT（TiDB 若维护该状态）；
-//   - 保守观察：视图不可用、或预算的一半内始终没有 LOCK WAIT（部分 TiDB 版本不在视图里
-//     维护等待状态）。此时退到"settle 窗口内操作仍未返回"：blocker 持的正是被观察操作
-//     必需的那把行锁，没被挡住的实现会在窗口内直接跑完并把结果放进带缓冲的 done，
-//     所以"根本没阻塞"依然判红；只是它证明不了"等的恰好是那把锁"，这一点写进实施报告。
+// 强观察契约（杜绝无锁空转假绿，闭环 F05）：
+// 必须在 information_schema.innodb_trx 或 data_lock_waits 视图中明确观测到该连接进入
+// 'LOCK WAIT' 状态；严禁在无等待证据时仅凭 done 暂无值就降级返回成功。
 func waitForBackendBlock(observer *DB, pid int, done <-chan error) error {
 	const (
-		budget       = 10 * time.Second
-		settleWindow = 500 * time.Millisecond
+		budget   = 10 * time.Second
+		interval = 20 * time.Millisecond
 	)
 	start := time.Now()
-	viewTrusted := true
 	for time.Since(start) < budget {
 		if err := lockObservationProbe(done); err != nil {
 			return err
 		}
-		if viewTrusted {
-			waiting, available := tidbLockWaiting(observer, pid)
-			switch {
-			case waiting:
-				return nil
-			case !available:
-				viewTrusted = false
-			}
-		}
-		if !viewTrusted {
-			// 保守观察：等一个 settle 窗口，再确认它**仍然**没有返回。
-			time.Sleep(settleWindow)
-			if err := lockObservationProbe(done); err != nil {
-				return err
-			}
+		waiting, available := tidbLockWaiting(observer, pid)
+		if available && waiting {
 			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
-		if time.Since(start) > budget/2 {
-			viewTrusted = false
-		}
+		time.Sleep(interval)
 	}
-	return fmt.Errorf("connection %d did not block within %s", pid, budget)
+	// 无论视图是否可用，在 budget 内未获取到真实的锁等待强证据，绝不静默放行
+	return fmt.Errorf("connection %d did not enter proven lock wait within %s", pid, budget)
 }
 
 // assertProfilesUnlocked 断言这些 profile 行此刻没有被持有者锁住（即删除路径没有在
