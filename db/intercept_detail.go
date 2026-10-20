@@ -52,7 +52,7 @@ type InterceptDetail struct {
 func (d *DB) GetInterceptDetail(id int64) (*InterceptDetail, error) {
 	var out InterceptDetail
 	var raw []byte
-	err := d.QueryRow(approvalRowSelectWithAudit+` WHERE ip.id=$1`, id).Scan(
+	err := d.QueryRow(approvalRowSelectWithAudit+` WHERE ip.id = ?`, id).Scan(
 		&out.ID, &out.RuleID, &out.ConversationID, &out.TaskID, &out.AgentName,
 		&out.ToolName, &out.ToolInput, &out.Status, &out.Reason, &out.DecidedAt, &out.CreatedAt,
 		&out.DecisionSource, &out.ConvTitle, &out.ConvAgentKey, &out.RuleName, &raw,
@@ -84,11 +84,22 @@ func (d *DB) ResolveIntercept(id int64, status, action, reason string) (bool, er
 	if err != nil {
 		return false, err
 	}
-	r, err := d.Exec(`UPDATE intercept_pending SET status=$2, decided_at=NOW(),
-		audit=CASE WHEN audit IS NULL THEN NULL ELSE audit || $3::jsonb ||
-        CASE WHEN $4='allow' AND audit->>'correlation' IS DISTINCT FROM 'exact'
-        THEN '{"execution_status":"unknown"}'::jsonb ELSE '{}'::jsonb END END
-        WHERE id=$1 AND status='pending'`, id, status, patch, action)
+	// TiDB 侧的等价改写（逐条对应，语义不变）：
+	//   - `audit || patch::jsonb` → `JSON_MERGE_PATCH(audit, CAST(patch AS JSON))`：
+	//     两个对象合并、右值覆盖左值，与 jsonb 的 || 一致；`||` 在 MySQL 是逻辑或，
+	//     照抄会把布尔值写进 audit；
+	//   - `audit->>'correlation' IS DISTINCT FROM 'exact'` → `NOT (取值 <=> 'exact')`：
+	//     必须用 NULL 安全等值，否则"字段缺失/脏行"在 PG 里判 TRUE（→ 执行结果未知），
+	//     在 MySQL 的三值逻辑里会变成 NULL 而被 CASE 当成 FALSE，把"无法确认执行结果"
+	//     误记成"执行成功"；
+	//   - `CASE WHEN audit IS NULL THEN NULL` 保留：老行是"没有审计"而不是"空审计"，
+	//     绝不能凭空造一个 {} 出来；
+	//   - NOW() → NOW(3)：本库 DATETIME(3) 精度的时间列一律由 NOW(3) 提供。
+	r, err := d.Exec(`UPDATE intercept_pending SET status=?, decided_at=NOW(3),
+		audit=CASE WHEN audit IS NULL THEN NULL ELSE JSON_MERGE_PATCH(JSON_MERGE_PATCH(audit, CAST(? AS JSON)),
+        CASE WHEN ?='allow' AND NOT (`+expJSONTextCond("audit", "$.correlation")+` <=> 'exact')
+        THEN CAST('{"execution_status":"unknown"}' AS JSON) ELSE CAST('{}' AS JSON) END) END
+        WHERE id = ? AND status='pending'`, status, patch, action, id)
 	if err != nil {
 		return false, err
 	}
@@ -106,9 +117,12 @@ func (d *DB) CompleteIntercept(id int64, runID, toolUseID, status, output string
 	if err != nil {
 		return err
 	}
-	_, err = d.Exec(`UPDATE intercept_pending SET audit=audit || $4::jsonb
-		WHERE id=$1 AND audit->>'run_id'=$2 AND audit->>'tool_use_id'=$3
-		AND audit->>'effective_action'='allow' AND audit->>'execution_status'='awaiting_result'`,
-		id, runID, toolUseID, patch)
+	// 回填只打在"当初真正放行、且正在等结果"的那一次调用上：四个条件全部走
+	// JSON_VALID 守卫的取值口径（同 expJSONTextCond），脏行按不匹配处理，绝不让
+	// 一条历史脏数据把整条 UPDATE 打成 Error 3141。
+	_, err = d.Exec(`UPDATE intercept_pending SET audit=JSON_MERGE_PATCH(audit, CAST(? AS JSON))
+		WHERE id = ? AND `+expJSONTextCond("audit", "$.run_id")+` = ? AND `+expJSONTextCond("audit", "$.tool_use_id")+` = ?
+		AND `+expJSONTextCond("audit", "$.effective_action")+`='allow' AND `+expJSONTextCond("audit", "$.execution_status")+`='awaiting_result'`,
+		patch, id, runID, toolUseID)
 	return err
 }

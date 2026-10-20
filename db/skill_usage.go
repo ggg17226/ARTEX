@@ -30,7 +30,7 @@ type SkillUsage struct {
 func (d *DB) InsertSkillUsage(u *SkillUsage) error {
 	_, err := d.Exec(`
 INSERT INTO skill_usage(skill, agent_key, task_id, exploration_id, intent_id, session_id, args_len, found)
-VALUES ($1, NULLIF($2,''), $3, $4, $5, NULLIF($6,''), $7, $8)`,
+VALUES (?, NULLIF(?,''), ?, ?, ?, NULLIF(?,''), ?, ?)`,
 		u.Skill, u.AgentKey, nullIfZero(u.TaskID), nullIfZero(u.ExplorationID),
 		nullIfZero(u.IntentID), u.SessionID, u.ArgsLen, u.Found)
 	return err
@@ -56,16 +56,17 @@ type SkillStat struct {
 // that were never invoked are absent — callers merge against the skill list on disk.
 // Only resolved calls count; misses are reported separately by MissingSkillStats.
 func (d *DB) SkillStats() ([]SkillStat, error) {
-	// agent keys come back as one comma-joined string rather than text[]: the pgx
-	// stdlib driver has no database/sql Scan target for arrays, and agent keys are
-	// [a-z0-9_-] so a comma join is unambiguous.
+	// agent keys come back as one comma-joined string rather than a real array:
+	// 迁移前用 PG 的 STRING_AGG，TiDB 侧对应 GROUP_CONCAT(DISTINCT … SEPARATOR ',')。
+	// 逗号连接之所以无歧义，是因为 agent key 的字符集是 [a-z0-9_-]，永远不含逗号；
+	// 消费方（mergeAgentKeys）按逗号切分，格式必须保持不变。
 	rows, err := d.Query(`
 SELECT skill, COUNT(*) AS calls,
        COUNT(DISTINCT task_id) AS tasks,
-       COALESCE(STRING_AGG(DISTINCT agent_key, ','), '') AS agents,
+       COALESCE(GROUP_CONCAT(DISTINCT agent_key SEPARATOR ','), '') AS agents,
        MAX(ts) AS last_used
 FROM skill_usage
-WHERE found
+WHERE found = 1
 GROUP BY skill
 ORDER BY COUNT(*) DESC, skill`)
 	if err != nil {
@@ -109,10 +110,10 @@ func (d *DB) MissingSkillStats(limit int) ([]SkillStat, error) {
 	}
 	rows, err := d.Query(`
 SELECT skill, COUNT(*) AS calls,
-       COALESCE(STRING_AGG(DISTINCT agent_key, ','), '') AS agents,
+       COALESCE(GROUP_CONCAT(DISTINCT agent_key SEPARATOR ','), '') AS agents,
        MAX(ts) AS last_used
 FROM skill_usage
-WHERE NOT found
+WHERE found = 0
 GROUP BY skill
 ORDER BY COUNT(*) DESC, skill`)
 	if err != nil {
@@ -171,9 +172,9 @@ func (d *DB) RecentSkillCalls(skill string, limit int) ([]SkillCall, error) {
 	rows, err := d.Query(`
 SELECT ts, COALESCE(agent_key,''), COALESCE(task_id,0), COALESCE(session_id,''), args_len
 FROM skill_usage
-WHERE skill = $1 AND found
+WHERE skill = ? AND found = 1
 ORDER BY ts DESC
-LIMIT $2`, skill, limit)
+LIMIT ?`, skill, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +196,7 @@ func (d *DB) SkillCallsByTask(taskID int64) ([]SkillStat, error) {
 	rows, err := d.Query(`
 SELECT skill, COUNT(*) AS calls, MAX(ts) AS last_used
 FROM skill_usage
-WHERE task_id = $1 AND found
+WHERE task_id = ? AND found = 1
 GROUP BY skill
 ORDER BY COUNT(*) DESC, skill`, taskID)
 	if err != nil {

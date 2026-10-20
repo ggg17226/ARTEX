@@ -64,6 +64,22 @@ func IsDeadlock(err error) bool       { return Classify(err) == KindDeadlock }
 func IsLockTimeout(err error) bool    { return Classify(err) == KindLockTimeout }
 func IsConnectionLost(err error) bool { return Classify(err) == KindConnectionLost }
 
+// MySQLCode 取出 MySQL/TiDB 的**服务器错误号**（1062 / 1205 / 1213 / 1452 …）。
+// 非 MySQLError 的错误（网络层、context 取消、应用层自己包装的哨兵错误）返回
+// (0, false)，调用方据此退回 Classify 的分类结果。
+//
+// 存在的理由：Kind 是"要不要重试"的分类，粒度刻意粗；而日志归因、以及
+// "父行不存在"这类语义判定需要具体错误号。旧代码在这里直接用 pgx 的
+// *pgconn.PgError 取 SQLSTATE，等于让上层依赖某个驱动的具体类型；本函数把这层
+// 依赖收进本包，上层只认 MySQL 错误号常量。
+func MySQLCode(err error) (uint16, bool) {
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number, true
+	}
+	return 0, false
+}
+
 // IsRetryable 是跨计划统一的可重试判定：仅死锁、锁超时、连接断开可重试。
 // 唯一键冲突、语法/权限/外键类错误与 context 取消一律不可重试。
 func IsRetryable(err error) bool {

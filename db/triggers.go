@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/Autumn-27/artex/db/schema"
 )
 
 // AgentTrigger is one P3 trigger attached to a custom agent. Six trigger
@@ -68,18 +70,29 @@ func scanTrigger(sc interface{ Scan(...any) error }) (*AgentTrigger, error) {
 }
 
 // CreateTrigger inserts a trigger for agentKey and returns it.
+//
+// TiDB：无 INSERT … RETURNING，改 Exec + LastInsertId 定位自增 id，再按 id 回读整行。
+// 六个 message 列与 tool_names 都是 MEDIUMTEXT NOT NULL，而 TiDB 不给 TEXT 族声明
+// DDL 默认值，因此必须逐列显式写值（空串就是它们的语义默认值），否则 strict 模式 1364。
 func (d *DB) CreateTrigger(t *AgentTrigger) (*AgentTrigger, error) {
-	row := d.QueryRow(`
+	res, err := d.Exec(`
 INSERT INTO agent_triggers(agent_key, enabled, interval_sec, on_finding, on_goal_met, on_task_timeout, on_tool_call, on_task_create, interval_message, finding_message, goal_message, task_timeout_message, tool_call_message, task_create_message, tool_names)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING `+triggerCols,
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.AgentKey, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate,
 		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, marshalToolNames(t.ToolNames))
-	return scanTrigger(row)
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return scanTrigger(d.QueryRow(`SELECT `+triggerCols+` FROM agent_triggers WHERE id = ?`, id))
 }
 
 // UpdateTrigger updates a trigger's fields (not last_fire).
 func (d *DB) UpdateTrigger(t *AgentTrigger) error {
-	_, err := d.Exec(`UPDATE agent_triggers SET enabled=$2, interval_sec=$3, on_finding=$4, on_goal_met=$5, on_task_timeout=$6, on_tool_call=$7, on_task_create=$8, interval_message=$9, finding_message=$10, goal_message=$11, task_timeout_message=$12, tool_call_message=$13, task_create_message=$14, tool_names=$15 WHERE id=$1`,
+	_, err := d.Exec(`UPDATE agent_triggers SET enabled=?, interval_sec=?, on_finding=?, on_goal_met=?, on_task_timeout=?, on_tool_call=?, on_task_create=?, interval_message=?, finding_message=?, goal_message=?, task_timeout_message=?, tool_call_message=?, task_create_message=?, tool_names=? WHERE id=?`,
 		t.ID, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate,
 		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, marshalToolNames(t.ToolNames))
 	return err
@@ -87,18 +100,19 @@ func (d *DB) UpdateTrigger(t *AgentTrigger) error {
 
 // DeleteTrigger removes a trigger.
 func (d *DB) DeleteTrigger(id int64) error {
-	_, err := d.Exec(`DELETE FROM agent_triggers WHERE id=$1`, id)
+	_, err := d.Exec(`DELETE FROM agent_triggers WHERE id = ?`, id)
 	return err
 }
 
 // ListTriggersFor returns an agent's triggers.
 func (d *DB) ListTriggersFor(agentKey string) ([]*AgentTrigger, error) {
-	return d.queryTriggers(`SELECT `+triggerCols+` FROM agent_triggers WHERE agent_key=$1 ORDER BY id`, agentKey)
+	return d.queryTriggers(`SELECT `+triggerCols+` FROM agent_triggers WHERE agent_key = ? ORDER BY id`, agentKey)
 }
 
 // ListEnabledTriggers returns all enabled triggers (for the scheduler).
 func (d *DB) ListEnabledTriggers() ([]*AgentTrigger, error) {
-	return d.queryTriggers(`SELECT ` + triggerCols + ` FROM agent_triggers WHERE enabled ORDER BY id`)
+	// 布尔列显式 = 1：TiDB 的 sql_mode 不保证接受裸列当谓词，且 r4 审计口径统一要求显式比较。
+	return d.queryTriggers(`SELECT ` + triggerCols + ` FROM agent_triggers WHERE enabled = 1 ORDER BY id`)
 }
 
 func (d *DB) queryTriggers(q string, args ...any) ([]*AgentTrigger, error) {
@@ -120,30 +134,43 @@ func (d *DB) queryTriggers(q string, args ...any) ([]*AgentTrigger, error) {
 
 // TouchTriggerFire records an interval trigger's fire time (now).
 func (d *DB) TouchTriggerFire(id int64) error {
-	_, err := d.Exec(`UPDATE agent_triggers SET last_fire=now() WHERE id=$1`, id)
+	_, err := d.Exec(`UPDATE agent_triggers SET last_fire=NOW(3) WHERE id = ?`, id)
 	return err
 }
 
 // DeleteTriggersForAgent removes all triggers of an agent (custom agent delete).
 func (d *DB) DeleteTriggersForAgent(agentKey string) error {
-	_, err := d.Exec(`DELETE FROM agent_triggers WHERE agent_key=$1`, agentKey)
+	_, err := d.Exec(`DELETE FROM agent_triggers WHERE agent_key = ?`, agentKey)
 	return err
 }
 
 // ---------- scheduler_state (kv watermarks) ----------
 
+// GetSchedState reads one scheduler watermark. `key` / `value` 都是 MySQL/TiDB
+// 关键字，必须反引号（裸写 WHERE key=? 直接 1064）。
 func (d *DB) GetSchedState(key string) (string, error) {
 	var v string
-	err := d.QueryRow(`SELECT value FROM scheduler_state WHERE key=$1`, key).Scan(&v)
+	err := d.QueryRow("SELECT `value` FROM scheduler_state WHERE `key` = ?", key).Scan(&v)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
 	return v, err
 }
 
+// SetSchedState upserts one scheduler watermark (M13)。
+//
+// scheduler_state 在 TiDB 基线里是 hash 唯一键表：自然键 `key` 是 MEDIUMTEXT，TEXT 族
+// 不能直接建唯一索引，唯一性完全由 uq_scheduler_state_key_hash(key_hash) 承载。因此
+// 每条 INSERT 都必须同时写 key_identity（canonical 载荷）与 key_hash（其 SHA-256）：
+// 漏写等于把唯一键退化成 NULL，重复水位再也挡不住。ON DUPLICATE KEY UPDATE 的冲突
+// 判定就落在那条 hash 唯一索引上，更新分支只碰 `value`（身份不可变）。
+//
+// 身份载荷沿用 schema.SettingsKeyIdentity —— 该 builder 的契约就是「settings/tools/
+// scheduler_state 共用的分支 key」，另起分支会让同一张表出现两套 identity 编码。
 func (d *DB) SetSchedState(key, value string) error {
-	_, err := d.Exec(`INSERT INTO scheduler_state(key,value) VALUES ($1,$2)
-ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, key, value)
+	identity, hash := canonicalIdentityPair(schema.SettingsKeyIdentity(key))
+	_, err := d.Exec("INSERT INTO scheduler_state(`key`, key_identity, key_hash, `value`) VALUES (?, ?, ?, ?)"+
+		" ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)", key, identity, hash, value)
 	return err
 }
 
@@ -171,7 +198,7 @@ func (d *DB) NewFindingsSince(lastID int64) ([]TaskEvent, error) {
 	rows, err := d.Query(`
 SELECT n.id, t.id, t.description, t.goal, n.payload
 FROM exploration_nodes n JOIN tasks t ON t.exploration_id = n.exploration_id
-WHERE n.kind='finding' AND n.id > $1 AND t.deleted_at IS NULL
+WHERE n.kind='finding' AND n.id > ? AND t.deleted_at IS NULL
 ORDER BY n.id`, lastID)
 	if err != nil {
 		return nil, err
@@ -197,7 +224,7 @@ ORDER BY n.id`, lastID)
 func (d *DB) TimedOutTasksSince(lastID int64) ([]TaskEvent, error) {
 	rows, err := d.Query(`
 SELECT id, description, goal FROM tasks
-WHERE status='timeout' AND deleted_at IS NULL AND id > $1
+WHERE status='timeout' AND deleted_at IS NULL AND id > ?
 ORDER BY id`, lastID)
 	if err != nil {
 		return nil, err
@@ -222,7 +249,7 @@ ORDER BY id`, lastID)
 func (d *DB) NewTasksSince(lastID int64) ([]TaskEvent, error) {
 	rows, err := d.Query(`
 SELECT id, description, goal FROM tasks
-WHERE deleted_at IS NULL AND id > $1
+WHERE deleted_at IS NULL AND id > ?
 ORDER BY id`, lastID)
 	if err != nil {
 		return nil, err
@@ -253,7 +280,7 @@ SELECT r.id, t.id, t.description, t.goal, r.tool, COALESCE(u.detail,''), COALESC
 FROM activity r
 JOIN tasks t ON t.exploration_id = r.exploration_id
 LEFT JOIN activity u ON u.exploration_id = r.exploration_id AND u.tool_use_id = r.tool_use_id AND u.kind='tool_use'
-WHERE r.kind='tool_result' AND r.id > $1 AND r.tool <> '' AND t.deleted_at IS NULL
+WHERE r.kind='tool_result' AND r.id > ? AND r.tool <> '' AND t.deleted_at IS NULL
 ORDER BY r.id`, lastID)
 	if err != nil {
 		return nil, err

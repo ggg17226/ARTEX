@@ -1,7 +1,10 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"sort"
 	"time"
 )
 
@@ -22,14 +25,19 @@ type ConvTokenSummary struct {
 
 // ConversationTokenSummaries returns one row per conversation with its summed
 // result-row token usage (0 for conversations with no completed run yet).
+//
+// TiDB（P08-04 Task 4.3）：created_at 的文本化由 `::text` 改为 DATE_FORMAT，格式与
+// assets/exploration 侧同一套口径（前端只取前 10 位当日桶，见 dashboard 的
+// `created_at.slice(0, 10)`）。ONLY_FULL_GROUP_BY 下分组键必须显式列出所有非聚合列，
+// 不再依赖 PG "GROUP BY 主键即可裸选函数依赖列" 的宽松规则。
 func (d *DB) ConversationTokenSummaries() ([]ConvTokenSummary, error) {
 	rows, err := d.Query(`
-SELECT c.llm_profile_id, c.created_at::text,
-       COALESCE(sum(ca.input_tokens),0), COALESCE(sum(ca.output_tokens),0),
-       COALESCE(sum(ca.cache_read_tokens),0), COALESCE(sum(ca.cache_write_tokens),0)
+SELECT c.llm_profile_id, DATE_FORMAT(c.created_at, '%Y-%m-%dT%H:%i:%s.%f'),
+       COALESCE(SUM(ca.input_tokens),0), COALESCE(SUM(ca.output_tokens),0),
+       COALESCE(SUM(ca.cache_read_tokens),0), COALESCE(SUM(ca.cache_write_tokens),0)
 FROM conversations c
 LEFT JOIN conversation_activities ca ON ca.conversation_id = c.id AND ca.kind = 'result'
-GROUP BY c.id`)
+GROUP BY c.id, c.llm_profile_id, c.created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +92,10 @@ func scanConv(row interface{ Scan(...any) error }) (Conversation, error) {
 
 // CreateConversation opens a new chat thread for agentKey with an initial title.
 // llmProfileID may be nil to use the globally active profile.
+//
+// TiDB：PostgreSQL 的 INSERT … RETURNING 没有等价物，改成 Exec + LastInsertId 定位自增
+// 主键，再在事务内回读整行（本事务刚插入的行必然可见）。"先插子行、后锁 profile 行"
+// 的顺序保持不变，与 DeleteProfile 的 子行 → profile 行 加锁协议一致。
 func (d *DB) CreateConversation(agentKey, title string, llmProfileID *int64) (*Conversation, error) {
 	tx, err := d.Begin()
 	if err != nil {
@@ -91,12 +103,11 @@ func (d *DB) CreateConversation(agentKey, title string, llmProfileID *int64) (*C
 	}
 	defer tx.Rollback()
 
-	// Insert the child without a profile first. The new row is exclusively owned
-	// by this transaction before it takes a profile lock, matching DeleteProfile's
-	// child-row -> profile-row protocol.
-	c, err := scanConv(tx.QueryRow(`
-INSERT INTO conversations(agent_key, title, llm_profile_id) VALUES ($1, $2, NULL)
-RETURNING `+convCols, agentKey, title))
+	res, err := tx.Exec(`INSERT INTO conversations(agent_key, title, llm_profile_id) VALUES (?, ?, NULL)`, agentKey, title)
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
@@ -104,11 +115,13 @@ RETURNING `+convCols, agentKey, title))
 		return nil, err
 	}
 	if llmProfileID != nil {
-		c, err = scanConv(tx.QueryRow(`UPDATE conversations SET llm_profile_id=$2
-WHERE id=$1 RETURNING `+convCols, c.ID, llmProfileID))
-		if err != nil {
+		if _, err := tx.Exec(`UPDATE conversations SET llm_profile_id = ? WHERE id = ?`, *llmProfileID, id); err != nil {
 			return nil, err
 		}
+	}
+	c, err := scanConv(tx.QueryRow(`SELECT `+convCols+` FROM conversations WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -125,7 +138,7 @@ func (d *DB) UpdateConversationProfile(id int64, llmProfileID *int64) error {
 	defer tx.Rollback()
 
 	var lockedID int64
-	if err := tx.QueryRow(`SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, id).Scan(&lockedID); err != nil {
+	if err := tx.QueryRow(`SELECT id FROM conversations WHERE id = ? FOR UPDATE`, id).Scan(&lockedID); err != nil {
 		if err == sql.ErrNoRows {
 			// Preserve the previous UPDATE semantics: an unknown id is a no-op.
 			return tx.Commit()
@@ -135,16 +148,19 @@ func (d *DB) UpdateConversationProfile(id int64, llmProfileID *int64) error {
 	if err := lockLLMProfileForReference(tx, llmProfileID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE conversations SET llm_profile_id=$2 WHERE id=$1`, id, llmProfileID); err != nil {
+	if _, err := tx.Exec(`UPDATE conversations SET llm_profile_id = ? WHERE id = ?`, llmProfileID, id); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 // ListConversations returns all threads, most-recently-updated first.
+//
+// TiDB：DESC 排序天然把 NULL 排到最后，`NULLS LAST` 是 PG 专有语法，直接删除即可
+// （MySQL 只在 ASC 时需要手写 IS NULL 前置）。
 func (d *DB) ListConversations() ([]*Conversation, error) {
 	rows, err := d.Query(`SELECT ` + convCols + ` FROM conversations
-ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, updated_at DESC, id DESC`)
+ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC, updated_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +178,7 @@ ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, updated_at DES
 
 // GetConversation returns one thread (nil, nil if absent).
 func (d *DB) GetConversation(id int64) (*Conversation, error) {
-	c, err := scanConv(d.QueryRow(`SELECT `+convCols+` FROM conversations WHERE id=$1`, id))
+	c, err := scanConv(d.QueryRow(`SELECT `+convCols+` FROM conversations WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -174,16 +190,36 @@ func (d *DB) GetConversation(id int64) (*Conversation, error) {
 
 // UpdateConversation applies a partial title/pin mutation and returns the updated
 // row. Pinning an already-pinned conversation preserves its original pin order.
+//
+// TiDB：PG 用 `$n::boolean IS NULL` 在 SQL 里区分"未提供"与"提供 false"，MySQL 没有
+// 可空的 boolean 转型，改为 Go 侧把三态拆成两个 int 门（hasPin / pinVal），与
+// tasks.go 的 UpdateTask 同一套写法。
+//
+// 另外 MySQL 的 ROW_COUNT() 是 **changed rows**：标题/置顶值原样重写会返回 0，不能据此
+// 判定行不存在，因此统一改为"执行 UPDATE → 回读整行"，回读为空才是"会话不存在"。
 func (d *DB) UpdateConversation(id int64, patch ConversationPatch) (*Conversation, error) {
-	c, err := scanConv(d.QueryRow(`UPDATE conversations SET
-	title = CASE WHEN $2::boolean THEN $3 ELSE title END,
+	titleGate := boolToInt(patch.Title != nil)
+	titleArg := ""
+	if patch.Title != nil {
+		titleArg = *patch.Title
+	}
+	hasPin := boolToInt(patch.Pinned != nil)
+	pinVal := 0
+	if patch.Pinned != nil && *patch.Pinned {
+		pinVal = 1
+	}
+	if _, err := d.Exec(`UPDATE conversations SET
+	title = CASE WHEN ? = 1 THEN ? ELSE title END,
 	pinned_at = CASE
-		WHEN $4::boolean IS NULL THEN pinned_at
-		WHEN $4::boolean THEN COALESCE(pinned_at, now())
+		WHEN ? = 0 THEN pinned_at
+		WHEN ? = 1 THEN COALESCE(pinned_at, NOW(3))
 		ELSE NULL
-	END
-WHERE id=$1
-RETURNING `+convCols, id, patch.Title != nil, patch.Title, patch.Pinned))
+	END,
+	updated_at = NOW(3)
+WHERE id = ?`, titleGate, titleArg, hasPin, pinVal, id); err != nil {
+		return nil, err
+	}
+	c, err := scanConv(d.QueryRow(`SELECT `+convCols+` FROM conversations WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -202,49 +238,135 @@ func (d *DB) RenameConversation(id int64, title string) error {
 
 // TouchConversation bumps updated_at so the thread floats to the top of the list.
 func (d *DB) TouchConversation(id int64) error {
-	_, err := d.Exec(`UPDATE conversations SET updated_at=now() WHERE id=$1`, id)
+	_, err := d.Exec(`UPDATE conversations SET updated_at=NOW(3) WHERE id = ?`, id)
 	return err
 }
 
-// DeleteConversation removes a thread; its activities cascade via FK.
+// DeleteConversation removes a thread together with its **complete** conversation
+// closure (M20 / 闭环 R51-F07-01)。
+//
+// TiDB 不启用外键约束（见 db/schema 的设计说明），PG 时代的 `ON DELETE CASCADE`
+// 在迁移后不会自动发生，级联必须由本函数在同一事务里显式完成：
+//
+//  1. SELECT … FOR UPDATE 锁住会话根行（与旁路快照写者互斥，杜绝闭包收集期间被改写）；
+//  2. ComputeConversationClosure 收集 activities / intercept_pending / 旁路会话与其
+//     下挂请求 / 待置空的 retest；
+//  3. ExecuteConversationCascade 依次：停止本会话活跃 retest → 置空 retest 的弱关联
+//     conversation_id → 删 side_question_requests → side_question_sessions →
+//     conversation_activities → intercept_pending → 最后删会话根行，并断言无孤儿。
+//
+// Retest 语义契约（务必保持）：finding_retests 的行**永不物删**（它是 finding 的重测
+// 历史，不是会话的从属数据），只把弱引用置空；处于 pending/running 的 retest 转成
+// 停止态 stopped（否则 active_finding_id 生成列会一直占住该 finding 的唯一键），
+// completed 等终态一律不动。
 func (d *DB) DeleteConversation(id int64) error {
-	_, err := d.Exec(`DELETE FROM conversations WHERE id=$1`, id)
-	return err
+	if id <= 0 {
+		return nil
+	}
+	ctx := context.Background()
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	present, err := deleteConversationLocked(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if !present {
+		// 会话本就不存在：空事务没有可提交的内容，直接由 defer Rollback 收尾。
+		return nil
+	}
+	return tx.Commit()
 }
 
-// DeleteConversations removes existing threads in one statement and returns the
-// ids that were actually present. Child activities and trigger runs cascade.
+// DeleteConversations removes existing threads in one transaction and returns the
+// ids that were actually present. Each id goes through the same full-closure path
+// as DeleteConversation（同一个事务里按 id 升序逐个加锁删除，避免与并发批量删除交叉
+// 成反向锁序）。
 func (d *DB) DeleteConversations(ids []int64) ([]int64, error) {
 	if len(ids) == 0 {
 		return []int64{}, nil
 	}
-	rows, err := d.Query(`DELETE FROM conversations WHERE id=ANY($1::bigint[]) RETURNING id`, ids)
+	seen := make(map[int64]bool, len(ids))
+	unique := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return []int64{}, nil
+	}
+	// 统一加锁顺序：升序，重复 id 只删一次。
+	sort.Slice(unique, func(i, j int) bool { return unique[i] < unique[j] })
+
+	ctx := context.Background()
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	deleted := make([]int64, 0, len(ids))
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+	defer tx.Rollback()
+
+	deleted := make([]int64, 0, len(unique))
+	for _, id := range unique {
+		present, err := deleteConversationLocked(ctx, tx, id)
+		if err != nil {
 			return nil, err
 		}
-		deleted = append(deleted, id)
+		if present {
+			deleted = append(deleted, id)
+		}
 	}
-	return deleted, rows.Err()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return deleted, nil
+}
+
+// deleteConversationLocked deletes one conversation closure inside an existing
+// transaction and reports whether the root row was there at all. A missing root is
+// a no-op (matching the old `DELETE FROM conversations WHERE id = ?` semantics:
+// deleting an absent thread is not an error).
+func deleteConversationLocked(ctx context.Context, tx *sql.Tx, id int64) (bool, error) {
+	var locked int64
+	err := tx.QueryRowContext(ctx, `SELECT id FROM conversations WHERE id = ? FOR UPDATE`, id).Scan(&locked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	closure, err := ComputeConversationClosure(ctx, tx, uint64(id))
+	if err != nil {
+		// 已持锁仍报"会话不存在"只可能是并发删除窗口，同样按 no-op 处理。
+		if errors.Is(err, ErrForeignKeyViolation) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := ExecuteConversationCascade(ctx, tx, closure); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AppendConvActivity records one step of a conversation (human message or an agent
 // execution step) and returns its id. Mirrors ExplorationStore.AppendActivity but
 // keyed by conversation_id. Reuses the Activity struct (NodeID is ignored here).
 func (d *DB) AppendConvActivity(convID int64, a Activity) (int64, error) {
-	var id int64
-	err := d.QueryRow(`
+	res, err := d.Exec(`
 INSERT INTO conversation_activities(conversation_id, worker, kind, tool, tool_use_id, is_error, summary, detail, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
-VALUES ($1,NULLIF($2,''),NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,NULLIF($7,''),NULLIF($8,''),$9,$10,$11,$12)
-RETURNING id`, convID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError,
-		utf8Clean(a.Summary), utf8Clean(a.Detail), a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens).Scan(&id)
-	return id, err
+VALUES (?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,NULLIF(?,''),NULLIF(?,''),?,?,?,?)`,
+		convID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError,
+		utf8Clean(a.Summary), utf8Clean(a.Detail), a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 // ConvActivityList returns a conversation's steps after sinceID (exclusive) with
@@ -255,7 +377,7 @@ func (d *DB) ConvActivityList(convID, sinceID int64, limit int) ([]Activity, int
 	}
 	const cols = `id, COALESCE(worker,''), COALESCE(kind,''), COALESCE(tool,''), COALESCE(tool_use_id,''), is_error, COALESCE(summary,''), created_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens`
 	rows, err := d.Query(`SELECT `+cols+`
-FROM conversation_activities WHERE conversation_id=$1 AND id>$2 ORDER BY id LIMIT $3`, convID, sinceID, limit)
+FROM conversation_activities WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?`, convID, sinceID, limit)
 	if err != nil {
 		return nil, sinceID, err
 	}
@@ -289,8 +411,8 @@ func (d *DB) ConvActivityPage(convID, before int64, limit int) ([]Activity, bool
 	// fetch one extra row to detect whether older history remains before this window.
 	rows, err := d.Query(`SELECT `+cols+`
 FROM conversation_activities
-WHERE conversation_id=$1 AND ($2 <= 0 OR id < $2)
-ORDER BY id DESC LIMIT $3`, convID, before, limit+1)
+WHERE conversation_id = ? AND (? <= 0 OR id < ?)
+ORDER BY id DESC LIMIT ?`, convID, before, limit+1)
 	if err != nil {
 		return nil, false, err
 	}
@@ -322,7 +444,7 @@ ORDER BY id DESC LIMIT $3`, convID, before, limit+1)
 // ConvActivityDetail lazily returns the full detail blob for one step.
 func (d *DB) ConvActivityDetail(convID, id int64) (string, error) {
 	var s sql.NullString
-	err := d.QueryRow(`SELECT detail FROM conversation_activities WHERE id=$1 AND conversation_id=$2`, id, convID).Scan(&s)
+	err := d.QueryRow(`SELECT detail FROM conversation_activities WHERE id = ? AND conversation_id = ?`, id, convID).Scan(&s)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}

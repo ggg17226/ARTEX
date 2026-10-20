@@ -13,34 +13,62 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/db/tidb"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// isFKViolation reports whether err is a Postgres foreign-key violation (SQLSTATE
-// 23503) — e.g. an activity insert whose exploration_id has no parent row.
+// errCodeForeignKeyParentIsMissing 是 MySQL/TiDB 的外键父行缺失错误号（对应 PG 的
+// SQLSTATE 23503）。本项目的 TiDB 基线**不声明外键约束**（完整性由 db 层的闭包/级联
+// 与写前校验承担），所以正常情况下服务端永远不会回这个码；认它是为了在显式开启
+// foreign_key_checks 的调试实例上也不丢诊断信息。
+const errCodeForeignKeyParentIsMissing uint16 = 1452
+
+// isFKViolation reports whether an activity write failed because its parent row is
+// gone — e.g. an activity insert whose exploration_id has no parent row.
+//
+// 迁移前这里判的是 pgx 的 *pgconn.PgError + SQLSTATE "23503"。TiDB 侧的对应关系是：
+//  1. 真正的生产路径 → db 层写前校验显式返回的 db.ErrForeignKeyViolation；
+//  2. 兜底路径 → 服务器错误号 1452（仅在显式开启 FK 时可能出现）。
+//
+// 注意不能"顺手"把 23503 换成 1062：唯一键冲突与父行缺失是两种完全不同的丢日志原因。
 func isFKViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+	if errors.Is(err, db.ErrForeignKeyViolation) {
+		return true
+	}
+	code, ok := tidb.MySQLCode(err)
+	return ok && code == errCodeForeignKeyParentIsMissing
 }
 
 // dropReason classifies why an activity write was dropped, so the log can be
 // grouped/analysed by cause rather than by raw error text.
 func dropReason(err error) string {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "23503":
-			return "fk_violation(23503,父exploration不存在)"
-		case "23505":
-			return "unique_violation(23505)"
+	if isFKViolation(err) {
+		return "fk_violation(父行不存在)"
+	}
+	if code, ok := tidb.MySQLCode(err); ok {
+		switch code {
+		case 1062:
+			return "unique_violation(1062)"
+		case 1213:
+			return "deadlock(1213)"
+		case 1205:
+			return "lock_timeout(1205)"
+		case 1406:
+			return "data_too_long(1406)"
 		default:
-			return "pg_error(" + pgErr.Code + ")"
+			return fmt.Sprintf("tidb_error(%d)", code)
 		}
 	}
-	return "write_error"
+	switch tidb.Classify(err) {
+	case tidb.KindConnectionLost, tidb.KindConnError:
+		return "connection_error"
+	case tidb.KindCancelled:
+		return "cancelled"
+	default:
+		return "write_error"
+	}
 }
 
 // bumpDrop increments and returns the running count of dropped (unpersistable)

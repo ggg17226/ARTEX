@@ -38,26 +38,30 @@ func (d *DB) GetInterceptExecution(id int64) (*InterceptExecution, error) {
 	var scope any
 	if approval.ConversationID != nil {
 		scope = *approval.ConversationID
-		query = `SELECT id, NULL::bigint, COALESCE(worker,''), kind, COALESCE(tool,''), tool_use_id, is_error, COALESCE(summary,''), created_at, NULL::integer FROM conversation_activities WHERE conversation_id=$1`
+		// 会话侧活动表没有 node_id / main_seg 两列：PG 用 `NULL::bigint` / `NULL::integer`
+		// 给占位列定型，MySQL/TiDB 直接写 NULL 即可 —— 这两个 Scan 目标是 **int64 / **int
+		// 指针（Activity.NodeID / Activity.MainSeg），NULL 走"指针置空"路径，
+		// 不需要（也不应该）用 CAST(NULL AS …) 伪装类型。
+		query = `SELECT id, NULL, COALESCE(worker,''), kind, COALESCE(tool,''), tool_use_id, is_error, COALESCE(summary,''), created_at, NULL FROM conversation_activities WHERE conversation_id = ?`
 	} else if approval.TaskID != nil {
 		taskID, parseErr := strconv.ParseInt(*approval.TaskID, 10, 64)
 		if parseErr != nil || taskID <= 0 {
 			return nil, ErrInterceptExecutionUnavailable
 		}
 		var exists bool
-		if err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND archived_at IS NULL AND deleted_at IS NULL)`, taskID).Scan(&exists); err != nil {
+		if err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ? AND archived_at IS NULL AND deleted_at IS NULL)`, taskID).Scan(&exists); err != nil {
 			return nil, err
 		}
 		if !exists {
 			return nil, ErrInterceptTaskDeleted
 		}
 		scope = taskID
-		query = `SELECT id, node_id, COALESCE(worker,''), kind, COALESCE(tool,''), tool_use_id, is_error, COALESCE(summary,''), created_at, main_seg FROM activity WHERE exploration_id=(SELECT exploration_id FROM tasks WHERE id=$1 AND archived_at IS NULL AND deleted_at IS NULL)`
+		query = `SELECT id, node_id, COALESCE(worker,''), kind, COALESCE(tool,''), tool_use_id, is_error, COALESCE(summary,''), created_at, main_seg FROM activity WHERE exploration_id=(SELECT exploration_id FROM tasks WHERE id = ? AND archived_at IS NULL AND deleted_at IS NULL)`
 	} else {
 		return nil, ErrInterceptExecutionUnavailable
 	}
 	// Three matches suffice to detect duplicate IDs without loading a transcript.
-	rows, err := d.Query(query+` AND tool_use_id=$2 AND kind IN ('tool_use','tool_result') ORDER BY id LIMIT 3`, scope, audit.ToolUseID)
+	rows, err := d.Query(query+` AND tool_use_id = ? AND kind IN ('tool_use','tool_result') ORDER BY id LIMIT 3`, scope, audit.ToolUseID)
 	if err != nil {
 		return nil, err
 	}
