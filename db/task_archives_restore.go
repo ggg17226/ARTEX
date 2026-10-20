@@ -505,6 +505,18 @@ WHERE relation.source_task_id=? LIMIT 1 FOR UPDATE`, taskID).Scan(&dependent)
 	if err := lockArchiveAssets(tx, taskID, expID, snapshot); err != nil {
 		return err
 	}
+	// 逆拓扑闭包（I01）：新 Catalog 明确没有 FK/CHECK，旧库"删父行靠级联清子行"
+	// 在这里根本不会发生。压缩必须自己按 证据绑定 → 探索锚点 → 探索边 的顺序删到底，
+	// 否则这些关系会以本次归档自己的残留留在热库，恢复预检把它们误判成冲突
+	// （归档成功、恢复必失败）。锚点/绑定都靠 nodes/findings 定位，因此共享的
+	// 证据快照 id 必须在删除父行之前取走。
+	evidenceIDs, err := archivedEvidenceSnapshotIDs(tx, taskID)
+	if err != nil {
+		return err
+	}
+	if err := deleteArchiveGraphClosure(tx, taskID, expID); err != nil {
+		return err
+	}
 	for _, statement := range []struct {
 		query string
 		args  []any
@@ -535,6 +547,12 @@ WHERE relation.source_task_id=? LIMIT 1 FOR UPDATE`, taskID).Scan(&dependent)
 	if err := deleteExclusiveArchiveAssets(tx, taskID, snapshot.ExclusiveAssetIDs); err != nil {
 		return err
 	}
+	// 证据快照是跨任务共享的物理行：压缩只解绑、不删除。解绑后已经没有任何绑定的
+	// 快照补上"孤儿"标记，与恢复侧 restoreFindingTrafficTx 的
+	// `SET s.unreferenced_at = NULL` 严格对称（共享给别的 finding 的快照不受影响）。
+	if err := markEvidenceSnapshotsUnreferenced(tx, evidenceIDs); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE explorations SET description='',goal='',status='open' WHERE id=?`, expID); err != nil {
 		return err
 	}
@@ -557,27 +575,148 @@ WHERE id=?`, ArchiveReady, archivePath, sha256, originalSize, compressedSize,
 	return tx.Commit()
 }
 
-// lockArchiveAssets 按物理 PK 升序给本任务涉及的资产行加悲观行锁，替代原 PG 的
-// 全表 SHARE ROW EXCLUSIVE 锁。三批加锁顺序固定（task_ids 归属 → 探索锚点 → 冷包
-// 快照自带 id），批内 ORDER BY id，避免与并发资产写入交叉死锁。
+// lockArchiveAssets 给本任务涉及的资产行加悲观行锁，替代原 PG 的
+// 全表 SHARE ROW EXCLUSIVE 锁。
+//
+// 锁协议（I07）：候选资产来自三个彼此独立的来源（task_ids 归属 / 节点锚定 /
+// 冷包独占），"每组各自 ORDER BY id 各锁一遍"**不等于**全局升序——任务自有资产
+// 20 与仅被节点锚定的资产 10 是合法数据（锚定不要求资产归属本任务），按
+// 20→10 取锁就会与另一个 10→20 的写者构成反向锁序。因此这里先把**全部**候选
+// 发现齐、去重、按物理 PK 全局升序，再统一按有界批次 FOR UPDATE。
+//
+// 发现阶段是普通 current read，只负责确定候选集合；真正的悲观锁只在最后一阶段
+// 按物理 PK 获取，与全仓"先按物理 PK 全局全序加锁"的统一协议一致。
 func lockArchiveAssets(tx *sql.Tx, taskID, expID int64, snapshot *TaskArchiveSnapshot) error {
-	if err := drainLockedRows(tx, `SELECT id FROM assets WHERE `+
-		assetJSONContains("COALESCE(task_ids, '[]')", "?")+` ORDER BY id FOR UPDATE`, taskID); err != nil {
+	candidates := map[int64]bool{}
+	if err := collectArchiveAssetIDs(tx, candidates, `SELECT id FROM assets WHERE `+
+		assetJSONContains("COALESCE(task_ids, '[]')", "?")+` ORDER BY id`, taskID); err != nil {
 		return err
 	}
-	if err := drainLockedRows(tx, `SELECT asset.id FROM assets asset
-JOIN exploration_anchors anchor ON anchor.asset_id = asset.id
+	if err := collectArchiveAssetIDs(tx, candidates, `SELECT anchor.asset_id FROM exploration_anchors anchor
 JOIN exploration_nodes node ON node.id = anchor.node_id
-WHERE node.exploration_id = ? ORDER BY asset.id FOR UPDATE`, expID); err != nil {
+WHERE node.exploration_id = ? GROUP BY anchor.asset_id`, expID); err != nil {
 		return err
 	}
-	for _, batch := range archiveIDBatches(snapshot.ExclusiveAssetIDs) {
+	if snapshot != nil {
+		for _, id := range snapshot.ExclusiveAssetIDs {
+			if id > 0 {
+				candidates[id] = true
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(candidates))
+	for id := range candidates {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	// 单一来源、全局升序、有界批次：既消除分组逆序，也让 IN (...) 的占位符数量有界。
+	for _, batch := range archiveIDBatches(ids) {
 		args := make([]any, 0, len(batch))
 		for _, id := range batch {
 			args = append(args, id)
 		}
 		if err := drainLockedRows(tx, `SELECT id FROM assets WHERE id IN (`+
 			questionPlaceholders(len(batch))+`) ORDER BY id FOR UPDATE`, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectArchiveAssetIDs 执行一条只读的资产 id 发现查询，把结果并入候选集合。
+// 这里刻意不加 FOR UPDATE：加锁必须等到完整候选集合确定之后一次性按全局升序进行。
+func collectArchiveAssetIDs(tx *sql.Tx, candidates map[int64]bool, query string, args ...any) error {
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		if id > 0 {
+			candidates[id] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	return rows.Close()
+}
+
+// archivedEvidenceSnapshotIDs 取出本任务 findings 当前引用的证据快照 id（去重升序）。
+// 必须在删除 finding_traffic_bindings / findings **之前**调用：逆拓扑一旦失去父行集合，
+// 这些跨任务共享的快照就再也定位不到了。
+func archivedEvidenceSnapshotIDs(tx *sql.Tx, taskID int64) ([]string, error) {
+	rows, err := tx.Query(`SELECT DISTINCT b.snapshot_id
+FROM finding_traffic_bindings b JOIN findings f ON f.id = b.finding_id
+WHERE f.task_id=? ORDER BY b.snapshot_id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	return out, rows.Close()
+}
+
+// deleteArchiveGraphClosure 按逆拓扑显式删除热库里的图叶子关系与证据绑定。
+// 顺序固定为 证据绑定 → 探索锚点 → 探索边：前两者都要 JOIN 父行定位，必须早于
+// findings / exploration_nodes 的删除执行。
+func deleteArchiveGraphClosure(tx *sql.Tx, taskID, expID int64) error {
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE binding FROM finding_traffic_bindings binding
+JOIN findings finding ON finding.id = binding.finding_id WHERE finding.task_id=?`, []any{taskID}},
+		{`DELETE anchor FROM exploration_anchors anchor
+JOIN exploration_nodes node ON node.id = anchor.node_id WHERE node.exploration_id=?`, []any{expID}},
+		{`DELETE FROM exploration_edges WHERE exploration_id=?`, []any{expID}},
+	} {
+		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// markEvidenceSnapshotsUnreferenced 给解绑后不再被任何绑定引用的快照补上孤儿标记。
+// 快照行本身不删（可能仍被其它任务的 finding 共享），且已有标记的行不重复覆盖。
+func markEvidenceSnapshotsUnreferenced(tx *sql.Tx, snapshotIDs []string) error {
+	const batchSize = 200
+	for start := 0; start < len(snapshotIDs); start += batchSize {
+		end := start + batchSize
+		if end > len(snapshotIDs) {
+			end = len(snapshotIDs)
+		}
+		batch := snapshotIDs[start:end]
+		args := make([]any, 0, len(batch))
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		if _, err := tx.Exec(`UPDATE traffic_evidence_snapshots SET unreferenced_at=NOW(3)
+WHERE unreferenced_at IS NULL AND id IN (`+questionPlaceholders(len(batch))+`)
+AND NOT EXISTS (SELECT 1 FROM finding_traffic_bindings binding
+  WHERE binding.snapshot_id = traffic_evidence_snapshots.id)`, args...); err != nil {
 			return err
 		}
 	}
@@ -759,6 +898,12 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 	if state != Restoring || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
 		return nil, fmt.Errorf("%w: restore snapshot identity/state mismatch", ErrTaskArchiveState)
 	}
+	// 合法 stub 例外（I05）：归档恢复只允许覆盖"当前 archive 自己的压缩残留"。
+	// 冷包子 ID 恰好不冲突，并不意味着目标根实体可以安全覆写——活跃 task/exploration
+	// 必须在这里 fail-closed，否则底层 API 就把整个恢复退化成"覆盖任意根实体"。
+	if err := assertRestorableArchiveStub(ctx, tx, taskID, expID, snapshot); err != nil {
+		return nil, err
+	}
 	warnings := []string{}
 
 	// 全图冲突裁决：核心图实体一旦被别的行占用，立即 fail-closed，整个事务回滚，
@@ -847,7 +992,10 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
-	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
+	// 证据绑定是纯关联行（I04）：入向逻辑引用是 (finding_id, snapshot_id)，冷包里的
+	// 自增 id 没有任何引用方，照抄回去只会撞上归档期间别人的新行。恢复前把旧物理
+	// 主键摘掉，交给 TiDB 重新分配；snapshot 属于调用方，这里只改副本。
+	if err := restoreFindingTrafficTx(tx, archiveSnapshotWithoutBindingPKs(snapshot)); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
 	if streamedLLMRecords != "" {
@@ -876,6 +1024,43 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 	return warnings, tx.Commit()
 }
 
+// archiveSnapshotWithoutBindingPKs 返回一份仅剥离 finding_traffic_bindings 旧物理
+// 主键的快照副本（I04）。证据绑定行没有任何入向物理引用，逻辑身份是
+// (finding_id, snapshot_id)，冷包里的旧 id 一律由 TiDB 重新分配；原快照归调用方
+// 所有，绝不就地改写。
+func archiveSnapshotWithoutBindingPKs(snapshot *TaskArchiveSnapshot) *TaskArchiveSnapshot {
+	raw, present := snapshot.Tables["finding_traffic_bindings"]
+	if !present || len(raw) == 0 {
+		return snapshot
+	}
+	rows, err := archiveDecodeRawRows(raw)
+	if err != nil || len(rows) == 0 {
+		return snapshot
+	}
+	stripped := false
+	for _, row := range rows {
+		if _, found := row["id"]; found {
+			delete(row, "id")
+			stripped = true
+		}
+	}
+	if !stripped {
+		return snapshot
+	}
+	trimmed, err := json.Marshal(rows)
+	if err != nil {
+		return snapshot
+	}
+	tables := make(map[string]json.RawMessage, len(snapshot.Tables))
+	for name, value := range snapshot.Tables {
+		tables[name] = value
+	}
+	tables["finding_traffic_bindings"] = trimmed
+	out := *snapshot
+	out.Tables = tables
+	return &out
+}
+
 // archiveEdgeKey / archiveAnchorKey 是核心图关联的逻辑身份，用于冷包与热库的元组比对。
 type archiveEdgeKey struct {
 	src int64
@@ -886,6 +1071,71 @@ type archiveEdgeKey struct {
 type archiveAnchorKey struct {
 	nodeID  int64
 	assetID int64
+}
+
+// assertRestorableArchiveStub 持锁核验恢复目标确属当前 archive 的合法压缩残留（I05）。
+//
+// 归档恢复的"根实体冲突例外"只有一种情形：task/exploration 还在，但已经被压缩成
+// 只剩身份的空壳。若目标是活跃根实体（archived_at/deleted_at 未同时置位，或
+// exploration 仍带着压缩前的内容），说明 restoring 元数据与热库已经不一致，必须
+// fail-closed，绝不能把冷包内容覆盖到无关的活跃任务上。
+func assertRestorableArchiveStub(ctx context.Context, tx *sql.Tx, taskID, expID int64, snapshot *TaskArchiveSnapshot) error {
+	// 快照根行身份：冷包里的 tasks/explorations 行必须就是这张 archive 的根实体本身，
+	// 否则紧随其后的根实体 UPDATE 会写到无关行上。
+	if err := assertArchivedRootRowIdentity(snapshot, "tasks", taskID); err != nil {
+		return err
+	}
+	if err := assertArchivedRootRowIdentity(snapshot, "explorations", expID); err != nil {
+		return err
+	}
+	var taskExpID int64
+	var archived, deleted int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(exploration_id,0),
+ COALESCE(archived_at IS NOT NULL,0), COALESCE(deleted_at IS NOT NULL,0)
+FROM tasks WHERE id=? FOR UPDATE`, taskID).Scan(&taskExpID, &archived, &deleted); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("restore tasks: archived task %d is missing, restore refused", taskID)
+		}
+		return fmt.Errorf("restore probe tasks: %w", err)
+	}
+	if taskExpID != expID {
+		return fmt.Errorf("restore tasks: task %d points at exploration %d, snapshot expects %d", taskID, taskExpID, expID)
+	}
+	if archived == 0 || deleted == 0 {
+		return fmt.Errorf("restore tasks: task %d is not an archived stub (archived=%d deleted=%d), restore refused",
+			taskID, archived, deleted)
+	}
+	var description, goal, status string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(description,''),COALESCE(goal,''),COALESCE(status,'')
+FROM explorations WHERE id=? FOR UPDATE`, expID).Scan(&description, &goal, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("restore explorations: archived exploration %d is missing, restore refused", expID)
+		}
+		return fmt.Errorf("restore probe explorations: %w", err)
+	}
+	// 压缩把 exploration 清成 description=''、goal=''、status='open'；任一不符就说明
+	// 它不是本次归档留下的 stub（可能已被别的任务写回内容）。
+	if description != "" || goal != "" || status != "open" {
+		return fmt.Errorf("restore explorations: exploration %d is not a compacted stub (description %d chars, goal %d chars, status %q), restore refused",
+			expID, len(description), len(goal), status)
+	}
+	return nil
+}
+
+// assertArchivedRootRowIdentity 校验冷包根表里那一行的 id 与 archive 声称的根实体一致。
+func assertArchivedRootRowIdentity(snapshot *TaskArchiveSnapshot, table string, want int64) error {
+	rows, err := archiveDecodeRawRows(snapshot.Tables[table])
+	if err != nil {
+		return fmt.Errorf("restore %s identity: %w", table, err)
+	}
+	if len(rows) != 1 {
+		return fmt.Errorf("restore %s: expected exactly one root row, manifest has %d", table, len(rows))
+	}
+	id, ok := jsonInt64(rawAny(rows[0]["id"]))
+	if !ok || id != want {
+		return fmt.Errorf("restore %s: snapshot root id does not match archive root %d", table, want)
+	}
+	return nil
 }
 
 // assertCoreGraphConflictFree 在写入之前对冷包里的核心图实体做一次 current read
@@ -1586,6 +1836,10 @@ func archiveSideRequestIdentity(row map[string]json.RawMessage) (archiveIdentity
 
 // restoreTaskScopes 还原任务范围。identity/identity_hash 是 NOT NULL 的 canonical
 // 派生列，必须按当前行的语义列重算（冷包里的旧值不采信）。
+//
+// hash 命中本身不构成"已经恢复过"的证据（I03）：摘要相同、完整 identity 不同是合法
+// 可能。因此命中时也要先按物理 PK 取行锁，再在同一事务内用 VerifyHashArbitration
+// 核验完整 identity；碰撞一律上抛，由外层整笔回滚。1062 同样不得盲目吞掉。
 func restoreTaskScopes(ctx context.Context, tx *sql.Tx, raw json.RawMessage) ([]string, error) {
 	rows, err := archiveDecodeRawRows(raw)
 	if err != nil {
@@ -1601,21 +1855,60 @@ func restoreTaskScopes(ctx context.Context, tx *sql.Tx, raw json.RawMessage) ([]
 		if err != nil {
 			return nil, err
 		}
-		var existing int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM task_scope WHERE identity_hash=?`, identity.hash[:]).Scan(&existing); err != nil {
+		duplicate, err := resolveArchivedHashIdentity(ctx, tx, "task_scope", &identity)
+		if err != nil {
 			return nil, err
 		}
-		if existing > 0 {
+		if duplicate {
 			continue
 		}
 		if _, err := archiveInsertRowTx(ctx, tx, "task_scope", row, &identity, nil); err != nil {
-			if tidb.IsDuplicateKey(err) {
-				continue
+			if !tidb.IsDuplicateKey(err) {
+				return nil, err
 			}
-			return nil, err
+			// 唯一键撞车：并发窗口里已经有人写下了同一摘要。走与命中分支完全相同的
+			// 协议——锁候选 PK、仲裁完整 identity；只有字节级一致才允许跳过。
+			duplicate, arbErr := resolveArchivedHashIdentity(ctx, tx, "task_scope", &identity)
+			if arbErr != nil {
+				return nil, arbErr
+			}
+			if !duplicate {
+				return nil, fmt.Errorf("archive restore task_scope: duplicate key on a hash that no longer resolves: %w", err)
+			}
+			continue
 		}
 	}
 	return warnings, nil
+}
+
+// resolveArchivedHashIdentity 处理"按 hash 已经命中一行"的分支：
+//  1. 先用一次非锁定读定位候选物理 PK（VerifyHashArbitration 不能作为预定位器）；
+//  2. 按物理 PK 拿 FOR UPDATE 行锁，满足 helper 的锁序前置条件；
+//  3. 在同一事务内比对完整 identity：字节相等返回 true（同一身份，不必重复插入）；
+//     不等时把 ErrIdentityHashCollision 原样上抛，由调用方整笔回滚。
+func resolveArchivedHashIdentity(ctx context.Context, tx *sql.Tx, table string, identity *archiveIdentityWrite) (bool, error) {
+	var candidate int64
+	err := tx.QueryRowContext(ctx, "SELECT `"+identity.pkCol+"` FROM `"+table+"` WHERE `"+identity.hashCol+"`=?", identity.hash[:]).Scan(&candidate)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("archive restore %s hash lookup: %w", table, err)
+	}
+	if _, err := tx.ExecContext(ctx, "SELECT `"+identity.pkCol+"` FROM `"+table+"` WHERE `"+identity.pkCol+"`=? FOR UPDATE", candidate); err != nil {
+		return false, fmt.Errorf("archive restore %s lock candidate row %d: %w", table, candidate, err)
+	}
+	found, err := schema.VerifyHashArbitration(ctx, tx, table, identity.pkCol, identity.identCol, identity.hashCol, identity.hash, identity.identity)
+	if err != nil {
+		if errors.Is(err, schema.ErrIdentityHashCollision) {
+			return false, fmt.Errorf("archive restore %s: identity hash collision on candidate row %d, restore refused: %w", table, candidate, err)
+		}
+		return false, fmt.Errorf("archive restore %s hash arbitration: %w", table, err)
+	}
+	if int64(found) != candidate {
+		return false, fmt.Errorf("archive restore %s: hash arbitration resolved to row %d but lookup found %d", table, found, candidate)
+	}
+	return true, nil
 }
 
 func archiveTaskScopeIdentity(row map[string]json.RawMessage) (archiveIdentityWrite, error) {
@@ -1722,7 +2015,14 @@ func restoreInterceptRowsCtx(ctx context.Context, tx *sql.Tx, raw json.RawMessag
 				row["audit"] = mustJSON(audit)
 			}
 		}
-		if _, err := archiveInsertRowTx(ctx, tx, "intercept_pending", row, nil, nil); err != nil {
+		// 旧自增主键只有在仍空闲时才复用（I04）：archivePrepareLeafPrimaryKey 会先把
+		// 行里的旧 id 摘掉再探测占用，被别的任务占走时返回 nil，交给 TiDB 重新分配。
+		// 此前这里直接传 nil 显式键，白名单仍带着旧 id 落库，撞上无关任务的主键。
+		explicitPK, err := archivePrepareLeafPrimaryKey(ctx, tx, "intercept_pending", row)
+		if err != nil {
+			return err
+		}
+		if _, err := archiveInsertRowTx(ctx, tx, "intercept_pending", row, nil, explicitPK); err != nil {
 			return err
 		}
 	}
@@ -1779,13 +2079,39 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=? AND archived_at IS NOT NULL`, taskID); err != nil {
+	// 影响行数逐条核对：目标不是归档 stub（或已经被别处删走）时，绝不能"删 0 行也算成功"。
+	if n, err := execArchiveStubDelete(tx, `DELETE FROM tasks WHERE id=? AND archived_at IS NOT NULL`, taskID); err != nil {
 		return err
+	} else if n != 1 {
+		return fmt.Errorf("%w: task %d is not a deletable archive stub", ErrTaskArchiveState, taskID)
 	}
-	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=?`, expID); err != nil {
+	if n, err := execArchiveStubDelete(tx, `DELETE FROM explorations WHERE id=?`, expID); err != nil {
 		return err
+	} else if n != 1 {
+		return fmt.Errorf("%w: exploration %d of archive %d is missing", ErrTaskArchiveState, expID, archiveID)
+	}
+	// 新 Catalog 没有 FK 级联（I06）：task_archives 元数据必须在这个事务里自己删干净。
+	// 只删 task/exploration 会留下一条 state='deleting' 的孤儿归档——它污染归档列表、
+	// 任务 claim 与依赖检查，重启重入时又 JOIN 不到 task，永远无法收敛。
+	if n, err := execArchiveStubDelete(tx, `DELETE FROM task_archives WHERE id=?`, archiveID); err != nil {
+		return err
+	} else if n != 1 {
+		return fmt.Errorf("%w: archive %d metadata is missing", ErrTaskArchiveState, archiveID)
 	}
 	return tx.Commit()
+}
+
+// execArchiveStubDelete 执行永久删除的一条 DELETE，并把真实影响行数带回来。
+func execArchiveStubDelete(tx *sql.Tx, query string, args ...any) (int64, error) {
+	res, err := tx.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
 }
 
 // ArchivedAggregateStats returns compact summaries used by global dashboards so

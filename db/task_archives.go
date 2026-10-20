@@ -285,6 +285,12 @@ LIMIT 1 FOR UPDATE`, taskID).Scan(&dependent)
 		}
 		sources = append(sources, id)
 	}
+	// 迭代中途的驱动错误只会让 Next() 提前结束；不查 Rows.Err() 就会把残缺的
+	// source_task_ids 当成完整结果写进归档元数据。
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
@@ -1066,6 +1072,11 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 			return nil, err
 		}
 		sources = append(sources, id)
+	}
+	// 同上：冷包里的 source_task_ids 必须来自完整迭代，中途错误一律上抛。
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err

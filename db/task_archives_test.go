@@ -403,48 +403,55 @@ func TestTaskArchive_SevenTableManifestWhitelistStrict(t *testing.T) {
 // 关键语义列，并确认物理键由 TiDB 重新分配、canonical identity 由当前口径重算。
 func TestTaskArchive_SevenTableRestoreFidelity(t *testing.T) {
 	fixture := newArchiveSevenTableFixture(t)
+	// 归档之前先把夹具自己的**旧物理键**留档：判定"物理键被重新分配"必须拿导出前
+	// 的真实键做对照，而不是在压缩之后读一个恒为 0 的全库 MAX。
+	legacyKeys := archiveFixturePhysicalKeys(t, fixture)
 	snapshot, archiveID := archiveAndCompactFixture(t, fixture)
 
-	// 压缩后 7 张表必须彻底清空，并留下自增水位用于断言"物理键被重新分配"。
-	watermarks := map[string]int64{}
-	for table, query := range map[string]string{
-		"task_relations":             `SELECT COALESCE(MAX(row_id),0) FROM task_relations`,
-		"task_asset_links":           `SELECT COALESCE(MAX(row_id),0) FROM task_asset_links`,
-		"task_llm_profiles":          `SELECT COALESCE(MAX(row_id),0) FROM task_llm_profiles`,
-		"exploration_edges":          `SELECT COALESCE(MAX(row_id),0) FROM exploration_edges`,
-		"exploration_anchors":        `SELECT COALESCE(MAX(row_id),0) FROM exploration_anchors`,
-		"side_question_sessions":     `SELECT COALESCE(MAX(row_id),0) FROM side_question_sessions`,
-		"side_question_requests":     `SELECT COALESCE(MAX(ordinal),0) FROM side_question_requests`,
-		"traffic_evidence_snapshots": `SELECT COALESCE(MAX(row_id),0) FROM traffic_evidence_snapshots`,
-	} {
-		if rows := archiveCount(t, fixture.d, query); rows != 0 {
-			t.Fatalf("%s still holds %d rows after hot compaction", table, rows)
+	// 压缩后的残留用独立 ID 集合断言：夹具范围内的七表连同边/锚/证据绑定必须一处不剩。
+	// 锚点判据走 asset_id、绑定判据走 finding_id，都不依赖已被删除的父行子查询，
+	// 因此 I01 那类"父行删了、关系还在"的孤儿一定会在这里现形。
+	if leftovers := archiveFixturePhysicalKeys(t, fixture); len(leftovers) > 0 {
+		for table, ids := range leftovers {
+			if len(ids) > 0 {
+				t.Fatalf("%s still holds %d rows after hot compaction: %v", table, len(ids), ids)
+			}
 		}
-		watermarks[table] = archiveScalar(t, fixture.d, query)
 	}
 
 	restored := restoreArchiveFixture(t, fixture, archiveID, snapshot)
-	if restored != nil {
+	if len(restored) != 0 {
 		t.Fatalf("restore returned warnings for a fully owned package: %v", restored)
 	}
+	restoredKeys := archiveFixturePhysicalKeys(t, fixture)
 	for table, count := range archiveFixtureSevenTableCounts(t, fixture) {
 		want := snapshot.DataCounts[table]
 		if count != want {
 			t.Fatalf("%s restored %d rows, manifest recorded %d", table, count, want)
 		}
-		if table == "traffic_evidence_snapshots" {
-			continue
+	}
+	// 物理键必须是 TiDB 新分配的号段：恢复后不得出现任何归档前的旧键。
+	// traffic_evidence_snapshots 是 VARCHAR 逻辑主键（内容哈希），必须原样保留，不参与本断言。
+	for _, table := range []string{"task_relations", "task_asset_links", "task_llm_profiles",
+		"exploration_edges", "exploration_anchors", "side_question_sessions",
+		"side_question_requests", "finding_traffic_bindings"} {
+		before := map[int64]bool{}
+		for _, id := range legacyKeys[table] {
+			before[id] = true
 		}
-		key := "row_id"
-		if table == "side_question_requests" {
-			key = "ordinal"
+		for _, id := range restoredKeys[table] {
+			if before[id] {
+				t.Fatalf("%s reused archived physical key %d: surrogate must be reassigned by TiDB", table, id)
+			}
 		}
-		lowest := archiveScalar(t, fixture.d, fmt.Sprintf(`SELECT COALESCE(MIN(%s),0) FROM %s WHERE %s`,
-			key, table, archiveFixtureSevenTableWhere(table, fixture)))
-		if lowest <= watermarks[table] {
-			t.Fatalf("%s reused physical key %d (watermark %d): surrogate must be reassigned by TiDB",
-				table, lowest, watermarks[table])
-		}
+	}
+	if restored := archiveFixturePhysicalKeys(t, fixture)["side_question_requests"]; len(restored) != int(snapshot.DataCounts["side_question_requests"]) {
+		t.Fatalf("restored side_question_requests rows=%d, manifest recorded %d",
+			len(restored), snapshot.DataCounts["side_question_requests"])
+	}
+	if restored := archiveFixturePhysicalKeys(t, fixture)["finding_traffic_bindings"]; len(restored) != int(snapshot.DataCounts["finding_traffic_bindings"]) {
+		t.Fatalf("restored finding_traffic_bindings rows=%d, manifest recorded %d",
+			len(restored), snapshot.DataCounts["finding_traffic_bindings"])
 	}
 
 	f := fixture
@@ -503,17 +510,20 @@ WHERE node.exploration_id=? AND anchor.node_id=? AND anchor.asset_id=?`,
 		t.Fatalf("side_question_sessions fidelity lost: snapshot=%q memory=%q version=%d generation=%d",
 			sessionSnapshot, sessionMemory, sessionVersion, sessionGeneration)
 	}
-	// canonical identity 必须按当前口径重算：用同样的输入独立算一遍再比对字节。
-	payload := schema.SideQuestionRequestsIdentity(f.sessionKey, archiveFixtureRequestGeneration, archiveFixtureRequestClient)
-	digest := schema.CanonicalHash(payload)
-	var requests int
-	if err := f.d.QueryRow(`SELECT COUNT(*) FROM side_question_requests
+	// canonical identity 必须按当前口径重算：两条请求各自用自己的 client_id 独立算一遍
+	// 再比对字节。任何一行退回冷包里的旧 identity，都会掉出这个集合。
+	for _, client := range []string{archiveFixtureRequestClient, archiveFixtureRequestClient2} {
+		payload := schema.SideQuestionRequestsIdentity(f.sessionKey, archiveFixtureRequestGeneration, client)
+		digest := schema.CanonicalHash(payload)
+		var requests int
+		if err := f.d.QueryRow(`SELECT COUNT(*) FROM side_question_requests
 WHERE session_key=? AND client_id=? AND identity=? AND identity_hash=?`,
-		f.sessionKey, archiveFixtureRequestClient, payload, digest[:]).Scan(&requests); err != nil {
-		t.Fatalf("restored side_question_requests identity: %v", err)
-	}
-	if requests != int(snapshot.DataCounts["side_question_requests"]) {
-		t.Fatalf("restored side_question_requests with recomputed identity=%d, want %d", requests, snapshot.DataCounts["side_question_requests"])
+			f.sessionKey, client, payload, digest[:]).Scan(&requests); err != nil {
+			t.Fatalf("restored side_question_requests identity for %s: %v", client, err)
+		}
+		if requests != 1 {
+			t.Fatalf("restored side_question_requests matching recomputed identity for %s = %d, want 1", client, requests)
+		}
 	}
 	var urls, reqHashes string
 	var capturedAt, status int64
@@ -552,6 +562,11 @@ func TestTaskArchive_CoreConflictFailsClosedWithFullRollback(t *testing.T) {
 	if _, err := d.RestoreTaskArchive(archiveID, snapshot, 600); err == nil {
 		t.Fatal("conflicting core graph restore must be refused")
 	} else {
+		// 只要求"报个错"是不够的：必须确认拒绝确实来自被预占的 task_asset_links，
+		// 而不是压缩残留让流程在更早的位置提前失败。
+		if !strings.Contains(err.Error(), "task_asset_links") {
+			t.Fatalf("restore failed for the wrong reason, want a task_asset_links conflict: %v", err)
+		}
 		t.Logf("fail-closed as expected: %v", err)
 	}
 
@@ -574,6 +589,27 @@ func TestTaskArchive_CoreConflictFailsClosedWithFullRollback(t *testing.T) {
 	}
 	if state != Restoring {
 		t.Fatalf("refused restore archive state=%q, want %q (its progress write must roll back too)", state, Restoring)
+	}
+
+	// 合法 stub 例外（I05）：把根 task 改回"活跃"状态（清掉归档标记）。恢复必须拒绝，
+	// 绝不能因为冷包子实体恰好不冲突，就把冷包内容覆盖到一个活跃任务上。
+	if _, err := d.Exec(`UPDATE tasks SET archived_at=NULL WHERE id=?`, fixture.task.ID); err != nil {
+		t.Fatalf("make the root task live again: %v", err)
+	}
+	if _, err := d.RestoreTaskArchive(archiveID, snapshot, 600); err == nil {
+		t.Fatal("restoring onto an active (non-stub) task must be refused")
+	} else if !strings.Contains(err.Error(), "archived stub") {
+		t.Fatalf("active root task was refused for the wrong reason: %v", err)
+	}
+	if _, err := d.Exec(`UPDATE tasks SET archived_at=NOW(3) WHERE id=?`, fixture.task.ID); err != nil {
+		t.Fatalf("restore the archived marker: %v", err)
+	}
+	active := archiveFixtureSevenTableCounts(t, fixture)
+	for table, count := range active {
+		if count != before[table] {
+			t.Fatalf("%s changed to %d rows after the refused active-root restore (want %d): not fully rolled back",
+				table, count, before[table])
+		}
 	}
 }
 
@@ -606,8 +642,10 @@ func TestTaskArchive_EndToEndRoundTrip(t *testing.T) {
 	if _, err := d.Exec(`UPDATE tasks SET llm_profile_id=?,active_llm_profile_id=? WHERE id=?`, profileID, profileID, task.ID); err != nil {
 		t.Fatal(err)
 	}
+	// 8 列 / 8 个占位符 / 8 个实参严格对齐，并且绑定真实的 profileID：
+	// profile_id 写死 0 时 restoreTaskLLMProfiles 会因 llm_profiles 查不到该配置而整行跳过。
 	if _, err := d.Exec(`INSERT INTO task_llm_profiles(task_id,profile_id,position,status,last_error,exhausted_at,created_at,updated_at)
-VALUES(?,0,0,'quota_exhausted','balance exhausted',?,?,?)`, task.ID, exhaustedAt, chainCreatedAt, exhaustedAt); err != nil {
+VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, 0, "quota_exhausted", "balance exhausted", exhaustedAt, chainCreatedAt, exhaustedAt); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -929,6 +967,10 @@ const (
 	archiveFixtureSessionGeneration = int64(1)
 	archiveFixtureRequestGeneration = uint64(1)
 	archiveFixtureRequestClient     = "archive-client"
+	// 第二条旁路请求必须有**自己的** client_id：identity 的 canonical 口径是
+	// (session_key, generation, client_id)，复用第一条的 client_id 就会复用同一条
+	// identity/identity_hash，直接撞上 uq_side_requests_identity。
+	archiveFixtureRequestClient2 = "archive-client-2"
 )
 
 var archiveFixtureExhaustedAt = time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
@@ -1009,9 +1051,20 @@ func newArchiveSevenTableFixture(t *testing.T) *archiveSevenTableFixture {
 	}
 	fixture.nodeIDs = []int64{fact, intent}
 
-	if _, err := d.Exec(`INSERT INTO task_asset_links(task_id,asset_id,source,source_summary,source_node_id)
-VALUES(?,?,?,?,?)`, task.ID, assetID, archiveFixtureLinkSource, archiveFixtureLinkSummary, fact); err != nil {
-		t.Fatalf("insert task_asset_links: %v", err)
+	// UpsertRootDomain 已经在资产的唯一写出口里原子双写了这条 (task_id,asset_id) link
+	// （db/assets.go writeAsset → ensureTaskAssetLinkTx）。夹具绝不能再 INSERT 一份，
+	// 那会正面撞上 uq_task_asset_links；七表保真度要断言的是来源三列，因此改成在原地
+	// 盖戳，并核实行确实由双写产生（影响 1 行）。
+	linkRows, err := d.Exec(`UPDATE task_asset_links SET source=?,source_summary=?,source_node_id=?
+WHERE task_id=? AND asset_id=?`, archiveFixtureLinkSource, archiveFixtureLinkSummary, fact, task.ID, assetID)
+	if err != nil {
+		t.Fatalf("stamp task_asset_links provenance: %v", err)
+	}
+	if affected, err := linkRows.RowsAffected(); err != nil {
+		t.Fatalf("task_asset_links rows affected: %v", err)
+	} else if affected != 1 {
+		t.Fatalf("task_asset_links dual write left %d rows for (task %d, asset %d), want exactly 1",
+			affected, task.ID, assetID)
 	}
 
 	profileID, err := d.SaveProfile(&LLMProfile{Name: tag + "-profile", Format: "openai", Model: "archive-model"})
@@ -1019,8 +1072,10 @@ VALUES(?,?,?,?,?)`, task.ID, assetID, archiveFixtureLinkSource, archiveFixtureLi
 		t.Fatalf("create llm profile: %v", err)
 	}
 	fixture.profileID = profileID
+	// 列清单、占位符与实参严格 8/8/8，并且必须绑定真实的 profileID——写死 0 会让
+	// restoreTaskLLMProfiles 因为 llm_profiles 里查不到该配置而整行跳过。
 	if _, err := d.Exec(`INSERT INTO task_llm_profiles(task_id,profile_id,position,status,last_error,exhausted_at,created_at,updated_at)
-VALUES(?,0,0,'quota_exhausted','balance exhausted',?,?,?)`, task.ID, profileID,
+VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, int64(1), "quota_exhausted", "balance exhausted",
 		archiveFixtureExhaustedAt, archiveFixtureExhaustedAt.Add(-time.Hour), archiveFixtureExhaustedAt); err != nil {
 		t.Fatalf("insert task_llm_profiles: %v", err)
 	}
@@ -1059,18 +1114,25 @@ VALUES(?,0,0,'quota_exhausted','balance exhausted',?,?,?)`, task.ID, profileID,
 		archiveFixtureSessionSnapshot, archiveFixtureSessionGeneration, archiveFixtureSessionMemory); err != nil {
 		t.Fatalf("insert side_question_sessions: %v", err)
 	}
+	// 两条旁路请求：13 列 / 13 个 VALUES 项 / 13 个占位符 / 13 个实参，逐一对齐。
+	// 第二条使用自己的 client_id，并按它自己的 canonical identity 重算 identity 与
+	// identity_hash，否则两行会撞 uq_side_requests_identity 唯一索引。
 	if _, err := d.Exec(`INSERT INTO side_question_requests
 (id,session_key,generation,client_id,identity,identity_hash,question,answer,status,model,sequence,usage,context_info)
-VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?,?)`, "req-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
-		archiveFixtureRequestClient, requestIdentityPayload(fixture.sessionKey), requestIdentityHash(fixture.sessionKey),
-		"why?", "because", "done", `{"model":"archive-model"}`, `{"calls":1}`, `{"nodes":0}`); err != nil {
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "req-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
+		archiveFixtureRequestClient,
+		requestIdentityPayload(fixture.sessionKey, archiveFixtureRequestClient),
+		requestIdentityHash(fixture.sessionKey, archiveFixtureRequestClient),
+		"why?", "because", "done", `{"model":"archive-model"}`, int64(0), `{"calls":1}`, `{"nodes":0}`); err != nil {
 		t.Fatalf("insert side_question_requests: %v", err)
 	}
 	if _, err := d.Exec(`INSERT INTO side_question_requests
 (id,session_key,generation,client_id,identity,identity_hash,question,answer,status,model,sequence,usage,context_info)
-VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)`, "req2-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
-		archiveFixtureRequestClient+"-2", requestIdentityPayload(fixture.sessionKey), requestIdentityHash(fixture.sessionKey),
-		"again?", "again", "done", `{"model":"archive-model"}`, `{"calls":2}`, `{"nodes":1}`); err != nil {
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "req2-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
+		archiveFixtureRequestClient2,
+		requestIdentityPayload(fixture.sessionKey, archiveFixtureRequestClient2),
+		requestIdentityHash(fixture.sessionKey, archiveFixtureRequestClient2),
+		"again?", "again", "done", `{"model":"archive-model"}`, int64(1), `{"calls":2}`, `{"nodes":1}`); err != nil {
 		t.Fatalf("insert second side_question_requests: %v", err)
 	}
 
@@ -1079,12 +1141,13 @@ VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)`, "req2-"+tag, fixture.sessionKey, int64(arc
 }
 
 // requestIdentityPayload 用与线上写路径同一个 canonical 口径算出 identity 载荷。
-func requestIdentityPayload(sessionKey string) []byte {
-	return schema.SideQuestionRequestsIdentity(sessionKey, archiveFixtureRequestGeneration, archiveFixtureRequestClient)
+// client_id 是 identity 的一部分，每条请求都必须按自己的 client_id 计算。
+func requestIdentityPayload(sessionKey, clientID string) []byte {
+	return schema.SideQuestionRequestsIdentity(sessionKey, archiveFixtureRequestGeneration, clientID)
 }
 
-func requestIdentityHash(sessionKey string) []byte {
-	sum := schema.CanonicalHash(requestIdentityPayload(sessionKey))
+func requestIdentityHash(sessionKey, clientID string) []byte {
+	sum := schema.CanonicalHash(requestIdentityPayload(sessionKey, clientID))
 	return sum[:]
 }
 
@@ -1096,7 +1159,9 @@ func archiveFixtureCleanup(t *testing.T, fixture *archiveSevenTableFixture) {
 		query string
 		args  []any
 	}{
-		{`DELETE FROM finding_traffic_bindings WHERE finding_id IN (SELECT id FROM findings WHERE task_id IN (?,?))`, []any{taskID, sourceID}},
+		// 判据里额外带上 snapshot_id / asset_id：压缩或恢复失败留下的孤儿关系，其父行
+		// 已经不在，只靠父行子查询永远删不掉，会污染后续用例。
+		{`DELETE FROM finding_traffic_bindings WHERE finding_id IN (SELECT id FROM findings WHERE task_id IN (?,?)) OR snapshot_id=?`, []any{taskID, sourceID, fixture.snapshotID}},
 		{`DELETE FROM traffic_evidence_snapshots WHERE id=?`, []any{fixture.snapshotID}},
 		{`DELETE FROM side_question_requests WHERE session_key=?`, []any{fixture.sessionKey}},
 		{`DELETE FROM side_question_sessions WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
@@ -1112,7 +1177,7 @@ func archiveFixtureCleanup(t *testing.T, fixture *archiveSevenTableFixture) {
 		{`DELETE FROM task_relations WHERE task_id IN (?,?) OR source_task_id IN (?,?)`, []any{taskID, sourceID, taskID, sourceID}},
 		{`DELETE FROM activity WHERE exploration_id=?`, []any{expID}},
 		{`DELETE FROM task_constraints WHERE exploration_id=?`, []any{expID}},
-		{`DELETE FROM exploration_anchors WHERE node_id IN (SELECT id FROM exploration_nodes WHERE exploration_id=?)`, []any{expID}},
+		{`DELETE FROM exploration_anchors WHERE node_id IN (SELECT id FROM exploration_nodes WHERE exploration_id=?) OR asset_id=?`, []any{expID, fixture.assetID}},
 		{`DELETE FROM exploration_edges WHERE exploration_id=?`, []any{expID}},
 		{`DELETE FROM exploration_nodes WHERE exploration_id=?`, []any{expID}},
 		{`DELETE FROM assets WHERE id=?`, []any{fixture.assetID}},
@@ -1187,6 +1252,57 @@ func archiveFixtureSevenTableCounts(t *testing.T, fixture *archiveSevenTableFixt
 	return out
 }
 
+// archiveFixturePhysicalKeys 采集夹具在受管表上留下的物理主键集合（升序）。
+//
+// 每张表的定位条件都必须**不依赖可能已被压缩删除的父行**：锚点按 asset_id、证据
+// 绑定按 finding_id、旁路请求按 session_key。只有这样才能区分"父行删干净了"和
+// "父行删了、关系行还留在热库"这两种完全不同的状态。
+func archiveFixturePhysicalKeys(t *testing.T, fixture *archiveSevenTableFixture) map[string][]int64 {
+	t.Helper()
+	task := fmt.Sprint(fixture.task.ID)
+	exp := fmt.Sprint(fixture.task.ExplorationID)
+	probes := []struct {
+		table  string
+		column string
+		where  string
+		args   []any
+	}{
+		{"task_relations", "row_id", "task_id=" + task, nil},
+		{"task_asset_links", "row_id", "task_id=" + task, nil},
+		{"task_llm_profiles", "row_id", "task_id=" + task, nil},
+		{"exploration_edges", "row_id", "exploration_id=" + exp, nil},
+		{"exploration_anchors", "row_id", "asset_id=?", []any{fixture.assetID}},
+		{"side_question_sessions", "row_id", "task_id=" + task, nil},
+		{"side_question_requests", "ordinal", "session_key=?", []any{fixture.sessionKey}},
+		{"finding_traffic_bindings", "id", "finding_id=?", []any{fixture.findingID}},
+	}
+	out := make(map[string][]int64, len(probes))
+	for _, probe := range probes {
+		rows, err := fixture.d.Query(`SELECT `+probe.column+` FROM `+probe.table+` WHERE `+probe.where+` ORDER BY `+probe.column, probe.args...)
+		if err != nil {
+			t.Fatalf("read %s physical keys: %v", probe.table, err)
+		}
+		ids := []int64{}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				t.Fatalf("scan %s physical keys: %v", probe.table, err)
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatalf("iterate %s physical keys: %v", probe.table, err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close %s physical keys: %v", probe.table, err)
+		}
+		out[probe.table] = ids
+	}
+	return out
+}
+
 // archiveFixtureSevenTableWhere 把每张表限定到夹具自己的数据上。
 func archiveFixtureSevenTableWhere(table string, fixture *archiveSevenTableFixture) string {
 	task := fmt.Sprint(fixture.task.ID)
@@ -1201,7 +1317,10 @@ func archiveFixtureSevenTableWhere(table string, fixture *archiveSevenTableFixtu
 	case "exploration_edges":
 		return "exploration_id=" + exp
 	case "exploration_anchors":
-		return "node_id IN (SELECT id FROM exploration_nodes WHERE exploration_id=" + exp + ")"
+		// 判据不能走 nodes 子查询：压缩把节点删干净后，孤儿锚恰好查不到，
+		// 计数会假装"已清空"。夹具资产由来源任务共享、不会被压缩删除，按它定位
+		// 就能看到任何残留下来的锚。
+		return "asset_id=" + fmt.Sprint(fixture.assetID)
 	case "side_question_sessions":
 		return "task_id=" + task
 	case "traffic_evidence_snapshots":
@@ -1277,4 +1396,281 @@ func readRepoFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(raw)
+}
+
+// =====================================================================
+// 离线门禁：夹具 SQL 的列 / 占位符 / 实参必须逐一对齐（I02）
+// =====================================================================
+
+// TestTaskArchive_FixtureSQLBindingsAligned 用 AST 扫本文件里每一条以字符串字面量
+// 发出的 Exec/ExecContext，核对三条确定性不变式：
+//  1. INSERT 的列数必须等于 VALUES 项数；
+//  2. 语句里 `?` 的数量必须等于绑定的实参数量；
+//  3. 外键语义列（`*_id`）绝不允许被写成常量 0 —— profile_id=0 一类的写死会让恢复侧
+//     按"引用的配置已删除"整行跳过，夹具却照样建得出来。
+//
+// 这三类错位既不违反编译也不被 go vet 捕获，只在真实 TiDB 上以"夹具根本插不进去"
+// 或"恢复静默少一行"的形式暴露，集成用例没 DSN 时又整组 SKIP。把它们变成离线可执行
+// 的门禁，缺陷就不会再退回。
+func TestTaskArchive_FixtureSQLBindingsAligned(t *testing.T) {
+	const source = "task_archives_test.go"
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, source, readRepoFile(t, source), 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", source, err)
+	}
+	checked := 0
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel.Name != "Exec" && sel.Sel.Name != "ExecContext" {
+			return true
+		}
+		args := call.Args
+		if sel.Sel.Name == "ExecContext" {
+			if len(args) < 2 {
+				return true
+			}
+			args = args[1:]
+		}
+		// Exec(query, args...) 一类的动态绑定数量不在本门禁的能力范围内。
+		if len(args) == 0 || call.Ellipsis != token.NoPos {
+			return true
+		}
+		statement, ok := literalSQLText(args[0])
+		if !ok {
+			return true
+		}
+		checked++
+		line := fileSet.Position(call.Lparen).Line
+		if bound, want := len(args)-1, strings.Count(statement, "?"); bound != want {
+			t.Errorf("line %d binds %d arguments but the statement carries %d placeholders:\n%s",
+				line, bound, want, trimForReport(statement))
+		}
+		columns, values, ok := insertColumnsAndValues(statement)
+		if !ok {
+			return true
+		}
+		if len(columns) != len(values) {
+			t.Errorf("line %d lists %d INSERT columns but supplies %d VALUES items:\n%s",
+				line, len(columns), len(values), trimForReport(statement))
+		}
+		for index, item := range values {
+			if index >= len(columns) {
+				break
+			}
+			if !strings.HasSuffix(columns[index], "_id") {
+				continue
+			}
+			if trimmed := strings.TrimSpace(item); trimmed == "0" || trimmed == "'0'" {
+				t.Errorf("line %d hard-wires INSERT column %s to %s instead of binding the real reference",
+					line, columns[index], trimmed)
+			}
+		}
+		return true
+	})
+	if checked == 0 {
+		t.Fatal("fixture binding gate inspected no literal SQL statement; the scanner is broken")
+	}
+}
+
+// literalSQLText 取出一条语句的常量文本：反引号/双引号字面量，或它们的 `+` 拼接。
+func literalSQLText(expr ast.Expr) (string, bool) {
+	switch typed := expr.(type) {
+	case *ast.BasicLit:
+		if typed.Kind != token.STRING {
+			return "", false
+		}
+		value, err := strconv.Unquote(typed.Value)
+		if err != nil {
+			return "", false
+		}
+		return value, true
+	case *ast.BinaryExpr:
+		if typed.Op != token.ADD {
+			return "", false
+		}
+		left, ok := literalSQLText(typed.X)
+		if !ok {
+			return "", false
+		}
+		right, ok := literalSQLText(typed.Y)
+		if !ok {
+			return "", false
+		}
+		return left + right, true
+	default:
+		return "", false
+	}
+}
+
+// insertColumnsAndValues 解出一条 INSERT 的列清单与 VALUES 项（按顶层逗号切分）。
+// 只处理"表名 (列) … VALUES (项)"这一种夹具写法，其他形态直接判定为不适用。
+func insertColumnsAndValues(statement string) ([]string, []string, bool) {
+	lower := strings.ToLower(statement)
+	start := strings.Index(lower, "insert into")
+	if start < 0 {
+		return nil, nil, false
+	}
+	rest := statement[start:]
+	restLower := lower[start:]
+	open := strings.Index(rest, "(")
+	if open < 0 {
+		return nil, nil, false
+	}
+	columns, closed := splitParenthesized(rest, open)
+	if closed < 0 {
+		return nil, nil, false
+	}
+	rest = rest[closed+1:]
+	restLower = restLower[closed+1:]
+	valuesAt := strings.Index(restLower, "values")
+	if valuesAt < 0 {
+		return nil, nil, false
+	}
+	rest = rest[valuesAt+len("values"):]
+	open = strings.Index(rest, "(")
+	if open < 0 {
+		return nil, nil, false
+	}
+	values, closed := splitParenthesized(rest, open)
+	if closed < 0 {
+		return nil, nil, false
+	}
+	// 多行 VALUES(`(…), (…)`）不在夹具写法内，出现即视为不适用而不是误报。
+	if strings.Contains(strings.TrimSpace(rest[closed+1:]), "(") {
+		return nil, nil, false
+	}
+	return columns, values, true
+}
+
+// splitParenthesized 从 open 处的 `(` 起读到配对 `)`，返回按顶层逗号切开的片段。
+func splitParenthesized(text string, open int) ([]string, int) {
+	depth := 0
+	quote := byte(0)
+	parts := []string{}
+	start := open + 1
+	for index := open; index < len(text); index++ {
+		char := text[index]
+		switch {
+		case quote != 0:
+			if char == quote {
+				quote = 0
+			}
+		case char == '\'' || char == '"' || char == '`':
+			quote = char
+		case char == '(':
+			depth++
+		case char == ')':
+			depth--
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(text[start:index]))
+				return parts, index
+			}
+		case char == ',' && depth == 1:
+			parts = append(parts, strings.TrimSpace(text[start:index]))
+			start = index + 1
+		}
+	}
+	return nil, -1
+}
+
+// =====================================================================
+// 替身驱动的离线控制流门禁（I03 / I04）
+//
+// 复用 P08-02 留下的 database/sql driver 替身：它记录每一条真正经过 database/sql
+// 的语句。这里证明的是"实现发出了什么 SQL、走了哪条分支"，不冒充 TiDB 的真机锁行为。
+// =====================================================================
+
+// TestTaskArchive_ScopeHashHitLocksCandidateAndArbitrates 让 task_scope 的 hash 探测
+// 命中一条候选行：恢复必须 (1) 先按物理 PK 取 FOR UPDATE 行锁，(2) 在同一事务里调用
+// VerifyHashArbitration 核验完整 identity，(3) 核验不出结果时报错而不是静默跳过。
+// 旧实现只 COUNT(*) 命中就 continue，既没有锁也没有仲裁。
+func TestTaskArchive_ScopeHashHitLocksCandidateAndArbitrates(t *testing.T) {
+	state := newStubState(
+		// 非锁定定位：按 hash 命中候选物理 PK 9001。
+		stubRule{match: stubMatch("FROM `task_scope` WHERE `identity_hash`=?"), rows: stubRowsAlways(9001)},
+	)
+	d := openStubDB(t, state)
+	tx, err := d.Begin()
+	if err != nil {
+		t.Fatalf("begin stub tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	raw := json.RawMessage(`[{"task_id":101,"kind":"domain","domain":"corp.example"}]`)
+	if _, err := restoreTaskScopes(context.Background(), tx, raw); err == nil {
+		t.Fatal("a hash hit came back without an error: the arbitration outcome was swallowed")
+	}
+
+	var lockAt, arbitrationAt = -1, -1
+	for index, call := range state.statements(func(call stubCall) bool {
+		return strings.Contains(call.Query, "task_scope")
+	}) {
+		switch {
+		case strings.Contains(call.Query, "SELECT `id` FROM `task_scope` WHERE `id`=? FOR UPDATE"):
+			lockAt = index
+		case strings.Contains(call.Query, "SELECT `id`, `identity` FROM `task_scope`"):
+			arbitrationAt = index
+		case strings.Contains(call.Query, "INSERT INTO `task_scope`"):
+			t.Fatalf("a hash hit must never insert blindly: %s", call.Query)
+		case strings.Contains(call.Query, "COUNT(*)"):
+			t.Fatalf("hash lookup must resolve the candidate physical PK, not just count rows: %s", call.Query)
+		}
+	}
+	if lockAt < 0 {
+		t.Fatal("hash hit never took a FOR UPDATE lock on the candidate physical PK")
+	}
+	if arbitrationAt < 0 {
+		t.Fatal("hash hit never ran VerifyHashArbitration over the full identity")
+	}
+	if lockAt > arbitrationAt {
+		t.Fatalf("arbitration (statement %d) must run after the PK lock (statement %d)", arbitrationAt, lockAt)
+	}
+}
+
+// TestTaskArchive_InterceptOccupiedPrimaryKeyIsReassigned 让 intercept_pending 的旧
+// 物理键探测返回"已被占用"：恢复必须摘掉旧 id、由 TiDB 重新分配，绝不能把冷包里的
+// 旧主键插回别人的行上。
+func TestTaskArchive_InterceptOccupiedPrimaryKeyIsReassigned(t *testing.T) {
+	state := newStubState(
+		// 主键占用探测：返回 1 行，表示 id=17 已经被无关任务占走。
+		stubRule{match: stubMatch("COUNT(*) FROM `intercept_pending`"), rows: stubRowsAlways(1)},
+	)
+	d := openStubDB(t, state)
+	tx, err := d.Begin()
+	if err != nil {
+		t.Fatalf("begin stub tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	raw := json.RawMessage(`[{"id":17,"status":"approved","decision_source":"rule","reason":"fixture"}]`)
+	if err := restoreInterceptRowsCtx(context.Background(), tx, raw); err != nil {
+		t.Fatalf("restore intercept rows: %v", err)
+	}
+	probes := state.statements(func(call stubCall) bool {
+		return strings.Contains(call.Query, "COUNT(*) FROM `intercept_pending`")
+	})
+	if len(probes) != 1 {
+		t.Fatalf("occupancy probes issued = %d, want exactly 1", len(probes))
+	}
+	inserts := state.statements(func(call stubCall) bool {
+		return strings.Contains(call.Query, "INSERT INTO `intercept_pending`")
+	})
+	if len(inserts) != 1 {
+		t.Fatalf("intercept_pending inserts = %d, want exactly 1", len(inserts))
+	}
+	columns, _, ok := insertColumnsAndValues(inserts[0].Query)
+	if !ok {
+		t.Fatalf("cannot parse the emitted INSERT: %s", inserts[0].Query)
+	}
+	if containsColumn(columns, "id") {
+		t.Fatalf("an occupied archived primary key was replayed instead of reassigned: %s", inserts[0].Query)
+	}
 }
