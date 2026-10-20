@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -255,10 +256,19 @@ func (d *DB) TouchConversation(id int64) error {
 //     conversation_id → 删 side_question_requests → side_question_sessions →
 //     conversation_activities → intercept_pending → 最后删会话根行，并断言无孤儿。
 //
+// 写者协议（M20 的另一半，审查 F04）：TiDB 基线不带外键，删除侧这把根行锁只有与写侧
+// **共用同一把锁**才成立。conversation_activities / intercept_pending /
+// side_question_sessions 三类子实体的产品写入口都必须在自己的事务里先
+// lockConversationForReference（或旁路快照的 lockSideParent）锁住会话根行再写子行，父行
+// 已消失就拒绝写入（ErrConversationNotFound / ErrSideParentGone）。新增会话子实体写入口
+// 时少这把锁，等于重新打开"删除提交后复活孤儿"的洞。
+//
 // Retest 语义契约（务必保持）：finding_retests 的行**永不物删**（它是 finding 的重测
 // 历史，不是会话的从属数据），只把弱引用置空；处于 pending/running 的 retest 转成
 // 停止态 stopped（否则 active_finding_id 生成列会一直占住该 finding 的唯一键），
-// completed 等终态一律不动。
+// completed 等终态一律不动。由于闭包收集是普通读、并发收尾方 FinishFindingRetest 不锁
+// 会话根行，"收集到活跃 → 执行时已被并发收尾成终态"的交错真实存在，停止语句因此必须带
+// status IN ('pending','running') 的当前状态守卫（审查 F03，细则见执行器 Step 1 注释）。
 func (d *DB) DeleteConversation(id int64) error {
 	if id <= 0 {
 		return nil
@@ -354,11 +364,61 @@ func deleteConversationLocked(ctx context.Context, tx *sql.Tx, id int64) (bool, 
 	return true, nil
 }
 
+// ErrConversationNotFound 表示按 id 指定的 conversations 行不存在（现在不存在，或刚刚
+// 被删除）。会话子实体的写入方拿它区分"父会话已被删除"与真实数据库错误。
+var ErrConversationNotFound = errors.New("conversation not found")
+
+// lockConversationForReference 在**写入方自己的事务内**锁住并校验会话根行
+// （M20 / 闭环 R51-F07-01 / 审查 F04）。
+//
+// 为什么必须有这把锁：TiDB 基线不建外键，"删除会话"与"写会话子实体"之间没有任何数据库
+// 约束兜底。删除侧（deleteConversationLocked）对 conversations 取 FOR UPDATE，但如果
+// 写入方只是裸 INSERT，那它和删除方**不共享任何互斥对象**：删除事务提交后，一条还在
+// 途中的 emit/审批 INSERT 照样成功，留下一行指向已删除会话的孤儿活动/审批记录；删除
+// 事务里那句 COUNT 孤儿断言也永远看不见它（它发生在提交之后）。
+//
+// 因此所有会话子实体的产品写入口都必须：先在同一事务里 lockConversationForReference，
+// 再写子行。父行不在了就返回 ErrConversationNotFound 拒绝写入 —— 这正是我们想要的
+// "迟到的写入者被拒之门外"，绝不能静默成功。
+//
+// 锁序契约：会话根行永远是会话闭包写入路径上的**第一把锁**（旁路快照 lockSideParent
+// 也是先锁 conversations 再锁 side_question_sessions；审批写入方先锁 intercept_rules
+// 再锁 conversations，而删除路径从不反向请求 rule 锁），全仓不得出现"先锁子行再锁会话
+// 根"的写法，否则就会与 DeleteConversation 形成死锁环。
+//
+// convID == 0 表示"本就没有父会话"（后台任务审批、纯 task 侧活动），直接放行。
+func lockConversationForReference(tx *sql.Tx, convID int64) error {
+	if convID <= 0 {
+		return nil
+	}
+	var id int64
+	err := tx.QueryRow(`SELECT id FROM conversations WHERE id = ? FOR UPDATE`, convID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: %d", ErrConversationNotFound, convID)
+	}
+	return err
+}
+
 // AppendConvActivity records one step of a conversation (human message or an agent
 // execution step) and returns its id. Mirrors ExplorationStore.AppendActivity but
 // keyed by conversation_id. Reuses the Activity struct (NodeID is ignored here).
+//
+// 父会话存活校验（审查 F04）：整条写入跑在一个事务里，第一件事就是 lockConversationForReference
+// 抢会话根行。DeleteConversation 持同一把锁，于是两种交错都成立：
+//   - 删除先提交 → 本函数拿不到父行（SELECT … FOR UPDATE 空集）→ ErrConversationNotFound，
+//     绝不落下一条孤儿活动；
+//   - 本函数先拿到锁 → 删除必须等本次 INSERT 提交后才能继续，随后 DELETE … WHERE
+//     conversation_id = ? 把它一并带走，闭包内不会出现"删除已清理，活动又复活"。
 func (d *DB) AppendConvActivity(convID int64, a Activity) (int64, error) {
-	res, err := d.Exec(`
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := lockConversationForReference(tx, convID); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`
 INSERT INTO conversation_activities(conversation_id, worker, kind, tool, tool_use_id, is_error, summary, detail, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
 VALUES (?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,NULLIF(?,''),NULLIF(?,''),?,?,?,?)`,
 		convID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError,
@@ -366,7 +426,14 @@ VALUES (?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,NULLIF(?,''),NUL
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // ConvActivityList returns a conversation's steps after sinceID (exclusive) with
@@ -409,10 +476,15 @@ func (d *DB) ConvActivityPage(convID, before int64, limit int) ([]Activity, bool
 	}
 	const cols = `id, COALESCE(worker,''), COALESCE(kind,''), COALESCE(tool,''), COALESCE(tool_use_id,''), is_error, COALESCE(summary,''), created_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens`
 	// fetch one extra row to detect whether older history remains before this window.
+	//
+	// `before` 在这条语句里被引用了**两次**（0 门 + id 上界）。PG 的编号参数可以复用
+	// （`$2 <= 0 OR id < $2`），MySQL/TiDB 的 `?` 是位置参数，每个占位符都必须单独绑定，
+	// 因此实参必须是 (convID, before, before, limit+1) —— 少绑一位就是 4 占位符 vs 3 参数
+	// 的绑定错误（审查 F01：任意一次历史加载都会 500）。
 	rows, err := d.Query(`SELECT `+cols+`
 FROM conversation_activities
 WHERE conversation_id = ? AND (? <= 0 OR id < ?)
-ORDER BY id DESC LIMIT ?`, convID, before, limit+1)
+ORDER BY id DESC LIMIT ?`, convID, before, before, limit+1)
 	if err != nil {
 		return nil, false, err
 	}

@@ -91,10 +91,16 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 }
 
 // UpdateTrigger updates a trigger's fields (not last_fire).
+//
+// 参数顺序（审查 F02）：SET 子句的 14 列按 SQL 里出现的先后顺序绑定，**主键 id 排在最后**
+// （它是 WHERE id=? 的谓词，不是 SET 列表的一员）。PG 时代写成 `SET enabled=$2 …
+// tool_names=$15 WHERE id=$1`，实参以 t.ID 开头是对的；换成位置占位符后如果还把 t.ID
+// 放在第一位，就会整体错位一格 —— enabled 被写成 trigger id，WHERE id 被写成 tool_names
+// 的 JSON 文本，更新打在错误的行上却仍然可能返回 nil（占位符总数没变，数量守卫抓不到）。
 func (d *DB) UpdateTrigger(t *AgentTrigger) error {
 	_, err := d.Exec(`UPDATE agent_triggers SET enabled=?, interval_sec=?, on_finding=?, on_goal_met=?, on_task_timeout=?, on_tool_call=?, on_task_create=?, interval_message=?, finding_message=?, goal_message=?, task_timeout_message=?, tool_call_message=?, task_create_message=?, tool_names=? WHERE id=?`,
-		t.ID, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate,
-		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, marshalToolNames(t.ToolNames))
+		t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate,
+		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, marshalToolNames(t.ToolNames), t.ID)
 	return err
 }
 

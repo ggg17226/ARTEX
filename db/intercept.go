@@ -204,6 +204,8 @@ const interceptPendingInsertCols = `rule_id, conversation_id, task_id, agent_nam
 //
 // ruleID != 0 时先在同一事务里锁定并校验父规则（F5）：父规则已被删除就把 rule_id
 // 降级成 NULL，绝不写悬空引用。
+// convID != 0 时同样在同一事务里锁定并校验父会话（审查 F04）：会话已删除就**拒绝写入**
+// （ErrConversationNotFound），绝不留下挂在已删会话上的孤儿审批。
 func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, toolName string, input []byte, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
@@ -226,6 +228,14 @@ func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, too
 	// ruleID != 0 但父规则已消失 → 同样写 NULL，但 decision_source 仍记录真实的原始 ruleID（'rule'），杜绝篡改审计来源（N1）。
 	ruleIDPtr, err := resolveInterceptRuleParent(tx, ruleID)
 	if err != nil {
+		return 0, err
+	}
+	// 审查 F04：会话作用域的审批行必须与 DeleteConversation 抢同一把会话根锁，否则
+	// "会话已删除 + 在途审批落库"会留下一条指向已删会话的孤儿审批。与父规则不同，这里的
+	// 语义是**拒绝写入**而不是降级成 NULL：conversation_id 写 NULL 等于把一条本属于会话的
+	// 审批伪装成无父的后台任务审批（前端会把它归到另一个列表），会话都没了，这条记录就
+	// 不该存在。convID == 0（后台任务）不受影响，锁序固定为 intercept_rules → conversations。
+	if err := lockConversationForReference(tx, convID); err != nil {
 		return 0, err
 	}
 	res, err := tx.Exec(`
@@ -256,7 +266,8 @@ func (d *DB) DecideInterceptPending(id int64, status string) error {
 // rule matches for observability — they don't block and need no user action, so unlike
 // CreateInterceptPending (which starts 'pending') this records the outcome directly.
 //
-// 父规则协议与 CreateInterceptPending 完全一致（锁定 + 存活校验 + 缺失降级为 NULL）。
+// 父规则协议与 CreateInterceptPending 完全一致（锁定 + 存活校验 + 缺失降级为 NULL）；
+// 父会话同样是**同事务加锁 + 存活校验 + 缺失拒绝写入**（审查 F04）。
 func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, toolName string, input []byte, status, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
@@ -278,6 +289,11 @@ func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, too
 	// ruleID == 0 → NULL: the LLM fallback judge has no owning rule.
 	ruleIDPtr, err := resolveInterceptRuleParent(tx, ruleID)
 	if err != nil {
+		return 0, err
+	}
+	// 会话父锁协议与 CreateInterceptPending 完全一致（审查 F04）：先锁 conversations 根行
+	// 校验存活，父会话已删除就直接拒绝写入，绝不把已定论的详情记录落到已删会话上。
+	if err := lockConversationForReference(tx, convID); err != nil {
 		return 0, err
 	}
 	res, err := tx.Exec(`

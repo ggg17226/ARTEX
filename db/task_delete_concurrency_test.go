@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -73,6 +74,13 @@ VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID); 
 		deleter, _ := openTaskDeleteTestDB(t, dsn)
 		prepared := make(chan TaskDeletePreparation, 1)
 		releasePrepare := make(chan struct{})
+		// 审查 F06：prepare 回调是删除事务里的**阻塞点**，回调不放行，删除 goroutine 就
+		// 永远停在回调里，后面等 deleteDone 必然 12s 超时，还会遗留一条挂着的事务。
+		// 用 Once 包一层：正常路径显式放行一次，任何 t.Fatal 的提前退出路径由 Cleanup
+		// 兜底放行，绝不允许"只有失败分支才 close"的倒置。
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releasePrepare) }) }
+		t.Cleanup(release)
 		deleteDone := make(chan error, 1)
 		go func() {
 			_, deleteErr := deleter.DeleteTaskCascadePrepared(first.ID, true, false, false,
@@ -88,14 +96,14 @@ VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID); 
 		select {
 		case plan = <-prepared:
 		case err := <-deleteDone:
-			close(releasePrepare)
+			release()
 			t.Fatalf("delete returned before preparation: %v", err)
 		case <-time.After(5 * time.Second):
-			close(releasePrepare)
+			release()
 			t.Fatal("timed out waiting for task delete preparation")
 		}
 		if !containsDeleteHost(plan.TrafficHosts, host) {
-			close(releasePrepare)
+			release()
 			t.Fatalf("exclusive host %q missing from preparation: %v", host, plan.TrafficHosts)
 		}
 
@@ -111,6 +119,10 @@ INSERT INTO assets(type, url, service_type, domain, task_ids)
 VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID)
 			writerDone <- writeErr
 		}()
+
+		// 共享者已经发起，此刻放行 prepare：删除事务继续走完 host 解析之后的全部清理并
+		// 提交，两条腿都必须正常收尾。
+		release()
 
 		if err := waitForTaskDeleteResult(deleteDone); err != nil {
 			t.Fatal(err)

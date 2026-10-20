@@ -439,17 +439,19 @@ VALUES (?, ?, 0)`, task.ID, profileID); err != nil {
 		t.Fatal(err)
 	}
 
-	// TiDB 上没有 FK 派生的 KEY SHARE 锁可以把删除挡在 profile 行上（见
-	// waitForBackendBlock 的说明），"未提交引用 + 观察阻塞"这一半在 TiDB 上不成立。
-	// 因此把时序改成确定形态：先把引用提交，再发起删除。验证的产品契约不变 ——
+	// TiDB 上没有 FK 派生的 KEY SHARE 锁可以把删除挡在 profile 行上（见 waitForBackendBlock
+	// 的说明），"未提交引用 + 观察阻塞"这一半在 TiDB 上不成立。因此这个用例把时序改成确定
+	// 形态：先把引用**提交**，再发起删除 —— 这里根本没有 blocker 持有锁，所以它不能、也不该
+	// 借用"证明阻塞"的共享 helper（审查 F05：依赖 PG 外键派生锁的个别场景单独适配，不许
+	// 反过来改写所有调用者共享的 helper 语义）。它验证的产品契约不变 ——
 	// 删除必须正确处理"初始扫描之后才出现的引用"，绝不能留下悬挂引用。
 	if err := referenceTx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	deleteDB, deletePID := openSingleConnectionTestDB(t, dsn)
+	deleteDB, _ := openSingleConnectionTestDB(t, dsn)
 	lateDone := make(chan error, 1)
 	go func() { lateDone <- deleteDB.DeleteProfile(profileID) }()
-	if err := waitForBackendBlock(d, deletePID, lateDone); err != nil {
+	if err := waitForMutationResult(lateDone); err != nil {
 		t.Fatalf("delete profile after late reference: %v", err)
 	}
 
@@ -487,32 +489,89 @@ func openSingleConnectionTestDB(t *testing.T, dsn string) (*DB, int) {
 	return d, pid
 }
 
-// waitForBackendBlock 等待被观察的写操作在预算内正常结束。
+// lockObservationProbe 非阻塞地探测 done：一旦读到结果，就说明被观察的操作**没有**停在
+// 预期的锁上（要么提前成功返回，要么带着错误返回）。
 //
-// 迁移前这里查询 PG 的阻塞链函数，先确认"确实被挡住"，用例再提交对手事务。该观察手段
-// 在 TiDB 上没有等价视图；更关键的是**原本的阻塞本身就是 PG 外键机器的产物**：
-// task_llm_profiles.profile_id 的外键让参考行对 llm_profiles 持 KEY SHARE 锁，才把
-// DeleteProfile 挡在 profile 行上。本项目的 TiDB 基线不建外键，那把锁根本不存在，
-// 照搬"必须观察到阻塞"在 TiDB 上是必然失败，不是偶发失败。
+// 关键约束：本函数只在"抓到提前返回"这一种情况下读 done。证明阻塞成功的分支绝不读 done，
+// 那唯一一次的完成结果必须留给调用方的 waitForMutationResult（审查 F05：迁移期这里被改成
+// "等到 done 有值就算观察到阻塞"，等于把"证明阻塞"偷换成"证明完成"—— 正确实现真的被挡住
+// 时必然超时，而即便操作侥幸跑完，结果也被这里吃掉，调用方第二次等待还是超时）。
+func lockObservationProbe(done <-chan error) error {
+	select {
+	case err := <-done:
+		if err == nil {
+			return fmt.Errorf("mutation returned successfully before reaching the expected lock")
+		}
+		return fmt.Errorf("mutation failed before reaching the expected lock: %v", err)
+	default:
+		return nil
+	}
+}
+
+// tidbLockWaiting 尝试用 MySQL/TiDB 侧的锁等待视图**强证明** pid 上的语句正在等行锁。
 //
-// 因此这里只保留它仍能证明的那一半：操作必须在预算内返回且不得报错；时序由各用例显式
-// "先提交对手事务"来保证（把未提交的迟到引用变成已提交的引用，验证的是同一条产品契约
-// ——删除必须正确处理初始扫描之后才出现的引用）。
-// 遗留缺口写入 task-4.3 报告：需在真机 TiDB 上补一版基于 1205 锁等待超时的并发用例。
+// 返回 available=false 表示这个 TiDB 版本没有提供可查询的锁等待视图（表/列不存在、权限
+// 不足、视图不维护等待状态），调用方据此降级到保守观察。
+func tidbLockWaiting(observer *DB, pid int) (waiting bool, available bool) {
+	var pending int
+	err := observer.QueryRow(`SELECT COUNT(1) FROM information_schema.innodb_trx
+ WHERE trx_mysql_thread_id = ? AND trx_state = 'LOCK WAIT'`, pid).Scan(&pending)
+	if err != nil {
+		return false, false
+	}
+	return pending > 0, true
+}
+
+// waitForBackendBlock 证明被观察的写操作**确实被对手事务挡在锁上**，返回后调用方再释放
+// blocker，并**唯一一次**消费 done（审查 F05 恢复的协议）。
+//
+// 调用方契约（每个用例都遵守）：
+//  1. 先用自己的一条事务对被观察操作**必需**的那一行取 FOR UPDATE（任务行 / agent 行 /
+//     会话行 / profile 行，锁的都是产品代码确实要加锁的行，不是 PG 外键派生的隐式锁）；
+//  2. 启动被观察操作 → waitForBackendBlock 证明它真的停在锁上（不消费 done）；
+//     期间用例还可断言 assertProfilesUnlocked —— 只有"确实阻塞了"这条断言才有意义；
+//  3. 回滚 blocker → 操作继续 → waitForMutationResult 收唯一那个完成结果。
+//
+// 观察分两级：
+//   - 强观察：information_schema.innodb_trx 里该连接处于 LOCK WAIT（TiDB 若维护该状态）；
+//   - 保守观察：视图不可用、或预算的一半内始终没有 LOCK WAIT（部分 TiDB 版本不在视图里
+//     维护等待状态）。此时退到"settle 窗口内操作仍未返回"：blocker 持的正是被观察操作
+//     必需的那把行锁，没被挡住的实现会在窗口内直接跑完并把结果放进带缓冲的 done，
+//     所以"根本没阻塞"依然判红；只是它证明不了"等的恰好是那把锁"，这一点写进实施报告。
 func waitForBackendBlock(observer *DB, pid int, done <-chan error) error {
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case err := <-done:
-			if err != nil {
-				return fmt.Errorf("mutation failed while the reference was held: %v", err)
+	const (
+		budget       = 10 * time.Second
+		settleWindow = 500 * time.Millisecond
+	)
+	start := time.Now()
+	viewTrusted := true
+	for time.Since(start) < budget {
+		if err := lockObservationProbe(done); err != nil {
+			return err
+		}
+		if viewTrusted {
+			waiting, available := tidbLockWaiting(observer, pid)
+			switch {
+			case waiting:
+				return nil
+			case !available:
+				viewTrusted = false
+			}
+		}
+		if !viewTrusted {
+			// 保守观察：等一个 settle 窗口，再确认它**仍然**没有返回。
+			time.Sleep(settleWindow)
+			if err := lockObservationProbe(done); err != nil {
+				return err
 			}
 			return nil
-		default:
 		}
 		time.Sleep(10 * time.Millisecond)
+		if time.Since(start) > budget/2 {
+			viewTrusted = false
+		}
 	}
-	return fmt.Errorf("connection %d did not finish within 10s", pid)
+	return fmt.Errorf("connection %d did not block within %s", pid, budget)
 }
 
 // assertProfilesUnlocked 断言这些 profile 行此刻没有被持有者锁住（即删除路径没有在

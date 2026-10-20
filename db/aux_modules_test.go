@@ -25,12 +25,19 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Autumn-27/artex/db/schema"
 	"github.com/Autumn-27/artex/sidequestion"
+
+	// SQLite（纯 Go，已在 go.mod 里，traffic 包生产使用）只用于**离线语义探针**：
+	// 把"真实闭包 + 真实级联执行器"发出的 SQL 打进一个内存库，验证 SQL 的实际语义
+	// （审查 F03：并发完成的终态是否会被覆写）。它不是 TiDB，也不替代真机门禁，
+	// 只在没有 DSN 的环境里给出可判定的语义证据。
+	_ "modernc.org/sqlite"
 )
 
 // =====================================================================
@@ -944,28 +951,62 @@ func TestConversation_DeleteConversation_ClosureAndRetestStatements(t *testing.T
 		t.Fatalf("根行 FOR UPDATE 锁必须在任何 DELETE 之前：lock=%d firstDelete=%d", lockIdx, firstDelete)
 	}
 
-	// 判据②：活跃 retest 停止，且停止集合严格等于 pending/running 的那一个 id。
+	// 判据②（审查 F03 修复轮次 1）：停止语句必须**同时**带两道闸门 ——
+	//   ① 作用域：打在闭包收集好的活跃 id 集合上（同会话 completed 的 902 绝不在里面）；
+	//   ② 当前状态守卫 status IN ('pending','running')：闭包收集是普通读，收集之后
+	//      FinishFindingRetest 完全可能把同一条复测提交成 completed。少了这道守卫，
+	//      无条件 SET status='stopped' 就把已提交的终态篡改成停止态 —— 直接违反
+	//      R51-F07-01「终态不可篡改」的铁律。
 	stop := auxFind(t, writes, "UPDATE FINDING_RETESTS SET STATUS = 'STOPPED'")
-	if strings.Contains(auxUpper(stop), "STATUS IN ('PENDING'") {
-		t.Fatalf("停止语句必须打在预先收集好的 id 集合上，避免把 completed 一并误伤：%s", stop.Query)
+	normStop := auxUpper(stop)
+	for _, want := range []string{"WHERE ID IN (", "AND STATUS IN ('PENDING', 'RUNNING')"} {
+		if !strings.Contains(normStop, want) {
+			t.Fatalf("停止活跃 retest 缺少 %s（id 集合 + 当前状态守卫缺一不可）：%s", want, auxCollapse(stop.Query))
+		}
+	}
+	if got := auxSetClause(t, stop.Query); got != "STATUS = 'STOPPED', CONVERSATION_ID = NULL" {
+		t.Errorf("停止语句只允许写 status/conversation_id 两列，实际 %q：%s", got, auxCollapse(stop.Query))
 	}
 	if len(stop.Args) != 1 || !auxNumEq(stop.Args[0], 901) {
 		t.Fatalf("停止语句的参数必须恰好是活跃 retest 901，实际 %v", stop.Args)
 	}
 
-	// 判据③：弱关联置空只打 conversation_id，且谓词是等值（绝不 NULL-safe），
+	// 判据③（审查 F03）：收集之后才被并发收尾成终态的那条，只能被**脱钩**、不能被改状态。
+	// 因此必须存在一条 SET 列表里**没有 status** 的置空语句，作用域覆盖收集到的全部 id
+	// （含 902 这条 completed）：外键被清掉，状态原样保留。
+	detach := auxFind(t, writes, "UPDATE FINDING_RETESTS SET CONVERSATION_ID = NULL WHERE ID IN (")
+	if strings.Contains(auxSetClause(t, detach.Query), "STATUS") {
+		t.Fatalf("按 id 脱钩的语句绝不得写 status（会覆写并发提交的终态）：%s", auxCollapse(detach.Query))
+	}
+	if len(detach.Args) != 2 || !auxNumEq(detach.Args[0], 901) || !auxNumEq(detach.Args[1], 902) {
+		t.Fatalf("按 id 脱钩必须覆盖收集到的全部 retest（901/902），实际 %v", detach.Args)
+	}
+	// 兜底：再按会话作用域清一次，捕获"闭包收集之后才绑定本会话"的迟到引用，
+	// 让无孤儿断言不因这条竞态窗口误判成删除失败。
+	scope := auxFind(t, writes, "UPDATE FINDING_RETESTS SET CONVERSATION_ID = NULL WHERE CONVERSATION_ID = ?")
+	if strings.Contains(auxSetClause(t, scope.Query), "STATUS") {
+		t.Fatalf("会话作用域置空绝不得写 status：%s", auxCollapse(scope.Query))
+	}
+	if len(scope.Args) != 1 || !auxNumEq(scope.Args[0], uint64(convID)) {
+		t.Fatalf("作用域置空参数必须是会话 id 本身，实际 %v", scope.Args)
+	}
+	// 三条 finding_retests 写语句的谓词都必须是等值（绝不 NULL-safe、绝不 IS NULL），
 	// 未绑定会话（conversation_id IS NULL）的历史 retest 不得被波及。
-	nullify := auxFind(t, writes, "UPDATE FINDING_RETESTS SET CONVERSATION_ID = NULL")
-	if !strings.Contains(auxUpper(nullify), "WHERE CONVERSATION_ID = ?") ||
-		strings.Contains(auxUpper(nullify), "<=>") || strings.Contains(auxUpper(nullify), "IS NULL") {
-		t.Fatalf("置空谓词必须是 conversation_id = ?：%s", auxCollapse(nullify.Query))
+	for _, c := range writes {
+		if !strings.Contains(auxUpper(c), "FINDING_RETESTS") {
+			continue
+		}
+		u := auxUpper(c)
+		if strings.Contains(u, "<=>") || strings.Contains(u, "CONVERSATION_ID IS NULL") {
+			t.Errorf("finding_retests 写语句谓词必须等值，不得波及未绑定会话的历史行：%s", auxCollapse(c.Query))
+		}
 	}
-	if len(nullify.Args) != 1 || !auxNumEq(nullify.Args[0], uint64(convID)) {
-		t.Fatalf("置空参数必须是会话 id 本身，实际 %v", nullify.Args)
-	}
-	// 停止必须先于置空：置空后仍能按 id 精确停止，但状态机顺序固定更好审计。
-	if auxIndexOf(t, writes, "SET STATUS = 'STOPPED'") > auxIndexOf(t, writes, "SET CONVERSATION_ID = NULL") {
-		t.Errorf("必须先停止活跃 retest 再置空引用")
+	// 顺序：先停止活跃（顺手脱钩）→ 再按 id 脱钩全部 → 最后作用域兜底。
+	stopAt := auxIndexOf(t, writes, "SET STATUS = 'STOPPED'")
+	detachAt := auxIndexOf(t, writes, "SET CONVERSATION_ID = NULL WHERE ID IN")
+	scopeAt := auxIndexOf(t, writes, "SET CONVERSATION_ID = NULL WHERE CONVERSATION_ID = ?")
+	if !(stopAt < detachAt && detachAt < scopeAt) {
+		t.Errorf("retest 写序必须是 停止(%d) < 按 id 脱钩(%d) < 作用域兜底(%d)", stopAt, detachAt, scopeAt)
 	}
 
 	// 判据④：四类级联依赖全部显式删除，且都带会话作用域谓词。
@@ -1168,10 +1209,12 @@ func TestConversation_CreateAndUpdateDialect(t *testing.T) {
 	}
 }
 
-// TestConversation_AppendConvActivityUsesLastInsertId 覆盖 RETURNING id → LastInsertId。
+// TestConversation_AppendConvActivityUsesLastInsertId 覆盖 RETURNING id → LastInsertId，
+// 以及审查 F04 的父锁协议：会话子实体的 INSERT 之前必须已经在同一事务里锁住会话根行。
 func TestConversation_AppendConvActivityUsesLastInsertId(t *testing.T) {
 	eng := newExpMockEngine()
 	d := openExpMockDB(t, eng)
+	eng.on("SELECT id FROM conversations WHERE id = ? FOR UPDATE", []string{"id"}, []driver.Value{int64(77)})
 	eng.setNextInsertID(6001)
 	id, err := d.AppendConvActivity(77, Activity{Worker: "w", Kind: "msg", Summary: "s"})
 	if err != nil {
@@ -1187,6 +1230,15 @@ func TestConversation_AppendConvActivityUsesLastInsertId(t *testing.T) {
 		if strings.Contains(auxUpper(insert), frag) {
 			t.Errorf("INSERT conversation_activities 残留 PG 方言 %q：%s", frag, auxCollapse(insert.Query))
 		}
+	}
+	// 父锁必须是这条写入的第一条语句，且整笔写入恰好提交一次。
+	lockAt := auxIndexOf(t, calls, "SELECT ID FROM CONVERSATIONS WHERE ID = ? FOR UPDATE")
+	insertAt := auxIndexOf(t, calls, "INSERT INTO CONVERSATION_ACTIVITIES")
+	if lockAt > insertAt {
+		t.Errorf("会话根行锁必须在 INSERT 之前：lock=%d insert=%d", lockAt, insertAt)
+	}
+	if counts := eng.txCounts(); counts.Commits != 1 || counts.Rollbacks != 0 {
+		t.Errorf("活动写入必须提交恰好一次，实际 %+v", counts)
 	}
 }
 
@@ -1982,4 +2034,404 @@ func auxMinInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// =====================================================================
+// 9) 审查修复轮次 1 的回归守卫
+//    F01 会话历史分页的重复游标绑定 / F02 UpdateTrigger 参数顺序 /
+//    F03 并发完成后的 Retest 终态不可篡改 / F04 会话子实体写者父锁
+// =====================================================================
+
+// auxSetClause 返回 UPDATE 语句 SET 与 WHERE 之间的赋值列表（归一化大写、单行）。
+// 参数顺序错位的直接表现就是"SET 列 ↔ 绑定值"配错，所以逐位断言必须先拿到列的次序。
+func auxSetClause(t *testing.T, query string) string {
+	t.Helper()
+	u := strings.ToUpper(auxCollapse(query))
+	start := strings.Index(u, " SET ")
+	end := strings.Index(u, " WHERE ")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("不是可解析的 UPDATE 语句：%s", auxCollapse(query))
+	}
+	return strings.TrimSpace(u[start+len(" SET ") : end])
+}
+
+// auxSetColumns 按出现顺序返回 UPDATE SET 子句里的列名（小写）。
+func auxSetColumns(t *testing.T, query string) []string {
+	t.Helper()
+	parts := strings.Split(auxSetClause(t, query), ",")
+	cols := make([]string, 0, len(parts))
+	for _, p := range parts {
+		eq := strings.Index(p, "=")
+		if eq < 0 {
+			t.Fatalf("SET 子句里出现非赋值片段 %q：%s", p, auxCollapse(query))
+		}
+		cols = append(cols, strings.ToLower(strings.TrimSpace(p[:eq])))
+	}
+	return cols
+}
+
+// auxConvActivityCols 是 ConvActivityList/ConvActivityPage 那 12 列摘要列的名字。
+var auxConvActivityCols = []string{
+	"id", "worker", "kind", "tool", "tool_use_id", "is_error",
+	"summary", "created_at", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+}
+
+// auxConvActivityRow 造一行摘要活动（列序与 auxConvActivityCols 一致）。
+func auxConvActivityRow(id int64, created time.Time) []driver.Value {
+	tokens := int64(7)
+	return []driver.Value{id, "w", "text", "", "", false, fmt.Sprintf("s-%d", id), created, tokens, tokens, tokens, tokens}
+}
+
+// TestConversation_ConvActivityPageBindsRepeatedCursor 锁死审查 F01：
+//
+//	`conversation_id = ? AND (? <= 0 OR id < ?) ORDER BY id DESC LIMIT ?`
+//
+// 里 `before` 被引用了两次，PG 可以复用同一个编号参数，MySQL/TiDB 的 `?` 是位置参数，
+// **每个占位符必须单独绑定**。少绑一位就是运行期绑定错误，任意一次历史加载都直接 500。
+func TestConversation_ConvActivityPageBindsRepeatedCursor(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+	created := time.Date(2026, 10, 20, 3, 4, 5, 0, time.UTC)
+	// 3 行 > limit=2 → hasMore 必须为 true，且返回窗口按 id 升序。
+	eng.on("FROM conversation_activities", auxConvActivityCols,
+		auxConvActivityRow(int64(5), created),
+		auxConvActivityRow(int64(4), created),
+		auxConvActivityRow(int64(3), created))
+
+	activities, hasMore, err := d.ConvActivityPage(77, 0, 2)
+	if err != nil {
+		t.Fatalf("首屏历史加载失败：%v", err)
+	}
+	calls := eng.snapshotCalls()
+	auxAssertAllOrdinal(t, calls)
+
+	page := auxFind(t, calls, "FROM CONVERSATION_ACTIVITIES")
+	normalized := auxUpper(page)
+	for _, want := range []string{"CONVERSATION_ID = ?", "(? <= 0 OR ID < ?)", "ORDER BY ID DESC LIMIT ?"} {
+		if !strings.Contains(normalized, want) {
+			t.Errorf("反向分页缺少 %s：%s", want, auxCollapse(page.Query))
+		}
+	}
+	// 逐位绑定：(conversation_id, before 门, before 上界, limit+1)。
+	if len(page.Args) != 4 {
+		t.Fatalf("分页必须绑定 4 个参数，实际 %d 个：%v", len(page.Args), page.Args)
+	}
+	if !auxNumEq(page.Args[0], 77) {
+		t.Errorf("参数 0 必须是会话 id 77，实际 %v", page.Args[0])
+	}
+	if !auxNumEq(page.Args[1], 0) || !auxNumEq(page.Args[2], 0) {
+		t.Errorf("游标被引用两次，两个占位符都必须绑定 before：%v", page.Args)
+	}
+	if page.Args[1] != page.Args[2] {
+		t.Errorf("两个游标占位符必须绑同一个 before：%v", page.Args)
+	}
+	if !auxNumEq(page.Args[3], 3) {
+		t.Errorf("LIMIT 必须绑 limit+1=%d 以探测更早历史，实际 %v", 3, page.Args[3])
+	}
+	if !hasMore {
+		t.Errorf("取回 limit+1 行时 hasMore 必须为 true")
+	}
+	if len(activities) != 2 || activities[0].ID != 4 || activities[1].ID != 5 {
+		ids := make([]int64, 0, len(activities))
+		for _, a := range activities {
+			ids = append(ids, a.ID)
+		}
+		t.Errorf("窗口必须截断到 limit 并按 id 升序返回，实际 %v", ids)
+	}
+
+	// 非零游标：同一个 before 依然要出现在两个位置上。
+	eng2 := newExpMockEngine()
+	d2 := openExpMockDB(t, eng2)
+	eng2.on("FROM conversation_activities", auxConvActivityCols,
+		auxConvActivityRow(int64(3), created), auxConvActivityRow(int64(2), created))
+	if _, hasMore2, err := d2.ConvActivityPage(77, 123, 2); err != nil {
+		t.Fatalf("翻页历史加载失败：%v", err)
+	} else if hasMore2 {
+		t.Errorf("取回不足 limit+1 行时 hasMore 必须为 false")
+	}
+	calls2 := eng2.snapshotCalls()
+	auxAssertAllOrdinal(t, calls2)
+	page2 := auxFind(t, calls2, "FROM CONVERSATION_ACTIVITIES")
+	if len(page2.Args) != 4 || !auxNumEq(page2.Args[1], 123) || !auxNumEq(page2.Args[2], 123) {
+		t.Fatalf("游标 123 必须在第 1、2 位各绑定一次，实际 %v", page2.Args)
+	}
+}
+
+// TestTriggers_UpdateTriggerBindsSetColumnsInOrderAndIDLast 锁死审查 F02：
+// PG 的 `SET enabled=$2 … tool_names=$15 WHERE id=$1` 换成位置占位符后，实参必须
+// 按 SET 列的出现顺序重排，主键 id 落到**最后一位**。
+func TestTriggers_UpdateTriggerBindsSetColumnsInOrderAndIDLast(t *testing.T) {
+	eng := newExpMockEngine()
+	d := openExpMockDB(t, eng)
+
+	tr := &AgentTrigger{
+		ID: 77, AgentKey: "custom", Enabled: true, IntervalSec: 300,
+		OnFinding: true, OnGoalMet: false, OnTaskTimeout: true, OnToolCall: false, OnTaskCreate: true,
+		IntervalMessage: "im", FindingMessage: "fm", GoalMessage: "gm",
+		TaskTimeoutMessage: "tm", ToolCallMessage: "cm", TaskCreateMessage: "nm",
+		ToolNames: []string{"bash"},
+	}
+	if err := d.UpdateTrigger(tr); err != nil {
+		t.Fatalf("UpdateTrigger failed: %v", err)
+	}
+	calls := eng.snapshotCalls()
+	auxAssertAllOrdinal(t, calls)
+
+	update := auxFind(t, calls, "UPDATE AGENT_TRIGGERS SET")
+	wantCols := []string{
+		"enabled", "interval_sec", "on_finding", "on_goal_met", "on_task_timeout",
+		"on_tool_call", "on_task_create", "interval_message", "finding_message",
+		"goal_message", "task_timeout_message", "tool_call_message", "task_create_message", "tool_names",
+	}
+	if got := auxSetColumns(t, update.Query); !reflect.DeepEqual(got, wantCols) {
+		t.Fatalf("SET 列次序变了（参数逐位对齐的前提）：%v", got)
+	}
+	if !strings.Contains(auxUpper(update), "WHERE ID=?") {
+		t.Fatalf("必须按主键更新：%s", auxCollapse(update.Query))
+	}
+	if len(update.Args) != len(wantCols)+1 {
+		t.Fatalf("参数数量应为 14 列 + 1 主键，实际 %d：%v", len(update.Args), update.Args)
+	}
+	// 逐位比对：SET 的第 i 列 ↔ 实参第 i 位，最后一位是主键。
+	want := []driver.Value{
+		true, int64(300), true, false, true, false, true,
+		"im", "fm", "gm", "tm", "cm", "nm", `["bash"]`,
+		int64(77),
+	}
+	for i := range want {
+		if !auxValueEq(update.Args[i], want[i]) {
+			t.Errorf("参数 %d（列 %s）错绑：want %v got %v", i, wantCols[i], want[i], update.Args[i])
+		}
+	}
+	// 反向守卫：trigger id 只能出现在最后一位，绝不允许出现在 SET 的参数里。
+	for i := 0; i < len(update.Args)-1; i++ {
+		if auxNumEq(update.Args[i], 77) {
+			t.Errorf("trigger id 漏进 SET 第 %d 位（PG 参数排列残留）：%v", i, update.Args)
+			break
+		}
+	}
+}
+
+func auxValueEq(got driver.Value, want driver.Value) bool {
+	if b, ok := want.([]byte); ok {
+		g, ok2 := got.([]byte)
+		return ok2 && string(g) == string(b)
+	}
+	if bs, ok := want.(string); ok {
+		if g, ok2 := got.([]byte); ok2 {
+			return string(g) == bs
+		}
+	}
+	return reflect.DeepEqual(got, want)
+}
+
+// auxOpenSQLite 开一个只带会话闭包相关列的内存库，供 SQL 语义探针使用。
+func auxOpenSQLite(t *testing.T) *sql.DB {
+	t.Helper()
+	sqliteDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("打开内存 SQLite 失败：%v", err)
+	}
+	sqliteDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqliteDB.Close() })
+	for _, ddl := range []string{
+		`CREATE TABLE conversations (id INTEGER PRIMARY KEY, agent_key TEXT, title TEXT)`,
+		`CREATE TABLE conversation_activities (id INTEGER PRIMARY KEY, conversation_id INTEGER)`,
+		`CREATE TABLE intercept_pending (id INTEGER PRIMARY KEY, conversation_id INTEGER)`,
+		`CREATE TABLE side_question_sessions (row_id INTEGER PRIMARY KEY, session_key TEXT, conversation_id INTEGER)`,
+		`CREATE TABLE side_question_requests (ordinal INTEGER, session_key TEXT)`,
+		`CREATE TABLE finding_retests (id INTEGER PRIMARY KEY, conversation_id INTEGER, status TEXT)`,
+	} {
+		if _, err := sqliteDB.Exec(ddl); err != nil {
+			t.Fatalf("建表失败 %s: %v", ddl, err)
+		}
+	}
+	return sqliteDB
+}
+
+func auxRetestRow(t *testing.T, sqliteDB *sql.DB, id int64) (string, sql.NullInt64) {
+	t.Helper()
+	var status string
+	var conv sql.NullInt64
+	err := sqliteDB.QueryRow(`SELECT status, conversation_id FROM finding_retests WHERE id = ?`, id).Scan(&status, &conv)
+	if err != nil {
+		t.Fatalf("回读 retest %d 失败：%v", id, err)
+	}
+	return status, conv
+}
+
+// TestConversation_DeleteConversation_TerminalRetestSurvivesConcurrentFinish 是审查
+// F03 的语义证据：跑**真实**的 ComputeConversationClosure + ExecuteConversationCascade，
+// 在"闭包收集之后、级联执行之前"把那条 running 的复测提交成 completed（正是
+// FinishFindingRetest 与会话删除的真实交错，它只锁 findings→finding_retests，不锁会话），
+// 断言级联**只脱钩、不篡改终态**；未绑定会话的历史 retest 一条都不许被波及。
+func TestConversation_DeleteConversation_TerminalRetestSurvivesConcurrentFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		raceFinish     bool
+		wantActiveOpen string
+	}{
+		{"concurrent completion wins", true, "completed"},
+		{"still running gets stopped", false, "stopped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sqliteDB := auxOpenSQLite(t)
+			if _, err := sqliteDB.Exec(`INSERT INTO conversations(id,agent_key,title) VALUES (77,'test_agent','to delete')`); err != nil {
+				t.Fatal(err)
+			}
+			for _, ddl := range []string{
+				`INSERT INTO conversation_activities(id,conversation_id) VALUES (501,77)`,
+				`INSERT INTO intercept_pending(id,conversation_id) VALUES (601,77)`,
+				`INSERT INTO side_question_sessions(row_id,session_key,conversation_id) VALUES (1,'conv-77',77)`,
+				`INSERT INTO side_question_requests(ordinal,session_key) VALUES (1,'conv-77')`,
+				`INSERT INTO finding_retests(id,conversation_id,status) VALUES (901,77,'running')`,
+				`INSERT INTO finding_retests(id,conversation_id,status) VALUES (902,77,'completed')`,
+				// 未绑定任何会话的历史复测：任何会话删除都不许碰它。
+				`INSERT INTO finding_retests(id,conversation_id,status) VALUES (903,NULL,'running')`,
+			} {
+				if _, err := sqliteDB.Exec(ddl); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ctx := context.Background()
+			tx, err := sqliteDB.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			closure, err := ComputeConversationClosure(ctx, tx, 77)
+			if err != nil {
+				t.Fatalf("ComputeConversationClosure failed: %v", err)
+			}
+			if len(closure.ActiveRetestIDsToStop) != 1 || closure.ActiveRetestIDsToStop[0] != 901 {
+				t.Fatalf("闭包收集到的活跃 retest 应为 [901]，实际 %v", closure.ActiveRetestIDsToStop)
+			}
+			if tc.raceFinish {
+				// 模拟并发 FinishFindingRetest 在收集之后提交终态。
+				if _, err := tx.ExecContext(ctx, `UPDATE finding_retests SET status='completed' WHERE id = 901`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := ExecuteConversationCascade(ctx, tx, closure); err != nil {
+				t.Fatalf("ExecuteConversationCascade failed: %v", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("闭包提交失败：%v", err)
+			}
+
+			// 终态铁律：并发完成方赢 → 901 必须仍是 completed；没被完成 → 才允许转停止态。
+			if status, conv := auxRetestRow(t, sqliteDB, 901); status != tc.wantActiveOpen {
+				t.Errorf("901 状态应为 %s，实际 %s（终态不可篡改被违反）", tc.wantActiveOpen, status)
+			} else if conv.Valid {
+				t.Errorf("901 的弱引用必须置空，实际仍绑定 %d", conv.Int64)
+			}
+			if status, conv := auxRetestRow(t, sqliteDB, 902); status != "completed" {
+				t.Errorf("902 的 completed 终态必须原样保留，实际 %s", status)
+			} else if conv.Valid {
+				t.Errorf("902 的弱引用必须置空，实际仍绑定 %d", conv.Int64)
+			}
+			if status, conv := auxRetestRow(t, sqliteDB, 903); status != "running" || conv.Valid {
+				t.Errorf("未绑定会话的历史 retest 不得被波及，实际 status=%s conv=%v", status, conv)
+			}
+			var left int64
+			for _, q := range []string{
+				`SELECT COUNT(1) FROM conversations WHERE id = 77`,
+				`SELECT COUNT(1) FROM conversation_activities WHERE conversation_id = 77`,
+				`SELECT COUNT(1) FROM intercept_pending WHERE conversation_id = 77`,
+				`SELECT COUNT(1) FROM side_question_sessions WHERE conversation_id = 77`,
+				`SELECT COUNT(1) FROM side_question_requests WHERE session_key = 'conv-77'`,
+				`SELECT COUNT(1) FROM finding_retests WHERE conversation_id = 77`,
+			} {
+				if err := sqliteDB.QueryRow(q).Scan(&left); err != nil {
+					t.Fatal(err)
+				}
+				if left != 0 {
+					t.Errorf("%s 残留 %d 行，闭包不完整", q, left)
+				}
+			}
+			// finding_retests 实体一行都不能少（弱关联只置空）。
+			if err := sqliteDB.QueryRow(`SELECT COUNT(1) FROM finding_retests`).Scan(&left); err != nil {
+				t.Fatal(err)
+			}
+			if left != 3 {
+				t.Errorf("复测实体必须全部存活，实际剩 %d 行", left)
+			}
+		})
+	}
+}
+
+// TestConversation_ParentLockRejectsWritesToDeletedConversation 是审查 F04 的语句级守卫：
+// 会话子实体的每一个产品写入口都必须"同一事务内先锁/校验会话根行，再写子行"，
+// 根行已经不在了就**拒绝写入**，绝不留下引用已删会话的孤儿行。
+func TestConversation_ParentLockRejectsWritesToDeletedConversation(t *testing.T) {
+	t.Run("append activity after deletion is refused", func(t *testing.T) {
+		eng := newExpMockEngine()
+		d := openExpMockDB(t, eng)
+		// 不注册会话行规则：根行 SELECT … FOR UPDATE 返回空集 == 会话已被删除。
+		if _, err := d.AppendConvActivity(77, Activity{Kind: "text", Summary: "late emit"}); !errors.Is(err, ErrConversationNotFound) {
+			t.Fatalf("会话已删除时迟到的活动写入必须被拒绝，实际 %v", err)
+		}
+		calls := eng.snapshotCalls()
+		auxAssertAllOrdinal(t, calls)
+		lock := auxFind(t, calls, "SELECT ID FROM CONVERSATIONS WHERE ID = ? FOR UPDATE")
+		if !strings.Contains(auxUpper(lock), "FOR UPDATE") {
+			t.Fatalf("父会话校验必须是行锁而非普通读：%s", auxCollapse(lock.Query))
+		}
+		for _, c := range calls {
+			if strings.Contains(auxUpper(c), "INSERT INTO CONVERSATION_ACTIVITIES") {
+				t.Errorf("父行校验失败后绝不得落库孤儿活动：%s", auxCollapse(c.Query))
+			}
+		}
+		if counts := eng.txCounts(); counts.Commits != 0 {
+			t.Errorf("被拒绝的写入不得提交，实际 %+v", counts)
+		}
+	})
+
+	for _, decided := range []bool{false, true} {
+		name := map[bool]string{false: "pending approval", true: "decided detail"}[decided]
+		t.Run("intercept "+name+" after deletion is refused", func(t *testing.T) {
+			eng := newExpMockEngine()
+			d := openExpMockDB(t, eng)
+			var err error
+			if decided {
+				_, err = d.CreateDecidedIntercept(0, 77, "", "agent", "bash", []byte(`{}`), "allowed", "r")
+			} else {
+				_, err = d.CreateInterceptPending(0, 77, "", "agent", "bash", []byte(`{}`), "r")
+			}
+			if !errors.Is(err, ErrConversationNotFound) {
+				t.Fatalf("会话已删除时迟到的审批写入必须被拒绝，实际 %v", err)
+			}
+			calls := eng.snapshotCalls()
+			auxAssertAllOrdinal(t, calls)
+			auxFind(t, calls, "SELECT ID FROM CONVERSATIONS WHERE ID = ? FOR UPDATE")
+			for _, c := range calls {
+				if strings.Contains(auxUpper(c), "INSERT INTO INTERCEPT_PENDING") {
+					t.Errorf("父会话校验失败后绝不得落库孤儿审批：%s", auxCollapse(c.Query))
+				}
+			}
+		})
+	}
+
+	t.Run("lock order is intercept_rules then conversations", func(t *testing.T) {
+		eng := newExpMockEngine()
+		d := openExpMockDB(t, eng)
+		eng.on("SELECT id FROM intercept_rules WHERE id=? FOR UPDATE", []string{"id"}, []driver.Value{int64(9)})
+		eng.on("SELECT id FROM conversations WHERE id = ? FOR UPDATE", []string{"id"}, []driver.Value{int64(77)})
+		eng.setNextInsertID(3001)
+		if _, err := d.CreateInterceptPending(9, 77, "", "agent", "bash", []byte(`{}`), "r"); err != nil {
+			t.Fatalf("父规则与会话都存活时写入必须成功：%v", err)
+		}
+		calls := eng.snapshotCalls()
+		auxAssertAllOrdinal(t, calls)
+		ruleAt := auxIndexOf(t, calls, "FROM INTERCEPT_RULES WHERE ID=? FOR UPDATE")
+		convAt := auxIndexOf(t, calls, "FROM CONVERSATIONS WHERE ID = ? FOR UPDATE")
+		insertAt := auxIndexOf(t, calls, "INSERT INTO INTERCEPT_PENDING")
+		if !(ruleAt < convAt && convAt < insertAt) {
+			t.Errorf("锁序必须是 intercept_rules(%d) → conversations(%d) → INSERT(%d)", ruleAt, convAt, insertAt)
+		}
+		if counts := eng.txCounts(); counts.Commits != 1 {
+			t.Errorf("成功路径必须提交恰好一次，实际 %+v", counts)
+		}
+	})
 }

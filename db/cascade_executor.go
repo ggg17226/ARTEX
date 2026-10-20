@@ -550,11 +550,50 @@ func ExecuteConversationCascade(ctx context.Context, tx *sql.Tx, closure *Conver
 	}
 	audit := newAudit("conversation", closure.ConversationID)
 
-	// Step 1: 停止并置空 retest 引用
-	if len(closure.ActiveRetestIDsToStop) > 0 {
-		_, err := tx.ExecContext(ctx, `UPDATE finding_retests SET status = 'stopped' WHERE id IN (`+closurePlaceholders(len(closure.ActiveRetestIDsToStop))+`)`, uint64Args(closure.ActiveRetestIDsToStop)...)
-		if err != nil {
-			return nil, fmt.Errorf("stop active retests: %w", err)
+	// Step 1: 停止本会话活跃 retest，并把弱引用 conversation_id 置空。
+	//
+	// 并发前提（闭环 R51-F07-01 / M20 的铁律「终态不可篡改」）：会话删除只锁
+	// conversations 根行，闭包收集 finding_retests 时是**普通读**；而并发收尾方
+	// FinishFindingRetest 只锁 findings → finding_retests，**不锁会话根行**。于是
+	// "收集到 id = 901 处于 running" 与 "本条 UPDATE 执行" 之间，901 完全可能已经被
+	// 提交成 completed。原实现无条件 `SET status='stopped' WHERE id IN (...)` 就会把
+	// 那条已经提交的终态篡改成停止态（审查 F03）。三条语句各司其职：
+	//
+	//	① 停止：谓词必须带上当前状态守卫 status IN ('pending','running')。它是执行本条
+	//	   语句时的**当前读**，只可能命中此刻仍在推进的复测；已经提交终态的行一条都不碰。
+	//	   同一条语句里顺手置空 conversation_id，省掉对同一行的第二次加锁。
+	//	② 脱钩：对闭包收集到的全部 id 只写 conversation_id = NULL，不带任何 status 赋值。
+	//	   「收集后才被并发完成」的那条正是在这里被脱钩：外键清掉，状态原样保留。
+	//	③ 兜底：再按会话作用域清一次，捕获「闭包收集之后才绑定到本会话」的迟到引用，
+	//	   保证 Step 4 的无孤儿断言不因这条竞态窗口误判成删除失败。
+	//
+	// 审计口径：MySQL/TiDB 的 RowsAffected 是 **changed rows**，把一列已经为 NULL 的
+	// conversation_id 再写一次 NULL 不计入，因此下面三条语句的行数可以直接累加到同一个
+	// `finding_retests.conversation_id` 键上，得到"本会话有多少条复测被真正脱钩"，既不重复
+	// 也不遗漏（closure_integration_test.go 的会话闭包用例就按这个键断言）。
+	var detached int64
+	if active := dedupeSortedUint64(closure.ActiveRetestIDsToStop); len(active) > 0 {
+		var stopped int64
+		for _, chunk := range chunkUint64(active, cascadeDMLChunk) {
+			res, err := tx.ExecContext(ctx, `UPDATE finding_retests SET status = 'stopped', conversation_id = NULL
+WHERE id IN (`+closurePlaceholders(len(chunk))+`) AND status IN ('pending', 'running')`, uint64Args(chunk)...)
+			if err != nil {
+				return nil, fmt.Errorf("stop active retests: %w", err)
+			}
+			rows, _ := res.RowsAffected()
+			stopped += rows
+			detached += rows // 同一条语句也把 conversation_id 落了 NULL
+		}
+		audit.EntitiesUpdated["finding_retests.status"] = stopped
+	}
+	if nullify := dedupeSortedUint64(closure.NullifyRetestIDs); len(nullify) > 0 {
+		for _, chunk := range chunkUint64(nullify, cascadeDMLChunk) {
+			res, err := tx.ExecContext(ctx, `UPDATE finding_retests SET conversation_id = NULL WHERE id IN (`+closurePlaceholders(len(chunk))+`)`, uint64Args(chunk)...)
+			if err != nil {
+				return nil, fmt.Errorf("nullify collected finding_retests.conversation_id: %w", err)
+			}
+			rows, _ := res.RowsAffected()
+			detached += rows
 		}
 	}
 	{
@@ -563,7 +602,8 @@ func ExecuteConversationCascade(ctx context.Context, tx *sql.Tx, closure *Conver
 			return nil, fmt.Errorf("nullify finding_retests.conversation_id: %w", err)
 		}
 		rows, _ := res.RowsAffected()
-		audit.EntitiesUpdated["finding_retests.conversation_id"] = rows
+		detached += rows
+		audit.EntitiesUpdated["finding_retests.conversation_id"] = detached
 	}
 
 	// Step 2: 级联删除子表
