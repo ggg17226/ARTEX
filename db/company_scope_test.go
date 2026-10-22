@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -106,7 +107,6 @@ func TestParseAutoScopeLine(t *testing.T) {
 
 func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	d, as, cs := testSetup(t)
-	defer d.Close()
 
 	stamp := time.Now().UnixNano()
 	explicitCompany, _, err := cs.UpsertCompany(fmt.Sprintf("Explicit Attribution %d", stamp), "")
@@ -117,8 +117,8 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, explicitCompany)
-	defer cleanupCompany(d, autoCompany)
+	defer cleanupCompany(t, d, explicitCompany)
+	defer cleanupCompany(t, d, autoCompany)
 
 	domain := fmt.Sprintf("explicit-%d.invalid", stamp)
 	icp := fmt.Sprintf("ICP-%d", stamp)
@@ -127,24 +127,27 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 
 	// A pre-existing row with company_id and no provenance value represents old
 	// installations. The schema default conservatively treats it as explicit.
-	var assetID int64
-	if err := d.QueryRow(`INSERT INTO assets(type,domain,root_domain,company_id)
-		VALUES ('root_domain',$1,$1,$2) RETURNING id`, domain, explicitCompany).Scan(&assetID); err != nil {
-		t.Fatal(err)
-	}
-	defer deleteAsset(d, assetID)
+	//
+	// TiDB 侧：assets.company_source 是 NOT NULL 且 TEXT 无 DDL 默认值，"没写来源"这个
+	// 状态在 TiDB 里不存在，因此夹具直接按 PG 当年的列默认值写入 'explicit'；自增 id 用
+	// LastInsertId 取回（TiDB 没有 RETURNING）。
+	assetID := assetRawInsert(t, d, map[string]any{
+		"type": "root_domain", "domain": domain, "root_domain": domain,
+		"company_id": explicitCompany, "company_source": "explicit",
+	})
+	defer deleteAsset(t, d, assetID)
 	appID, err := as.UpsertApp(UpsertAppReq{
 		Name: fmt.Sprintf("explicit-app-%d", stamp), ICP: icp, CompanyID: &explicitCompany,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, appID)
+	defer deleteAsset(t, d, appID)
 	autoAssetID, err := as.UpsertIP(UpsertIPReq{IP: ip})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, autoAssetID)
+	defer deleteAsset(t, d, autoAssetID)
 
 	rules := []ScopeInput{
 		{Kind: "domain", Value: domain},
@@ -159,7 +162,7 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 		t.Helper()
 		var got *int64
 		var gotSource string
-		if err := d.QueryRow(`SELECT company_id,company_source FROM assets WHERE id=$1`, id).Scan(&got, &gotSource); err != nil {
+		if err := d.QueryRow(`SELECT company_id,company_source FROM assets WHERE id=?`, id).Scan(&got, &gotSource); err != nil {
 			t.Fatal(err)
 		}
 		if got == nil || *got != want || gotSource != source {
@@ -180,7 +183,7 @@ func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	assertCompany(appID, explicitCompany, "explicit")
 	var autoCompanyID *int64
 	var autoSource string
-	if err := d.QueryRow(`SELECT company_id,company_source FROM assets WHERE id=$1`, autoAssetID).Scan(&autoCompanyID, &autoSource); err != nil {
+	if err := d.QueryRow(`SELECT company_id,company_source FROM assets WHERE id=?`, autoAssetID).Scan(&autoCompanyID, &autoSource); err != nil {
 		t.Fatal(err)
 	}
 	if autoCompanyID != nil || autoSource != "scope" {
@@ -229,22 +232,21 @@ func TestParseStructuredCompanyScope(t *testing.T) {
 }
 
 func TestCompanyICPAttribution(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	// 关连接必须走 t.Cleanup 且**注册在清理之前**：t.Cleanup 是后进先出，
-	// 先注册关闭 → 关闭最后执行，下面的数据清理才连得上库。
-	// 原先这里是 `defer d.Close()`：defer 在函数返回时先跑，t.Cleanup 在那之后
-	// 才执行，于是清理语句全落在**已关闭的连接**上、错误又被 `_, _ =` 丢弃，
-	// 资产与公司就永久残留在库里。残留本身不会立刻报错，但本用例用
-	// `MAX(companies.id)+1` 当假 TaskID 给资产打标（见下方 suffix），
-	// 一旦这个数字与别的用例的任务 id 撞上，那个用例按「恰好 N 个资产」的断言
-	// 就会莫名失败——排查成本极高。
-	t.Cleanup(func() { d.Close() })
+	// 这里不再额外登记 `t.Cleanup(func() { d.Close() })`：openTestDB 已把 Close 注册为
+	// 最先一条，LIFO 保证本用例随后登记的清理都跑在还活着的连接池上，并由它把首次
+	// 关闭的错误判红。先前这句重复关闭不仅多余，还会吞掉并掩盖首次关闭的错误（审查 R-03）。
+	//
+	// 历史注释：曾有 `defer d.Close()` 让清理全落在已关闭连接上且吞错，资产与公司永久
+	// 残留；残留一旦与别的用例按 id 的断言撞上，排查成本极高。
+	d := openTestDB(t)
 
-	var suffix int64
-	if err := d.QueryRow(`SELECT COALESCE(MAX(id),0)+1 FROM companies`).Scan(&suffix); err != nil {
+	suffix := time.Now().UnixNano()
+	// 资产写者协议要求父任务真实存活。原先这里拿 `MAX(companies.id)+1` 当假 TaskID
+	// 给资产打标：TiDB 基线上它会被 lockTaskRowAlive 直接拒掉，偶尔撞上真实任务号
+	// 又会假通过 —— 一个看运气的用例。改用真实任务打标，清理口径（按 task_ids 里的
+	// 这个 id 反查删除）完全不变。
+	fixtureTask, err := d.CreateTask("ICP attribution fixture", "goal", nil, 0, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
 	cs := d.Companies()
@@ -255,37 +257,58 @@ func TestCompanyICPAttribution(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		// 不吞错误：清理失败会污染后续用例，必须让它在本次运行里显形。
-		if _, err := d.Exec(`DELETE FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]`, suffix); err != nil {
-			t.Errorf("清理测试资产失败: %v", err)
+		// 原 PG 写法 `task_ids @> ARRAY[$1]::bigint[]`：TiDB 的 task_ids 是 JSON 数组
+		// 文本，归属判断统一走 JSON_CONTAINS（与生产侧同一口径）。
+		deleteAssetsByWhere(t, d, `WHERE JSON_CONTAINS(COALESCE(task_ids,'[]'), CAST(? AS JSON))`, fixtureTask.ID)
+		// company_scope 必须在 companies 之前逆拓扑删除：下方 AddScopeInputs 每次成功
+		// 运行都给该企业写 icp+keyword 两条规则，企业行删掉后它们就是永久孤儿，每轮
+		// 累积两条；低 id 的残留规则还会把下一轮同值资产的归属抢走（审查 R-03）。
+		if _, err := d.Exec(`DELETE FROM company_scope WHERE company_id=?`, companyID); err != nil {
+			t.Errorf("清理测试公司范围规则失败: %v", err)
 		}
-		if _, err := d.Exec(`DELETE FROM companies WHERE id=$1`, companyID); err != nil {
+		if _, err := d.Exec(`DELETE FROM companies WHERE id=?`, companyID); err != nil {
 			t.Errorf("清理测试公司失败: %v", err)
+		}
+		// DeleteTask 的 lockorder 定位器会按归属逐个 FOR UPDATE 复核资产；上面的删除
+		// 只清了 assets 行，task_asset_links 还挂着，会被判成"成员漂移"而整笔回滚。
+		if _, err := d.Exec(`DELETE FROM task_asset_links WHERE task_id=?`, fixtureTask.ID); err != nil {
+			t.Errorf("清理打标任务归属失败: %v", err)
+		}
+		if err := d.DeleteTask(fixtureTask.ID); err != nil {
+			t.Errorf("清理打标任务失败: %v", err)
 		}
 	})
 
+	// ICP 号每轮唯一：归属平票时按 company_id 升序取第一条，历史运行残留的同值规则
+	// 会因为 id 更小先把资产认领走，本轮新建的公司就永远对不上。
+	// 空格与大小写的差异刻意保留 —— 本用例测的就是 NormalizeICP 的归一化。
+	icpRule := fmt.Sprintf("京 ICP备 %d号", suffix)
+	icpAsset := fmt.Sprintf("京icp备%d号", suffix)
+	icpAssetSpaced := fmt.Sprintf(" 京 ICP备 %d号 ", suffix)
+
 	// A keyword can guide an Agent, but must never claim an asset by its name.
 	added, _, invalid, errs := cs.AddScopeInputs(companyID, []ScopeInput{
-		{Kind: "icp", Value: "京 ICP备 998877号"},
-		{Kind: "keyword", Value: "ICP Scope"},
+		{Kind: "icp", Value: icpRule},
+		{Kind: "keyword", Value: fmt.Sprintf("ICP Scope %d", suffix)},
 	}, "unit test")
 	if added != 2 || invalid != 0 || len(errs) != 0 {
 		t.Fatalf("add structured scope: added=%d invalid=%d errors=%v", added, invalid, errs)
 	}
 
 	rootID, err := as.UpsertRootDomain(UpsertRootDomainReq{
-		Domain: fmt.Sprintf("icp-scope-%d.example", suffix), ICP: "京icp备998877号", TaskID: suffix,
+		Domain: fmt.Sprintf("icp-scope-%d.example", suffix), ICP: icpAsset, TaskID: fixtureTask.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	appID, err := as.UpsertApp(UpsertAppReq{
-		Name: fmt.Sprintf("ICP Scope Keyword Only %d", suffix), TaskID: suffix,
+		Name: fmt.Sprintf("ICP Scope Keyword Only %d", suffix), TaskID: fixtureTask.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	icpAppID, err := as.UpsertApp(UpsertAppReq{
-		Name: fmt.Sprintf("ICP Matched App %d", suffix), ICP: " 京 ICP备 998877号 ", TaskID: suffix,
+		Name: fmt.Sprintf("ICP Matched App %d", suffix), ICP: icpAssetSpaced, TaskID: fixtureTask.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -294,14 +317,21 @@ func TestCompanyICPAttribution(t *testing.T) {
 	assertCompany := func(assetID int64, want *int64) {
 		t.Helper()
 		var got *int64
-		if err := d.QueryRow(`SELECT company_id FROM assets WHERE id=$1`, assetID).Scan(&got); err != nil {
+		if err := d.QueryRow(`SELECT company_id FROM assets WHERE id=?`, assetID).Scan(&got); err != nil {
 			t.Fatal(err)
 		}
 		if want == nil && got != nil {
 			t.Fatalf("asset %d attributed by keyword: %d", assetID, *got)
 		}
 		if want != nil && (got == nil || *got != *want) {
-			t.Fatalf("asset %d company=%v want %d", assetID, got, *want)
+			// got 是指针：直接 %v 打出来是地址，排查时会把人带偏，这里显式解引用。
+			var gotText string
+			if got == nil {
+				gotText = "NULL"
+			} else {
+				gotText = fmt.Sprint(*got)
+			}
+			t.Fatalf("asset %d company=%s want %d", assetID, gotText, *want)
 		}
 	}
 	assertCompany(rootID, &companyID)
@@ -314,28 +344,48 @@ func TestCompanyICPAttribution(t *testing.T) {
 // backfill of a pre-existing asset, CIDR + domain-suffix matching, and that
 // out-of-scope assets stay unattributed.
 func TestCompanyScopeAttribution(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
+	d := openTestDB(t)
 	as := d.Assets()
 	cs := d.Companies()
 
+	// MAX(assets.id) 只用来取本用例名称/网段的递增唯一种子（uniq），与清理无关。
+	// 原写法 `DELETE FROM assets WHERE id > startMax` 删的是"本用例开始后产生的全部
+	// 资产"（assets 为空时 startMax=0 等价 DELETE FROM assets）：共享库上会连带删掉
+	// 并发写入方与别的用例的数据，还把别人的泄漏一并抹掉、让污染不可见（审查 R-03
+	// 明确禁止）。改为精确记录本用例创建的 asset id 集合，逐 id 删除。
 	var startMax int64
 	if err := d.QueryRow(`SELECT COALESCE(MAX(id),0) FROM assets`).Scan(&startMax); err != nil {
-		d.Close()
 		t.Fatalf("startMax: %v", err)
 	}
+	uniq := startMax + 1
+
+	// 清理钩子一次性登记在这里：闭包捕获 cid/createdAssetIDs，在测试结束时读取最终
+	// 值。逆拓扑删除 assets → company_scope → companies，任何一步失败必须 t.Errorf
+	// 判红，不许 `_, _ =` 吞错——残留的 CIDR/域名规则会持续认领后续运行的资产，低 id
+	// 规则还会在归属平票时抢先胜出（审查 R-03）。
+	// d.Close() 也不在这里重复：openTestDB 已最先登记 Close，重复关闭多余且吞错。
+	var cid int64
+	var createdAssetIDs []int64
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE id > $1`, startMax)
-		d.Close()
+		for _, id := range createdAssetIDs {
+			deleteAsset(t, d, id) // 先断开 link/anchor 引用，再删本体（TiDB 无外键）
+		}
+		if cid != 0 {
+			mustCleanup(t, d, `DELETE FROM company_scope WHERE company_id = ?`, cid)
+			mustCleanup(t, d, `DELETE FROM companies WHERE id = ?`, cid)
+		}
 	})
 
-	uniq := startMax + 1
 	root := fmt.Sprintf("scopetest%d.com", uniq)
 	sub := "api." + root
-	ipIn := "198.51.100.9"
-	ipOut := "203.0.113.9"
+	// 每轮换一个**独立的 TEST-NET /24**（仍在 198.51.0.0/16 与 203.0.113.0/24 这类
+	// 保留段内）：资产按 canonical 身份去重、company_id 一旦写下不会被后来者抢走，
+	// 沿用固定网段就会被上一轮残留的公司（它的 CIDR 规则还挂在 company_scope 上，
+	// 且 id 更小、在归属平票时胜出）先认领掉，本轮新公司再也对不上。
+	octet := uniq%250 + 1
+	ipNet := fmt.Sprintf("198.51.%d.0/24", octet)
+	ipIn := fmt.Sprintf("198.51.%d.9", octet)
+	ipOut := fmt.Sprintf("203.0.%d.9", octet)
 	outDomain := fmt.Sprintf("other%d.net", uniq)
 
 	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
@@ -348,17 +398,36 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre upsert: %v", err)
 	}
+	createdAssetIDs = append(createdAssetIDs, preID)
 	var preCompanyID *int64
-	d.QueryRow(`SELECT company_id FROM assets WHERE id = $1`, preID).Scan(&preCompanyID)
+	d.QueryRow(`SELECT company_id FROM assets WHERE id = ?`, preID).Scan(&preCompanyID)
 	if preCompanyID != nil {
 		t.Fatalf("pre-scope asset should be unattributed, got %v", *preCompanyID)
 	}
 
-	cs.AddScope(cid, []string{root, "198.51.100.0/24"}, "unit test")
+	// 公司与其范围规则（cid/company_scope）已并入函数开头的统一清理钩子，
+	// 按精确 id 逆拓扑删除并判红（审查 R-03）。
+
+	cs.AddScope(cid, []string{root, ipNet}, "unit test")
+
+	// 真机实测：AddScope 的归属重算会把规则域名**物化**成一条 root_domain 资产
+	// （scopetest<uniq>.com，归属 cid）。它不是本用例显式 Upsert 出来的，精确 id 清理
+	// 钩子事先拿不到它的 id，所以在 AddScope 之后按本用例专属且每轮唯一的域名精确
+	// 找回、并入清理清单（审查 R-03：只删本用例造成的行，且每步判红）。
+	var derivedRootID int64
+	switch err := d.QueryRow(`SELECT id FROM assets WHERE type = 'root_domain' AND domain = ?`, root).
+		Scan(&derivedRootID); err {
+	case nil:
+		createdAssetIDs = append(createdAssetIDs, derivedRootID)
+	case sql.ErrNoRows:
+		// 产品若不再物化该行则无需登记；不算失败。
+	default:
+		t.Errorf("找回 AddScope 物化的 root_domain 资产失败（可能留下残留）: %v", err)
+	}
 
 	mustCid := func(id int64, want int64, label string) {
 		var cID *int64
-		d.QueryRow(`SELECT company_id FROM assets WHERE id = $1`, id).Scan(&cID)
+		d.QueryRow(`SELECT company_id FROM assets WHERE id = ?`, id).Scan(&cID)
 		if cID == nil {
 			t.Fatalf("%s company_id = nil, want %d", label, want)
 		}
@@ -368,7 +437,7 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	}
 	mustNil := func(id int64, label string) {
 		var cID *int64
-		d.QueryRow(`SELECT company_id FROM assets WHERE id = $1`, id).Scan(&cID)
+		d.QueryRow(`SELECT company_id FROM assets WHERE id = ?`, id).Scan(&cID)
 		if cID != nil {
 			t.Fatalf("%s should be unattributed, got %d", label, *cID)
 		}
@@ -382,12 +451,14 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertIP in: %v", err)
 	}
+	createdAssetIDs = append(createdAssetIDs, ipInID)
 	mustCid(ipInID, cid, "in-CIDR ip (insert-time)")
 
 	sub2ID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: "www." + root})
 	if err != nil {
 		t.Fatalf("UpsertSubdomain: %v", err)
 	}
+	createdAssetIDs = append(createdAssetIDs, sub2ID)
 	mustCid(sub2ID, cid, "new subdomain (insert-time)")
 
 	// out of scope stays unattributed.
@@ -395,11 +466,13 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertRootDomain out: %v", err)
 	}
+	createdAssetIDs = append(createdAssetIDs, outID)
 	mustNil(outID, "out-of-scope domain")
 
 	ipOutID, err := as.UpsertIP(UpsertIPReq{IP: ipOut})
 	if err != nil {
 		t.Fatalf("UpsertIP out: %v", err)
 	}
+	createdAssetIDs = append(createdAssetIDs, ipOutID)
 	mustNil(ipOutID, "out-of-CIDR ip")
 }

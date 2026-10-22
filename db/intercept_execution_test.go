@@ -7,11 +7,10 @@ import (
 )
 
 func TestInterceptExecutionNavigation(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
+	// 统一走 openTestDB：DSN 缺失诚实 Skip、DSN 已配置连不上判红；
+	// Close 由其登记为最先一条 t.Cleanup（LIFO 最后执行）并判红，
+	// 替换原先 `t.Cleanup(func() { _ = d.Close() })` 的吞错关闭（审查 R-02-R）。
+	d := openTestDB(t)
 	approval := func(conv int64, task, id string, exact bool) int64 {
 		t.Helper()
 		audit := &InterceptAudit{ToolUseID: id, Correlation: "exact"}
@@ -22,7 +21,8 @@ func TestInterceptExecutionNavigation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE id=$1`, n) })
+		// 创建即登记、判红（原 `_, _ =` 吞错）。
+		t.Cleanup(func() { mustCleanup(t, d, `DELETE FROM intercept_pending WHERE id=?`, n) })
 		return n
 	}
 	conv := func() int64 {
@@ -31,7 +31,15 @@ func TestInterceptExecutionNavigation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM conversations WHERE id=$1`, c.ID) })
+		// 原 `_, _ = d.Exec("DELETE FROM conversations…")` 吞错且只删父行，本用例
+		// 每个会话写入 200+ 条 conversation_activities 全部残留；改为产品级
+		// DeleteConversation 完整闭包（conversation_activities / intercept_pending /
+		// 旁路会话…逆拓扑）并判红。
+		t.Cleanup(func() {
+			if err := d.DeleteConversation(c.ID); err != nil {
+				t.Errorf("清理会话 fixture %d 失败: %v", c.ID, err)
+			}
+		})
 		return c.ID
 	}
 	addConv := func(c int64, kind, id string) int64 {
@@ -67,10 +75,11 @@ func TestInterceptExecutionNavigation(t *testing.T) {
 			t.Fatal(err)
 		}
 		exp := task.ExplorationID
-		t.Cleanup(func() {
-			_, _ = d.Exec(`DELETE FROM tasks WHERE id=$1`, task.ID)
-			_, _ = d.Exec(`DELETE FROM explorations WHERE id=$1`, exp)
-		})
+		// 原 `_, _ = d.Exec(DELETE FROM tasks…)` + `DELETE FROM explorations…` 吞错且
+		// 只删两张父表：本用例写入的 intent 节点、task 会话 activity、task_scope
+		// 全部残留（审查 R-02-R）。改为产品级 DeleteTask 逆拓扑级联（含防悬空断言）
+		// 并判红。
+		t.Cleanup(func() { cleanupTask(t, d, task.ID) })
 		es := d.Exploration(exp)
 		intent, err := es.AddIntent(map[string]any{"summary": "do not parse agent label"}, 1, nil, "planner")
 		if err != nil {
@@ -103,19 +112,19 @@ func TestInterceptExecutionNavigation(t *testing.T) {
 			t.Fatal(err)
 		}
 		deletedApproval := approval(0, fmt.Sprint(task.ID), deletedCall, true)
-		if _, err = d.Exec(`DELETE FROM activity WHERE id=$1`, deletedSeq); err != nil {
+		if _, err = d.Exec(`DELETE FROM activity WHERE id=?`, deletedSeq); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = d.GetInterceptExecution(deletedApproval); !errors.Is(err, ErrInterceptSessionDeleted) {
 			t.Fatalf("deleted session: %v", err)
 		}
-		if _, err = d.Exec(`UPDATE tasks SET archived_at=NOW() WHERE id=$1`, task.ID); err != nil {
+		if _, err = d.Exec(`UPDATE tasks SET archived_at=NOW() WHERE id=?`, task.ID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = d.GetInterceptExecution(deletedApproval); !errors.Is(err, ErrInterceptTaskDeleted) {
 			t.Fatalf("archived task: %v", err)
 		}
-		if _, err = d.Exec(`UPDATE tasks SET archived_at=NULL WHERE id=$1`, task.ID); err != nil {
+		if _, err = d.Exec(`UPDATE tasks SET archived_at=NULL WHERE id=?`, task.ID); err != nil {
 			t.Fatal(err)
 		}
 		a := Activity{Worker: "work#7", NodeID: &intent, Kind: "tool_use", Tool: "Bash", ToolUseID: "unpaired", Summary: "pwd"}

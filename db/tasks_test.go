@@ -9,11 +9,7 @@ import (
 )
 
 func TestTaskLifecycleAndDeleteCascade(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	tk, err := d.CreateTask("迁移测试", "目标X", nil, 0, 0)
 	if err != nil {
@@ -71,23 +67,19 @@ func TestTaskLifecycleAndDeleteCascade(t *testing.T) {
 		t.Fatalf("task should be gone")
 	}
 	var nodes int
-	d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=$1`, tk.ExplorationID).Scan(&nodes)
+	d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=?`, tk.ExplorationID).Scan(&nodes)
 	if nodes != 0 {
 		t.Fatalf("exploration nodes should be cascade-deleted, got %d", nodes)
 	}
 	var exps int
-	d.QueryRow(`SELECT count(*) FROM explorations WHERE id=$1`, tk.ExplorationID).Scan(&exps)
+	d.QueryRow(`SELECT count(*) FROM explorations WHERE id=?`, tk.ExplorationID).Scan(&exps)
 	if exps != 0 {
 		t.Fatalf("exploration should be deleted, got %d", exps)
 	}
 }
 
 func TestTaskDeleteCascadeAssets(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	first, err := d.CreateTask("级联删除测试", "目标A", nil, 0, 0)
 	if err != nil {
@@ -207,11 +199,7 @@ func TestTaskDeleteCascadeAssets(t *testing.T) {
 }
 
 func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	suffix := time.Now().UnixNano()
 	profileIDs := make([]int64, 0, 3)
@@ -465,11 +453,7 @@ func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 }
 
 func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	source, err := d.CreateTask("source", "goal", nil, 0, 0)
 	if err != nil {
@@ -518,11 +502,7 @@ func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
 }
 
 func TestCreateTaskWithCompanyScopes(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	suffix := time.Now().UnixNano()
 	companyA, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Task Company A %d", suffix), "")
@@ -538,7 +518,7 @@ func TestCreateTaskWithCompanyScopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2,$3)`, companyA, companyB, emptyCompany)
+		_, _ = d.Exec(`DELETE FROM companies WHERE id IN (?,?,?)`, companyA, companyB, emptyCompany)
 	})
 
 	existingTask, err := d.CreateTask("existing company asset owner", "goal", nil, 0, 0)
@@ -546,22 +526,29 @@ func TestCreateTaskWithCompanyScopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.DeleteTask(existingTask.ID) })
-	var companyAssetA, companyAssetB int64
 	domainA := fmt.Sprintf("task-company-a-%d.example.test", suffix)
 	domainB := fmt.Sprintf("task-company-b-%d.example.test", suffix)
-	if err := d.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, company_id, company_source, task_ids)
-VALUES ('root_domain',$1,$1,$2,'explicit',ARRAY[$3]::bigint[])
-RETURNING id`, domainA, companyA, existingTask.ID).Scan(&companyAssetA); err != nil {
-		t.Fatal(err)
-	}
-	if err := d.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, company_id, company_source)
-VALUES ('root_domain',$1,$1,$2,'explicit')
-RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
-		t.Fatal(err)
-	}
+	// 原 PG 写法是 `INSERT INTO assets(...) VALUES(... ARRAY[?]::bigint[]) RETURNING id`：
+	// TiDB 没有 RETURNING、没有 ARRAY[]，task_ids 是 JSON 数组文本；统一走同包的
+	// assetRawInsert（补齐 NOT NULL 的 TEXT/JSON 列，自增 id 由 LastInsertId 取回）。
+	companyAssetA := assetRawInsert(t, d, map[string]any{
+		"type": "root_domain", "domain": domainA, "root_domain": domainA,
+		"company_id": companyA, "company_source": "explicit",
+	})
+	companyAssetB := assetRawInsert(t, d, map[string]any{
+		"type": "root_domain", "domain": domainB, "root_domain": domainB,
+		"company_id": companyB, "company_source": "explicit",
+	})
 	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{companyAssetA, companyAssetB}) })
+
+	// "另一个任务已经拥有 assetA" 这个前置状态必须走产品入口建立：PG 时代
+	// trg_assets_task_links 触发器会把 task_ids 数组同步成 task_asset_links 行，
+	// native 化之后 assets.task_ids（JSON）与 task_asset_links 的双写点只剩资产写者，
+	// 直接 INSERT 只能落下 JSON、留下归属悬空。这里登记的 provenance 也不是 company
+	// 快照，正是本用例后面要验证"不被企业快照覆盖"的那条来源。
+	if _, err := d.Assets().AttachAssetsToTask(existingTask.ID, []int64{companyAssetA}, "历史归属"); err != nil {
+		t.Fatalf("attach asset A to the existing task: %v", err)
+	}
 
 	task, err := d.CreateTaskWithOptions("company-scoped task", "use company scope", TaskCreateOptions{
 		CompanyIDs: []int64{companyA, companyB},
@@ -581,7 +568,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 		t.Fatalf("hydrated company IDs=%v", got.CompanyIDs)
 	}
 	var scopeCount int
-	if err := d.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=$1 AND kind='company'`, task.ID).Scan(&scopeCount); err != nil {
+	if err := d.QueryRow(`SELECT count(*) FROM task_scope WHERE task_id=? AND kind='company'`, task.ID).Scan(&scopeCount); err != nil {
 		t.Fatal(err)
 	}
 	if scopeCount != 2 {
@@ -612,14 +599,16 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 		}
 	}
 	var existingAssociation bool
-	if err := d.QueryRow(`SELECT $1=ANY(task_ids) FROM assets WHERE id=$2`, existingTask.ID, companyAssetA).Scan(&existingAssociation); err != nil {
+	// 原 PG 写法 `SELECT ?=ANY(task_ids)`：TiDB 的 task_ids 是 JSON 数组文本，
+	// 归属判断统一走 JSON_CONTAINS（与生产侧同一口径）。
+	if err := d.QueryRow(`SELECT JSON_CONTAINS(COALESCE(task_ids,'[]'), CAST(? AS JSON)) FROM assets WHERE id=?`, existingTask.ID, companyAssetA).Scan(&existingAssociation); err != nil {
 		t.Fatal(err)
 	}
 	if !existingAssociation {
 		t.Fatal("company snapshot removed the asset's existing task association")
 	}
 	var existingSource string
-	if err := d.QueryRow(`SELECT source FROM task_asset_links WHERE task_id=$1 AND asset_id=$2`, existingTask.ID, companyAssetA).Scan(&existingSource); err != nil {
+	if err := d.QueryRow(`SELECT source FROM task_asset_links WHERE task_id=? AND asset_id=?`, existingTask.ID, companyAssetA).Scan(&existingSource); err != nil {
 		t.Fatal(err)
 	}
 	if existingSource == taskCompanyAssetSource {
@@ -657,7 +646,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 		t.Fatalf("missing company error=%v, want %v", err, ErrTaskCompanyNotFound)
 	}
 	var leaked int
-	if err := d.QueryRow(`SELECT count(*) FROM explorations WHERE description=$1`, badDescription).Scan(&leaked); err != nil {
+	if err := d.QueryRow(`SELECT count(*) FROM explorations WHERE description=?`, badDescription).Scan(&leaked); err != nil {
 		t.Fatal(err)
 	}
 	if leaked != 0 {
@@ -669,11 +658,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 // deliberately not the sort key: tasks created in the same instant share a
 // timestamp and would reorder between polls; id is unique and monotonic.
 func TestListTasksOrderByIDDesc(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	stamp := time.Now().UnixNano()
 	var ids []int64

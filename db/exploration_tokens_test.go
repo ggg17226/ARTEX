@@ -6,17 +6,15 @@ import (
 )
 
 func TestTokenStatsBySessionUsesCompleteIntentHistory(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("token sessions", "aggregate complete session history")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	// 原先 `defer d.Exec` 只删 explorations 父行且吞错：本用例写入的 200+ 条 activity、
+	// intent/fact 节点在 TiDB（无外键级联）上全部成为孤儿（审查 R-02）。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	store := d.Exploration(expID)
 
 	intentID, err := store.AddIntent(map[string]any{"summary": "worker session"}, 1, nil, "planner")
@@ -32,7 +30,8 @@ func TestTokenStatsBySessionUsesCompleteIntentHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, otherExpID)
+	// 同上：foreign exploration 的 intent 节点也要完整逆拓扑清理（审查 R-02）。
+	t.Cleanup(func() { cleanupExploration(t, d, otherExpID) })
 	foreignIntentID, err := d.Exploration(otherExpID).AddIntent(map[string]any{"summary": "foreign worker"}, 1, nil, "planner")
 	if err != nil {
 		t.Fatal(err)

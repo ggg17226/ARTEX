@@ -12,12 +12,12 @@ func TestInterceptApprovalFilters(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = d.Close() })
 	scope := "approval-filter-" + t.Name()
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN ($1,$2)`, scope, scope+"-other") })
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN (?,?)`, scope, scope+"-other") })
 	rule, err := d.CreateInterceptRule("filter fixture", "tool_name", "string", "Bash", "deny", "fixture", 1, true, false, 0, "deny")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_rules WHERE id=$1`, rule.ID) })
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_rules WHERE id=?`, rule.ID) })
 	filter := InterceptApprovalFilter{Status: "denied", DecisionSource: "model"}
 	_, baseline, err := d.ListAllInterceptsPage(1, 20, filter)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestInterceptApprovalFilters(t *testing.T) {
 					}
 					// Legacy source fields and tied timestamps must filter/page consistently.
 					if i == 0 {
-						if _, err = d.Exec(`UPDATE intercept_pending SET decision_source='' WHERE id=$1`, id); err != nil {
+						if _, err = d.Exec(`UPDATE intercept_pending SET decision_source='' WHERE id=?`, id); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -57,7 +57,7 @@ func TestInterceptApprovalFilters(t *testing.T) {
 			}
 		}
 	}
-	if _, err := d.Exec(`UPDATE intercept_pending SET created_at='2099-01-01' WHERE task_id IN ($1,$2)`, scope, scope+"-other"); err != nil {
+	if _, err := d.Exec(`UPDATE intercept_pending SET created_at='2099-01-01' WHERE task_id IN (?,?)`, scope, scope+"-other"); err != nil {
 		t.Fatal(err)
 	}
 	cases := []struct {
@@ -122,7 +122,7 @@ func TestInterceptApprovalFilters(t *testing.T) {
 		t.Fatalf("invalid value escaped filter: %d %v", total, err)
 	}
 	// A rule's persisted source survives deletion of its associated rule.
-	_, err = d.Exec(`UPDATE intercept_pending SET decision_source='rule' WHERE task_id=$1 AND rule_id=$2`, scope, rule.ID)
+	_, err = d.Exec(`UPDATE intercept_pending SET decision_source='rule' WHERE task_id=? AND rule_id=?`, scope, rule.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

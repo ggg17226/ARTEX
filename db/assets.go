@@ -104,6 +104,9 @@ type AssetStore struct {
 	db      *DB
 	company *CompanyStore
 	tx      *sql.Tx
+	// scopeBarrier 标记"本事务已持有企业/范围写者屏障（lockCompanyScopeMutation）"。
+	// 屏障内的归属解析因此必须走**加锁当前读**，理由见 resolveCompanyWithICP。
+	scopeBarrier bool
 }
 
 // execInTx 在单条事务里执行 fn：TiDB 没有 DELETE … RETURNING，
@@ -194,10 +197,28 @@ func (s *AssetStore) withAssetMutation(fn func(*AssetStore) (int64, error)) (int
 	return 0, fmt.Errorf("%w after %d attempts: %w", ErrAssetWriteRetriesExhausted, assetWriteMaxAttempts, lastErr)
 }
 
-// withCompanyScopeMutation 保留旧名字（tasks.go / task_assets.go 的同名锁由
-// Task 2.3 统一接入 lockorder.TxRunner），语义等价于 withAssetMutation。
+// withCompanyScopeMutation 是**不带 TaskID 的裸资产写入**的事务边界：把"归属解析 +
+// 资产落库"整体压到企业/范围写者屏障之后（PG 时代这里是 `pg_advisory_xact_lock`，
+// TiDB 的等价原语就是 companies.go 的 lockCompanyScopeMutation —— companies 按主键升序
+// FOR UPDATE，与 AddScopeInputsChecked / UpdateScopeInputsChecked / RecomputeAttribution /
+// RegisterTaskAssetScopes 同一把锁，锁序恒为 companies → company_scope → assets，不成环）。
+//
+// 为什么必须有这把锁（迁移期间的回归，审查 I-03 复位）：本路径先读 company_scope 解析
+// 归属、再把归属写进 assets.company_id。没有屏障时，并发的范围变更可以在"解析"与"落库"
+// 之间提交，资产带着**已经作废的旧归属**落库，而范围侧的重算早已跑完，旧归属再也无人纠正。
+//
+// 屏障取在**每次尝试的事务内**（重试由 withAssetMutation 在全新事务里重放），并且屏障内
+// 的归属解析因此走加锁当前读（scoped.scopeBarrier = true）：真实 TiDB v8.5.8 实测，悲观
+// 事务在锁等待之后本事务快照**不会**前进（普通一致性读仍返回等待前的旧版本，只有加锁读
+// 读得到最新提交），只排队不换成当前读，拿完锁仍然会把旧归属写下去。
 func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
-	return s.withAssetMutation(fn)
+	return s.withAssetMutation(func(scoped *AssetStore) (int64, error) {
+		if err := lockCompanyScopeMutation(scoped.tx); err != nil {
+			return 0, err
+		}
+		scoped.scopeBarrier = true
+		return fn(scoped)
+	})
 }
 
 // runAssetAttempt 是单次尝试：Begin → fn → Commit；任何错误路径都由 defer 完整
@@ -264,19 +285,31 @@ type assetScopeQueryer interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }
 
+// resolveCompanyWithICP 按当前 company_scope 解析资产归属。
+//
+// s.scopeBarrier 为真时本事务已经持有企业/范围写者屏障，三条解析查询与存活性核验一律
+// 追加 FOR UPDATE 走**加锁当前读**。这不是防御性写法而是正确性要求：真实 TiDB v8.5.8
+// 悲观事务在锁等待之后**不会**推进本事务的一致性读快照（实测：锁等待结束后加锁读取得
+// 最新版本、同事务的普通一致性读仍是等待前的旧版本），屏障内再用快照读解析就等于把
+// "排队前看到的旧范围"写进 assets.company_id。屏障持锁期间不改变任何语义 —— 只有本
+// 事务自己刚拿到的锁会被重取。
 func (s *AssetStore) resolveCompanyWithICP(rootDomain, ipStr, icp string) (*int64, error) {
 	if s.tx != nil {
-		return resolveAssetCompany(s.tx, rootDomain, ipStr, icp)
+		return resolveAssetCompany(s.tx, rootDomain, ipStr, icp, s.scopeBarrier)
 	}
-	return resolveAssetCompany(s.db, rootDomain, ipStr, icp)
+	return resolveAssetCompany(s.db, rootDomain, ipStr, icp, false)
 }
 
-func resolveAssetCompany(q assetScopeQueryer, rootDomain, ipStr, icp string) (*int64, error) {
+func resolveAssetCompany(q assetScopeQueryer, rootDomain, ipStr, icp string, currentRead bool) (*int64, error) {
+	lock := ""
+	if currentRead {
+		lock = " FOR UPDATE"
+	}
 	// 在解析到有效 company_id 时，验证该目标企业在数据库中真实存活且有效（M19 并发防悬垂保护）：
 	// 避免在企业删除提交之后，由于旧快照读解析出了已被删除的 company_id，导致新写入的资产带有悬空的 company_id。
 	verifyCompanyAlive := func(cid int64) (*int64, error) {
 		var exists int
-		err := q.QueryRow(`SELECT 1 FROM companies WHERE id = ? LIMIT 1`, cid).Scan(&exists)
+		err := q.QueryRow(`SELECT 1 FROM companies WHERE id = ? LIMIT 1`+lock, cid).Scan(&exists)
 		if err == nil {
 			return &cid, nil
 		}
@@ -293,7 +326,7 @@ func resolveAssetCompany(q assetScopeQueryer, rootDomain, ipStr, icp string) (*i
 SELECT company_id FROM company_scope
 WHERE kind = 'domain' AND domain = ?
 ORDER BY CHAR_LENGTH(domain) DESC, company_id ASC
-LIMIT 1`, rootDomain).Scan(&cid)
+LIMIT 1`+lock, rootDomain).Scan(&cid)
 		if err == nil {
 			return verifyCompanyAlive(cid)
 		}
@@ -302,7 +335,7 @@ LIMIT 1`, rootDomain).Scan(&cid)
 		}
 	}
 	if ip := net.ParseIP(strings.TrimSpace(ipStr)); ip != nil {
-		cid, err := resolveCompanyByIP(q, ip)
+		cid, err := resolveCompanyByIP(q, ip, currentRead)
 		if err != nil {
 			return nil, err
 		}
@@ -316,7 +349,7 @@ LIMIT 1`, rootDomain).Scan(&cid)
 SELECT company_id FROM company_scope
 WHERE kind = 'icp' AND value = ?
 ORDER BY company_id ASC
-LIMIT 1`, normalized).Scan(&cid)
+LIMIT 1`+lock, normalized).Scan(&cid)
 		if err == nil {
 			return verifyCompanyAlive(cid)
 		}
@@ -329,10 +362,19 @@ LIMIT 1`, normalized).Scan(&cid)
 
 // resolveCompanyByIP 取回全部 ip/cidr 归属规则，在内存里做最长前缀匹配
 // （原 PG 语义：masklen 降序、company_id 升序）。
-func resolveCompanyByIP(q assetScopeQueryer, ip net.IP) (*int64, error) {
+//
+// currentRead（仅在持有企业/范围写者屏障时为真）把这条候选查询升级为加锁当前读，
+// 与 resolveAssetCompany 同一条口径；company_scope 的写入方（AddScope/UpdateScope/
+// DeleteCompanyWithAssets/RegisterTaskAssetScopes）全部先取同一把 companies 屏障，
+// 因此这把行锁不会与别的写者形成反向锁序。
+func resolveCompanyByIP(q assetScopeQueryer, ip net.IP, currentRead bool) (*int64, error) {
+	lock := ""
+	if currentRead {
+		lock = " FOR UPDATE"
+	}
 	rows, err := q.Query(`
 SELECT company_id, net FROM company_scope
-WHERE kind IN ('ip', 'cidr') AND net IS NOT NULL`)
+WHERE kind IN ('ip', 'cidr') AND net IS NOT NULL` + lock)
 	if err != nil {
 		return nil, err
 	}
@@ -1187,7 +1229,8 @@ func assetTaskIDsOf(taskID int64) []int64 {
 //     直接执行；在同一事务里重复取父锁只会自锁；
 //   - s.tx == nil 且 taskID > 0：经写者协议（全局业务门禁 → 行锁父任务 → 核验存活 →
 //     整体退避重放）。正在被级联删除的任务不可能再被挂上新资产（I1 屏障）；
-//   - s.tx == nil 且无 TaskID：走资产引擎自己的 1062/1205/1213 重试循环。
+//   - s.tx == nil 且无 TaskID：走资产引擎自己的 1062/1205/1213 重试循环，并在每次尝试
+//     的事务内先取企业/范围写者屏障（withCompanyScopeMutation），归属解析改用当前读。
 //
 // 归属 link 的双写不在这里做，而在 writeAsset 这个**唯一写入出口**里完成：嵌套副作用
 // （subdomain 顺带 upsert root_domain / IP 等）复用同一个 s.tx，同样会经过出口，
@@ -2405,23 +2448,83 @@ func (s *AssetStore) deleteByTaskIDTx(tx *sql.Tx, taskID int64) (int64, error) {
 	}
 
 	deleted := int64(0)
+	ctx := context.Background()
 	if len(owned) > 0 {
-		args := make([]any, 0, len(owned))
-		for _, id := range owned {
-			args = append(args, id)
-		}
-		res, err := tx.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(repeatQuestion(len(owned)), ",")+")", args...)
-		if err != nil {
+		// 独占资产整行删除：同事务先清 task_asset_links / exploration_anchors /
+		// finding_assets，再删本体（TiDB 无外键，漏一步就是永久卡死任务的悬空引用）。
+		targets := normalizeAssetIDs(owned)
+		if _, err := lockAssetRowsTx(ctx, tx, targets); err != nil {
 			return 0, err
 		}
-		deleted, _ = res.RowsAffected()
+		if _, err := purgeAssetReferencesTx(ctx, tx, targets); err != nil {
+			return 0, err
+		}
+		deleted, err = deleteAssetRowsTx(ctx, tx, targets)
+		if err != nil {
+			return deleted, err
+		}
 	}
 	for _, item := range shared {
 		if _, err := tx.Exec("UPDATE assets SET task_ids = ? WHERE id = ?", item.taskIDs, item.id); err != nil {
 			return deleted, err
 		}
+		// 双写不变式（规格 §3.2.2）：JSON 里剥掉了 taskID，本任务的 link 行必须在
+		// 同一事务里一起消失，否则 task_asset_links 会留下一条指向"仍存活资产"的
+		// 幽灵关联 —— 资产视图依旧把这条资产算作本任务的资产。
+		if err := deleteTaskAssetLinkRowsTx(ctx, tx, taskID, []int64{item.id}); err != nil {
+			return deleted, err
+		}
 	}
 	return deleted, nil
+}
+
+// deleteTaskAssetLinkRowsTx 删除 (taskID, assetIDs) 对应的 link 物理行。
+//
+// 与 detachTaskAssetTx 同一口径：先按 row_id 升序把要删的行锁住，再逐批按 row_id 删除，
+// 绝不对 task_asset_links 发"按未索引/半索引列的裸范围 DELETE"。这样锁集合可预测，
+// 也与 cascade_executor 的 deleteByPK 同向，不会与任务级联交错出反向锁序。
+func deleteTaskAssetLinkRowsTx(ctx context.Context, tx *sql.Tx, taskID int64, assetIDs []int64) error {
+	targets := normalizeAssetIDs(assetIDs)
+	if taskID <= 0 || len(targets) == 0 {
+		return nil
+	}
+	for _, chunk := range chunkInt64(targets, assetRefPurgeBatchSize) {
+		args := make([]any, 0, len(chunk)+3)
+		args = append(args, taskID)
+		args = append(args, int64Args(chunk)...)
+		in := inPlaceholders(len(chunk))
+		for cursor := int64(0); ; {
+			query := "SELECT row_id FROM task_asset_links WHERE task_id = ? AND asset_id IN (" + in +
+				") AND row_id > ? ORDER BY row_id LIMIT ? FOR UPDATE"
+			pageArgs := append(append([]any{}, args...), cursor, assetRefPurgeBatchSize)
+			var pkIDs []uint64
+			if err := queryUint64s(ctx, tx, &pkIDs, query, pageArgs...); err != nil {
+				return fmt.Errorf("assets: lock task_asset_links rows: %w", err)
+			}
+			if len(pkIDs) == 0 {
+				return nil
+			}
+			for _, batch := range chunkUint64(pkIDs, assetRefPurgeBatchSize) {
+				batchArgs := make([]any, len(batch))
+				for i, id := range batch {
+					batchArgs[i] = id
+				}
+				if _, err := tx.ExecContext(ctx,
+					"DELETE FROM task_asset_links WHERE row_id IN ("+inPlaceholders(len(batch))+")", batchArgs...); err != nil {
+					return fmt.Errorf("assets: delete task_asset_links rows: %w", err)
+				}
+			}
+			last := pkIDs[len(pkIDs)-1]
+			if last > uint64(math.MaxInt64) {
+				return fmt.Errorf("assets: task_asset_links pk %d overflows int64 cursor", last)
+			}
+			cursor = int64(last)
+			if len(pkIDs) < assetRefPurgeBatchSize {
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 // HostsByTask returns the exact HTTP host candidates attached to a task's
@@ -2483,6 +2586,16 @@ type rowsQuerier interface {
 // transaction path so asset/anchor writes stay locked until the task delete is
 // committed.
 func hostsForTaskDeletion(q rowsQuerier, taskID, explorationID int64) ([]string, error) {
+	// 两段 UNION：true 段是"本任务够得着的 host"（自己的归属 + 自己图里的锚点），
+	// false 段是"**别的存活任务**还要用的 host"，Go 侧按 host 做差集。
+	//
+	// 两段必须各自独立成立，绝不能给 false 段加 `a.id NOT IN (true 段)` 这类排除：
+	// 同一条资产既可以被本任务拥有、又可以同时被另一个存活任务拥有（共享资产），
+	// 排除之后它永远进不了 protected，共享 host 的流量会被连着删掉。反过来 false 段
+	// 也不能只盯本任务够得着的行：host 级共享常常长成"同一个 host 上另有一行资产、
+	// 归另一个任务"，那才是共享的本义。归属判据必须关联到候选任务 t.id —— 早先最后
+	// 一个 JSON_CONTAINS 绑的是外层 taskID，等价于"只要本任务拥有就受保护"，
+	// 会连本任务独占的 host 一起保护起来。
 	rows, err := q.Query(`
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,''), true
 FROM assets a
@@ -2495,32 +2608,18 @@ WHERE `+assetJSONContains("a.task_ids", "?")+`
 UNION ALL
 SELECT COALESCE(a.domain,''), COALESCE(a.ip,''), COALESCE(a.url,''), false
 FROM assets a
-WHERE a.id NOT IN (
-        SELECT a2.id FROM assets a2
-        WHERE `+assetJSONContains("a2.task_ids", "?")+`
-           OR EXISTS (
-                SELECT 1 FROM exploration_anchors ea
-                JOIN exploration_nodes n ON n.id = ea.node_id
-                WHERE n.exploration_id = ? AND ea.asset_id = a2.id
-           )
-   )
-   AND (
-        EXISTS (
-            SELECT 1
-            FROM exploration_anchors ea
-            JOIN exploration_nodes n ON n.id = ea.node_id
-            JOIN tasks t2 ON t2.exploration_id = n.exploration_id
-            WHERE ea.asset_id = a.id AND t2.id <> ? AND t2.deleted_at IS NULL
-        )
-        OR EXISTS (
-            SELECT 1 FROM tasks t
-            WHERE t.id <> ? AND t.deleted_at IS NULL
-              AND (
-                    (JSON_LENGTH(a.task_ids) = 1 AND `+assetJSONContains("a.task_ids", "t.id")+`)
-                 OR `+assetJSONContains("a.task_ids", "?")+`
-                  )
-        )
-   )`, taskID, explorationID, taskID, explorationID, taskID, taskID, taskID)
+WHERE EXISTS (
+        SELECT 1
+        FROM exploration_anchors ea
+        JOIN exploration_nodes n ON n.id = ea.node_id
+        JOIN tasks t2 ON t2.exploration_id = n.exploration_id
+        WHERE ea.asset_id = a.id AND t2.id <> ? AND t2.deleted_at IS NULL
+    )
+   OR EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.id <> ? AND t.deleted_at IS NULL
+          AND `+assetJSONContains("a.task_ids", "t.id")+`
+    )`, taskID, explorationID, taskID, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -2595,13 +2694,322 @@ func (s *AssetStore) GetByIDs(ids []int64) ([]*Asset, error) {
 	return scanAssets(rows)
 }
 
+// =============================================================================
+// 资产引用完整性清理（TiDB 基线**不建外键**）
+//
+// PG 时代 assets 的子表挂着 ON DELETE CASCADE，删资产本体时数据库顺手把从属行一起
+// 带走。TiDB 8.5 迁移基线明确不建外键（见 db/schema/catalog_*.go），于是"只 DELETE
+// assets 本行"的写法会把从属行原样留在库里，成为指向**已删除资产**的悬空引用。悬空
+// 引用的代价不是"脏数据"这么轻：
+//
+//	task_closure 把「link / anchor 指向的资产」算进任务的删除闭包，cascade_executor
+//	再逐个按物理 PK FOR UPDATE 锁这些资产行；悬空 id 锁不到行 ⇒ 成员漂移复核判定
+//	drift ⇒ 整笔级联回滚并放弃删除。一条悬空 link 就足以让对应任务**永久删不掉**
+//	（启用真实库用例时实测复现：artex_dev 悬空 link 133 行、悬空 anchor 33 行）。
+//
+// 因此所有"删除 assets 行"的产品路径都必须在**同一事务**里先清从属行再删本体，
+// 本节的 helper 是这条纪律的唯一实现。
+//
+// 从属表清单来源：全库扫描引用列
+//
+//	SELECT table_name, column_name FROM information_schema.columns
+//	 WHERE table_schema = DATABASE() AND column_name LIKE '%asset%'
+//
+// 命中 5 处，逐个定性：
+//   - exploration_anchors.asset_id   — 物理外键语义（node→asset 边）→ 整行删除；
+//   - finding_assets.asset_id        — 物理外键语义（finding→asset 事实行）→ 整行删除；
+//   - task_asset_links.asset_id      — 物理外键语义（task→asset 关联）→ 整行删除；
+//   - findings.asset_ids（JSON 数组）— **软引用**：读取侧把"数组里的 id 一个都不在
+//     assets 表里"的发现归入 FindingUnassignedAsset（未关联资产）桶（见 db/findings.go
+//     的 __none__ 谓词与 db/finding_assets.go 的同名哨兵），这是产品明确定义的兜底
+//     语义而非悬挂缺陷，因此**不**随资产删除改写漏洞历史；
+//   - assets.task_ids（JSON 数组）   — 资产行自身的反向冗余，随本体整行消失，无需 UPDATE。
+//
+// 「assets.task_ids ↔ task_asset_links 原子双写」（规格 §3.2.2）在本路径上的成立方式：
+// 本路径是**硬删除资产本体**，两侧在同一事务内一起消失（link 行按物理 row_id 删、
+// 资产行按 PK 删）；任何一侧先落库都会破坏双写不变式，故绝不拆成两次提交。
+// =============================================================================
+
+// assetRefPurgeBatchSize 是引用清理里 `IN (…)` 与 PK 游标的有界长度。调用方的 id
+// 列表来自 HTTP 批量删除（DELETE /api/assets）、企业清理与 host 清理，长度不设上限，
+// 必须分批，否则一条 SQL 的占位符无限膨胀（prepare 成本与内存失控）。
+const assetRefPurgeBatchSize = 200
+
+// assetReferenceTables 是引用 assets.id 的**全部**从属表（定性见上方说明），数组顺序
+// 即 lockorder 固定锁序的升序：exploration_anchors(20) → finding_assets(22) →
+// task_asset_links(50)。与任务级联执行器同向加锁，避免两条路径交错时出现反向锁序。
+var assetReferenceTables = []struct {
+	Name     string
+	PKColumn string
+}{
+	{"exploration_anchors", "row_id"},
+	{"finding_assets", "id"},
+	{"task_asset_links", "row_id"},
+}
+
+// chunkInt64 把 int64 列表切成有界批次（与 cascade 侧 chunkUint64 同一纪律）。
+func chunkInt64(ids []int64, size int) [][]int64 {
+	if len(ids) == 0 || size <= 0 {
+		return nil
+	}
+	out := make([][]int64, 0, (len(ids)+size-1)/size)
+	for start := 0; start < len(ids); start += size {
+		end := start + size
+		if end > len(ids) {
+			end = len(ids)
+		}
+		cloned := make([]int64, end-start)
+		copy(cloned, ids[start:end])
+		out = append(out, cloned)
+	}
+	return out
+}
+
+// queryInt64s 追加一条单列 SELECT 的结果（升序游标翻页用）；与 task_closure 侧
+// queryUint64s 同一实现口径，只是目标类型是 int64（assets.id 是 BIGINT，但业务侧
+// 一律按 int64 处理，避免无符号转换边界）。
+func queryInt64s(ctx context.Context, tx DBTX, dest *[]int64, query string, args ...any) error {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		*dest = append(*dest, id)
+	}
+	return rows.Err()
+}
+
+// normalizeAssetIDs 把调用方给定的 id 列表规整为「丢弃非正数 + 去重 + 升序」。
+//
+//   - 非正数：0 与负数不可能是 assets.id（BIGINT UNSIGNED 自增），既有调用方把它们
+//     当"未设置"传（server 侧 parseIDListField 已挡非正数，内部路径未必），静默丢弃
+//     而不是报错，与 detachTaskAssetTx 对缺失资产的宽容口径一致；
+//   - 升序：加锁与删除都按主键升序进行，这是与闭包执行器共享的防死锁纪律；
+//   - 结果为空时上层必须**直接返回**，绝不拼出 `IN ()` 这种非法 SQL。
+func normalizeAssetIDs(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// lockAssetRowsTx 以 PK 升序当前读锁住待删的资产行，返回实际存在的 id。
+//
+// 加锁的必要性：本路径与 attach/detach（lockAssetForTaskLink）、任务级联（按 PK
+// FOR UPDATE）会在同一批资产上交错。先锁本体再清从属行，才能保证"task_ids ↔
+// task_asset_links"的读改写窗口里不会出现并发认领 —— 否则对方刚把这条资产挂给新
+// 任务，我们这边已经把资产行连同 link 一起删掉，新任务于是拿到一条悬空 link。
+func lockAssetRowsTx(ctx context.Context, tx *sql.Tx, ids []int64) ([]int64, error) {
+	var found []int64
+	for _, chunk := range chunkInt64(ids, assetRefPurgeBatchSize) {
+		query := "SELECT id FROM assets WHERE id IN (" + inPlaceholders(len(chunk)) + ") ORDER BY id FOR UPDATE"
+		if err := queryInt64s(ctx, tx, &found, query, int64Args(chunk)...); err != nil {
+			return nil, err
+		}
+	}
+	return found, nil
+}
+
+// purgeAssetReferencesTx 在同一事务内物理删除引用 assetIDs 的从属行，
+// 返回「表名 → 删除行数」的审计结果。
+//
+// 每张表都走「按 PK 游标锁读物理主键（升序 + 有界 LIMIT）→ 按 PK 精确 DELETE」两步，
+// 而不是一条 `DELETE … WHERE asset_id IN (…)`：
+//  1. 开放范围 DML 会按扫描顺序拿走计划外的锁（与 cascade R1 判红样本同一口径），
+//     而本路径的调用方在同一事务里还要锁别的表；
+//  2. 按 PK 删让锁集合完全可预测，天然与 cascade_executor 的 deleteByPK 同向；
+//  3. PK 游标把"锁 + 删"的批量限制在一段连续 PK 上，避免一次锁住整段未索引范围。
+//
+// 调用方必须先把 assetIDs 规整为升序去重的正数（normalizeAssetIDs）。
+func purgeAssetReferencesTx(ctx context.Context, tx *sql.Tx, assetIDs []int64) (map[string]int64, error) {
+	purged := make(map[string]int64, len(assetReferenceTables))
+	if len(assetIDs) == 0 {
+		return purged, nil
+	}
+	for _, ref := range assetReferenceTables {
+		total := int64(0)
+		for _, chunk := range chunkInt64(assetIDs, assetRefPurgeBatchSize) {
+			in := inPlaceholders(len(chunk))
+			for cursor := int64(0); ; {
+				args := make([]any, 0, len(chunk)+2)
+				args = append(args, int64Args(chunk)...)
+				args = append(args, cursor, assetRefPurgeBatchSize)
+				var pkIDs []uint64
+				query := "SELECT " + ref.PKColumn + " FROM " + ref.Name +
+					" WHERE asset_id IN (" + in + ") AND " + ref.PKColumn + " > ?" +
+					" ORDER BY " + ref.PKColumn + " LIMIT ? FOR UPDATE"
+				if err := queryUint64s(ctx, tx, &pkIDs, query, args...); err != nil {
+					return purged, fmt.Errorf("assets: lock %s rows by asset_id: %w", ref.Name, err)
+				}
+				if len(pkIDs) == 0 {
+					break
+				}
+				for _, batch := range chunkUint64(pkIDs, assetRefPurgeBatchSize) {
+					batchArgs := make([]any, len(batch))
+					for i, id := range batch {
+						batchArgs[i] = id
+					}
+					res, err := tx.ExecContext(ctx,
+						"DELETE FROM "+ref.Name+" WHERE "+ref.PKColumn+" IN ("+inPlaceholders(len(batch))+")", batchArgs...)
+					if err != nil {
+						return purged, fmt.Errorf("assets: delete %s rows by pk: %w", ref.Name, err)
+					}
+					n, err := res.RowsAffected()
+					if err != nil {
+						return purged, err
+					}
+					total += n
+				}
+				last := pkIDs[len(pkIDs)-1]
+				if last > uint64(math.MaxInt64) {
+					return purged, fmt.Errorf("assets: %s pk %d overflows int64 cursor", ref.Name, last)
+				}
+				cursor = int64(last)
+				if len(pkIDs) < assetRefPurgeBatchSize {
+					break
+				}
+			}
+		}
+		purged[ref.Name] = total
+	}
+	return purged, nil
+}
+
+// deleteAssetRowsTx 按 PK 分批删除资产本体并返回删除行数；ids 必须已规整。
+func deleteAssetRowsTx(ctx context.Context, tx *sql.Tx, ids []int64) (int64, error) {
+	deleted := int64(0)
+	for _, chunk := range chunkInt64(ids, assetRefPurgeBatchSize) {
+		res, err := tx.ExecContext(ctx,
+			"DELETE FROM assets WHERE id IN ("+inPlaceholders(len(chunk))+")", int64Args(chunk)...)
+		if err != nil {
+			return deleted, fmt.Errorf("assets: delete assets by pk: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return deleted, err
+		}
+		deleted += n
+	}
+	return deleted, nil
+}
+
+// deleteAssetsByIDsWithTx 是三条对外删除路径（按 ID / 按企业 / 按 host）共用的收尾：
+// 锁资产本体 → 同事务清从属引用 → 删本体，任何一步失败整体回滚。
+// 返回（实际删除的资产数, 引用清理审计, error）。ids 允许含重复与非正数。
+func deleteAssetsByIDsWithTx(ctx context.Context, tx *sql.Tx, ids []int64) (int64, map[string]int64, error) {
+	targets := normalizeAssetIDs(ids)
+	if len(targets) == 0 {
+		return 0, nil, nil
+	}
+	existing, err := lockAssetRowsTx(ctx, tx, targets)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(existing) == 0 {
+		return 0, nil, nil
+	}
+	purged, err := purgeAssetReferencesTx(ctx, tx, existing)
+	if err != nil {
+		return 0, purged, err
+	}
+	deleted, err := deleteAssetRowsTx(ctx, tx, existing)
+	return deleted, purged, err
+}
+
+// deleteAssetsByIDsStore 处理"已绑定事务(s.tx) / 未绑定(db 自开事务)"两种形态，
+// 让 DeleteByIDs / DeleteByCompanyID / DeleteByHost 在外层已开事务时复用同一段原子
+// 逻辑（嵌套开事务会自锁，并把双写拆成两次提交）。
+func (s *AssetStore) deleteAssetsByIDsStore(ids []int64) (int64, map[string]int64, error) {
+	ctx := context.Background()
+	if s.tx != nil {
+		return deleteAssetsByIDsWithTx(ctx, s.tx, ids)
+	}
+	var deleted int64
+	var purged map[string]int64
+	err := s.db.execInTx(func(tx *sql.Tx) error {
+		var err error
+		deleted, purged, err = deleteAssetsByIDsWithTx(ctx, tx, ids)
+		return err
+	})
+	if err != nil {
+		return 0, purged, err
+	}
+	return deleted, purged, nil
+}
+
 // DeleteByCompanyID hard-deletes all assets belonging to a company. Returns rows deleted.
+//
+// TiDB 没有 ON DELETE CASCADE：原来的单条 `DELETE FROM assets WHERE company_id = ?`
+// 会把 task_asset_links / exploration_anchors / finding_assets 中指向这些资产的行
+// 全部留在库里成为悬空引用（并把对应任务的 DeleteTask 永久卡死）。现在改为同一
+// 事务内「锁候选行 → 清引用 → 按 PK 删本体」；返回值仍是删除的资产数，调用方无感。
 func (s *AssetStore) DeleteByCompanyID(companyID int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM assets WHERE company_id = ?`, companyID)
+	if companyID <= 0 {
+		return 0, nil
+	}
+	var deleted int64
+	err := s.db.execInTx(func(tx *sql.Tx) error {
+		var err error
+		deleted, err = deleteAssetsByCompanyIDTx(context.Background(), tx, companyID)
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return deleted, nil
+}
+
+// deleteAssetsByCompanyIDTx 在**调用方给定的事务**里删除某企业的全部资产并清理引用。
+//
+// 抽成事务内函数的原因：DeleteCompanyWithAssets（企业级联）自己已经开了事务并持有
+// 企业/范围写者屏障，它必须复用同一段"锁候选 → 清引用 → 按 PK 删本体"，而不是再发
+// 一条裸 `DELETE FROM assets WHERE company_id = ?`（那正是悬空 link/anchor 的成因之一），
+// 更不能嵌套调用 DeleteByCompanyID —— 嵌套事务会去排队等自己已经持有的那把屏障锁。
+func deleteAssetsByCompanyIDTx(ctx context.Context, tx *sql.Tx, companyID int64) (int64, error) {
+	if companyID <= 0 {
+		return 0, nil
+	}
+	// 同一事务内：锁读候选 PK（游标翻页，避免一次性锁全表）→ 清引用 → 删本体。
+	var ids []int64
+	for cursor := int64(0); ; {
+		var page []int64
+		if err := queryInt64s(ctx, tx, &page,
+			`SELECT id FROM assets WHERE company_id = ? AND id > ? ORDER BY id LIMIT ? FOR UPDATE`,
+			companyID, cursor, assetRefPurgeBatchSize); err != nil {
+			return 0, err
+		}
+		ids = append(ids, page...)
+		if len(page) < assetRefPurgeBatchSize {
+			break
+		}
+		cursor = page[len(page)-1]
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	targets := normalizeAssetIDs(ids)
+	if _, err := purgeAssetReferencesTx(ctx, tx, targets); err != nil {
+		return 0, err
+	}
+	return deleteAssetRowsTx(ctx, tx, targets)
 }
 
 // DeleteByHost hard-deletes every asset whose host exactly matches the given value:
@@ -2610,8 +3018,10 @@ func (s *AssetStore) DeleteByCompanyID(companyID int64) (int64, error) {
 // normalized the same way it is stored (DomainKey: lowercase/trim/strip trailing dot)
 // so matching is exact, not fuzzy. Passing a root domain also removes its subdomains
 // and their services/endpoints (they carry root_domain = that host); passing a
-// subdomain/IP removes only that host's own assets. Referencing exploration_anchors
-// rows are cleaned by ON DELETE CASCADE. Returns rows deleted, grouped by type.
+// subdomain/IP removes only that host's own assets.
+//
+// PG 时代靠 assets 的 ON DELETE CASCADE 顺带清掉引用行；TiDB 基线不建外键，本路径
+// 现在在同一事务里显式清理（purgeAssetReferencesTx），与 DeleteByIDs 完全同一口径。
 //
 // TiDB 没有 DELETE … RETURNING：先在同一事务里按候选行加锁读回 type，再按 PK 删除，
 // 分组计数与原来的 RETURNING type 完全一致。
@@ -2645,15 +3055,14 @@ WHERE domain = ? OR root_domain = ? OR ip = ? FOR UPDATE`, h, h, h)
 		if len(ids) == 0 {
 			return nil
 		}
-		placeholders := repeatQuestion(len(ids))
-		args := make([]any, 0, len(ids))
-		for _, id := range ids {
-			args = append(args, id)
-		}
-		if _, err := tx.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(placeholders, ",")+")", args...); err != nil {
+		// 候选行已被 FOR UPDATE 锁住；这里只做"清引用 + 按 PK 删本体"，
+		// 不再重复锁定（同一事务里重复锁同一行虽不阻塞，但会让锁计划失真）。
+		targets := normalizeAssetIDs(ids)
+		if _, err := purgeAssetReferencesTx(context.Background(), tx, targets); err != nil {
 			return err
 		}
-		return nil
+		_, err = deleteAssetRowsTx(context.Background(), tx, targets)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -2662,21 +3071,26 @@ WHERE domain = ? OR root_domain = ? OR ip = ? FOR UPDATE`, h, h, h)
 }
 
 // DeleteByIDs hard-deletes assets by their IDs. Returns the number of rows deleted.
+//
+// 引用完整性（TiDB 无外键，必须由应用层补齐）：删除与从属行清理在**同一事务**内完成
+// —— 先按 PK 升序锁住待删资产行，再在同一事务里删除
+//   - task_asset_links（asset_id 命中，按物理 row_id 精确删）
+//   - exploration_anchors（asset_id 命中，按物理 row_id 精确删）
+//   - finding_assets（asset_id 命中，按物理 id 精确删）
+//
+// 最后才删 assets 本体。task_asset_links 与 assets.task_ids 是一对必须原子的双写
+// （规格 §3.2.2）：本路径把资产本体整行删除，两侧同生同死，绝不出现"link 删了、
+// 资产还在"或"资产删了、link 悬空"的半态。
+//
+// 入参里的非正数与重复项被静默丢弃（不可能是合法 assets.id）；规整后为空则直接返回
+// 0，绝不拼出 `IN ()` 这种非法 SQL。返回语义与旧实现一致（删除的资产行数），
+// server DELETE /api/assets 的 {"deleted": n} 不变。
 func (s *AssetStore) DeleteByIDs(ids []int64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	placeholders := repeatQuestion(len(ids))
-	args := make([]any, 0, len(ids))
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	sqlText := "DELETE FROM assets WHERE id IN (" + strings.Join(placeholders, ",") + ")"
-	res, err := s.db.Exec(sqlText, args...)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	deleted, _, err := s.deleteAssetsByIDsStore(ids)
+	return deleted, err
 }
 
 // CountsByType returns asset counts per type.

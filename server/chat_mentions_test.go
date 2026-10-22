@@ -51,15 +51,29 @@ func TestChatMentionPagination(t *testing.T) {
 		}
 		t.Cleanup(func() { _, _ = pg.DeleteFinding(id) })
 	}
-	var companyID, assetID int64
-	if err := pg.QueryRow(`INSERT INTO companies(name,nkey) VALUES($1,$1) RETURNING id`, query).Scan(&companyID); err != nil {
+	// companies.nkey_identity / nkey_hash 是 NOT NULL 且没有默认值，
+	// 手写 INSERT 会撞 Error 1364：必须走产品 upsert（它负责派生归一化键）。
+	companyID, _, err := pg.Companies().UpsertCompany(query, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM companies WHERE id=$1`, companyID) })
-	if err := pg.QueryRow(`INSERT INTO assets(type,app_name,bundle_id) VALUES('app',$1,$1) RETURNING id`, query).Scan(&assetID); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM assets WHERE id=$1`, assetID) })
+	createdCompany := companyID
+	t.Cleanup(func() {
+		if err := pg.Companies().DeleteCompany(createdCompany); err != nil {
+			t.Errorf("删除公司 fixture %d 失败: %v", createdCompany, err)
+		}
+		assertZero(t, pg, `SELECT COUNT(*) FROM companies WHERE id=?`, createdCompany)
+	})
+	// TiDB 基线里 assets 的 company_source / task_ids / bound_domains / open_ports /
+	// record_value / technologies / auth / params / extra 都是 NOT NULL 且**没有默认值**
+	// （PG 时代靠列默认值省略了它们），手写 INSERT 必须逐列显式给出。
+	assetID := insertRowID(t, pg, `INSERT INTO assets(type,app_name,bundle_id,company_source,task_ids,
+    bound_domains,open_ports,record_value,technologies,auth,params,extra)
+    VALUES('app',?,?,'explicit','[]','[]','[]','','[]','[]','[]','{}')`, query, query)
+	t.Cleanup(func() {
+		mustCleanup(t, pg, `DELETE FROM assets WHERE id=?`, assetID)
+		assertZero(t, pg, `SELECT COUNT(*) FROM assets WHERE id=?`, assetID)
+	})
 	cursor := ""
 	seen := map[string]bool{}
 	for pageNum := 0; ; pageNum++ {
@@ -117,12 +131,7 @@ func TestChatMentionPagination(t *testing.T) {
 }
 
 func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{ctx: ctx, m: m, engine: NewEngine(m)}
 	task, err := m.CreateTask("Worker mention test", "Read referenced records", nil, 0, 0)
@@ -134,7 +143,7 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 		drain, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stop()
 		_ = s.waitTaskQuiescent(drain, task.ID)
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 	}()
 	iid, err := task.Store.AddNode(db.KindIntent, map[string]any{"summary": "Read referenced records only"}, 1, "paused", "human", nil)
 	if err != nil {
@@ -226,24 +235,33 @@ func TestChatMentionBoundedJSON(t *testing.T) {
 func TestChatMentionCatalogAndContext(t *testing.T) {
 	s, fid := newRetestServer(t)
 	pg := s.m.pg
-	var cid int64
-	if err := pg.QueryRow(`INSERT INTO companies(name,nkey) VALUES('引用测试公司','mention-test-company') RETURNING id`).Scan(&cid); err != nil {
+	// 企业与其 scope 一律走产品 API：nkey_identity / nkey_hash 由它派生，
+	// 名称带上本用例独有的 fid，避免共享库上的唯一键 1062。
+	cid, _, _, _, _, err := pg.Companies().CreateCompanyWithScope(
+		fmt.Sprintf("引用测试公司 %d", fid), "",
+		[]db.ScopeInput{{Kind: "domain", Value: fmt.Sprintf("mention-%d.example", fid)}}, "test")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM companies WHERE id=$1`, cid) })
-	if _, err := pg.Exec(`INSERT INTO company_scope(company_id,kind,domain,raw) VALUES($1,'domain','mention.example','mention.example')`, cid); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() {
+		if err := pg.Companies().DeleteCompany(cid); err != nil {
+			t.Errorf("删除公司 fixture %d 失败: %v", cid, err)
+		}
+		assertZero(t, pg, `SELECT COUNT(*) FROM companies WHERE id=?`, cid)
+		assertZero(t, pg, `SELECT COUNT(*) FROM company_scope WHERE company_id=?`, cid)
+	})
 	var refs strings.Builder
 	fmt.Fprintf(&refs, "分析 @[漏洞#%d 客户端伪造标题] @[企业#%d 公司] ", fid, cid)
 	for _, kind := range []string{"root_domain", "subdomain", "ip", "app", "service", "endpoint"} {
 		var id int64
-		if err := pg.QueryRow(`INSERT INTO assets(type,company_id,domain,ip,app_name,url,method,extra)
-          VALUES($1,$2,$3,'192.0.2.81','引用测试应用',$4,'GET','{"note":"参数和扩展信息"}') RETURNING id`,
-			kind, cid, kind+".mention.example", "https://"+kind+".mention.example/path").Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM assets WHERE id=$1`, id) })
+		// ip 列在 TiDB 上是 CIDR 类型，'192.0.2.81' 由驱动按主机地址写入。
+		// 同上：TiDB 上这些集合列 NOT NULL 且无默认值，必须显式补全。
+		id = insertRowID(t, pg, `INSERT INTO assets(type,company_id,domain,ip,app_name,url,method,extra,
+    company_source,task_ids,bound_domains,open_ports,record_value,technologies,auth,params)
+    VALUES(?,?,?,?,?,?,?,?,?,'[]','[]','[]','','[]','[]','[]')`,
+			kind, cid, kind+".mention.example", "192.0.2.81", "引用测试应用",
+			"https://"+kind+".mention.example/path", "GET", `{"note":"参数和扩展信息"}`, "explicit")
+		t.Cleanup(func() { mustCleanup(t, pg, `DELETE FROM assets WHERE id=?`, id) })
 		label := ""
 		for name, value := range chatMentionKinds {
 			if value == kind {
@@ -264,7 +282,7 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 			}
 		}
 	}
-	if _, err := pg.Exec(`UPDATE findings SET report='完整报告内容',summary='最新摘要' WHERE id=$1`, fid); err != nil {
+	if _, err := pg.Exec(`UPDATE findings SET report='完整报告内容',summary='最新摘要' WHERE id=?`, fid); err != nil {
 		t.Fatal(err)
 	}
 	msg, err := composeChatMentionMessage(pg, refs.String())
@@ -314,7 +332,7 @@ func TestChatMentionConversationReceivesServerDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { waitRetestIdle(t, s); _, _ = s.m.pg.Exec(`DELETE FROM conversations WHERE id=$1`, c.ID) })
+	t.Cleanup(func() { waitRetestIdle(t, s); mustCleanup(t, s.m.pg, `DELETE FROM conversations WHERE id=?`, c.ID) })
 	message := fmt.Sprintf("请查看 @[漏洞#%d 示例]", fid)
 	body, _ := json.Marshal(map[string]any{"message": message})
 	w := retestRequest(s.pgSendConversationMessage, http.MethodPost, c.ID, string(body))

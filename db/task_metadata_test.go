@@ -7,11 +7,7 @@ import (
 )
 
 func TestTaskPinOrderingAndRename(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	suffix := time.Now().UnixNano()
 	first, err := d.CreateTask(fmt.Sprintf("task-pin-first-%d", suffix), "goal", nil, 0, 0)
@@ -69,11 +65,7 @@ func TestTaskPinOrderingAndRename(t *testing.T) {
 }
 
 func TestDeleteConversationsReturnsExistingIDs(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	first, err := d.CreateConversation("mainagent", "batch-delete-first", nil)
 	if err != nil {

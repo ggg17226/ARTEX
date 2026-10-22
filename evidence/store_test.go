@@ -3,6 +3,7 @@ package evidence
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,35 +20,139 @@ import (
 	"github.com/Autumn-27/artex/traffic"
 )
 
-func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
+// evidenceDSN 返回本轮集成测试使用的 TiDB 连接串（spec §3.1.1 / §4.3）。
+//
+//   - 未设置 ARTEX_TIDB_DSN → 诚实 t.Skip 声明"本用例未执行"，绝不当作通过；
+//   - 已设置 → 用例必须真实连库跑，连不上/基线缺失都是环境违规，由调用方判红。
+//     ARTEX_PG_DSN 与 postgres:// 协议已彻底废除，这里不再读取。
+func evidenceDSN(t *testing.T) string {
 	t.Helper()
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_TIDB_DSN"))
 	if dsn == "" {
-		t.Skip("ARTEX_PG_DSN is required for evidence integration tests")
+		t.Skip("ARTEX_TIDB_DSN not set")
 	}
-	pg, err := db.Open(dsn)
+	return dsn
+}
+
+// newRunTag 生成本轮 fixture 的唯一标记。它被写进证据快照的 url 里
+// （https://fixture.local/<tag>/<id>），于是"这一轮到底造了哪些快照行"就有了
+// 可精确回读的物理判据 —— 既不依赖时间窗口，也绝不圈到别人/历史的数据。
+func newRunTag(t *testing.T) string {
+	t.Helper()
+	var raw [6]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		t.Fatalf("生成 fixture 标记失败: %v", err)
+	}
+	return "ev" + hex.EncodeToString(raw[:])
+}
+
+// evidenceFixture 开一个真实 TiDB 连接 + 一个一次性任务 + 一个本地流量索引。
+//
+// 返回的 tag 是本轮唯一标记：seedExchange 必须把它拼进 url，清理阶段再按它
+// 精确回读并物理删净本轮的 traffic_evidence_snapshots 行。
+func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string, string) {
+	t.Helper()
+	pg, err := db.Open(evidenceDSN(t))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ARTEX_TIDB_DSN 已配置但打开 TiDB 失败（环境违规，必须判红而不是 Skip）: %v", err)
 	}
-	t.Cleanup(func() { pg.Close() })
-	task, err := pg.CreateTask("evidence integration "+t.Name(), "local fixtures", nil, 0, 0)
+	// 连接池 Close 是本函数最先登记的一条 cleanup，按 LIFO 最后执行，
+	// 于是下面的 fixture 清理一定跑在还活着的池上。
+	t.Cleanup(func() {
+		if err := pg.Close(); err != nil {
+			t.Errorf("关闭 TiDB 连接池失败: %v", err)
+		}
+	})
+	tag := newRunTag(t)
+	task, err := pg.CreateTask("evidence integration "+tag+" "+t.Name(), "local fixtures", nil, 0, 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("创建任务 fixture 失败: %v", err)
 	}
-	t.Cleanup(func() { pg.DeleteFindingsByTask(task.ID); pg.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupEvidenceFixture(t, pg, task.ID, tag) })
 	dir := t.TempDir()
 	tr, err := traffic.Open(filepath.Join(dir, "traffic"), ":0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { tr.Close() })
+	t.Cleanup(func() {
+		if err = tr.Close(); err != nil {
+			t.Errorf("关闭流量索引失败: %v", err)
+		}
+	})
 	store := New(pg, tr, filepath.Join(dir, "evidence"))
 	in := db.RecordFindingInput{TaskID: task.ID, ExplorationID: task.ExplorationID, Worker: "test", VulnClass: "TEST", Name: "Evidence fixture", Severity: "low", Summary: "local test"}
-	return store, in, dir
+	return store, in, dir, tag
 }
 
-func seedExchange(t *testing.T, s *Store, id string, body []byte, spill bool) {
+// evidenceURL 把本轮 tag 写进 fixture 的 url：快照 id 是内容的 SHA-256，
+// 带上 tag 后本轮每一条快照行都拥有独一无二的物理主键，清理才谈得上"精确"。
+func evidenceURL(tag, id string) string { return "https://fixture.local/" + tag + "/" + id }
+
+// cleanupEvidenceFixture 逆拓扑删净本轮 fixture：
+// 漏洞+绑定（产品级 DeleteFindingsByTask）→ 任务及其 exploration 子图
+// （DeleteTask 的完整物理闭包）→ 证据快照（按本轮 tag 精确回读出的物理主键）。
+// 任何一步失败都 t.Errorf 判红，绝不静默留下孤儿行。
+func cleanupEvidenceFixture(t *testing.T, pg *db.DB, taskID int64, tag string) {
+	t.Helper()
+	// 快照主键必须在删漏洞之前取：绑定一没，就没有别的路径能认出这些行了。
+	// tag 是随机 12 位十六进制，`%/<tag>/%` 只会命中本轮写入的 url。
+	pattern := "%/" + tag + "/%"
+	snapshots := evidenceSnapshotIDs(t, pg, pattern)
+	if _, err := pg.DeleteFindingsByTask(taskID); err != nil {
+		t.Errorf("清理任务 %d 的漏洞 fixture 失败: %v", taskID, err)
+	}
+	if err := pg.DeleteTask(taskID); err != nil {
+		t.Errorf("清理任务 fixture %d 失败: %v", taskID, err)
+	}
+	deleteEvidenceSnapshots(t, pg, snapshots)
+	if left := evidenceSnapshotIDs(t, pg, pattern); len(left) != 0 {
+		t.Errorf("证据快照未归零: task=%d 残留 %d 行 (示例 %s)", taskID, len(left), strings.Join(left, ","))
+	}
+}
+
+func evidenceSnapshotIDs(t *testing.T, pg *db.DB, urlPattern string) []string {
+	t.Helper()
+	rows, err := pg.Query(`SELECT id FROM traffic_evidence_snapshots WHERE url LIKE ? ORDER BY id`, urlPattern)
+	if err != nil {
+		t.Errorf("回读证据快照 fixture 失败: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			t.Errorf("扫描证据快照主键失败: %v", err)
+			return out
+		}
+		out = append(out, id)
+	}
+	if err = rows.Err(); err != nil {
+		t.Errorf("遍历证据快照 fixture 失败: %v", err)
+	}
+	return out
+}
+
+func deleteEvidenceSnapshots(t *testing.T, pg *db.DB, ids []string) {
+	t.Helper()
+	const batch = 200
+	for start := 0; start < len(ids); start += batch {
+		end := min(start+batch, len(ids))
+		args := make([]any, 0, end-start)
+		for _, id := range ids[start:end] {
+			args = append(args, id)
+		}
+		place := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
+		if _, err := pg.Exec(`DELETE FROM traffic_evidence_snapshots WHERE id IN (`+place+`)`, args...); err != nil {
+			t.Errorf("清理证据快照 fixture 失败 (%d 行): %v", len(args), err)
+		}
+	}
+}
+
+// seedExchange 往本轮一次性 SQLite 流量索引里写一条 exchange。
+// url 带上 tag（见 evidenceURL），host 保持 fixture.local —— 用例里的
+// DeleteHost("fixture.local") 语义不变。
+func seedExchange(t *testing.T, s *Store, tag, id string, body []byte, spill bool) {
 	t.Helper()
 	var blob any
 	inline := body
@@ -63,7 +169,7 @@ func seedExchange(t *testing.T, s *Store, id string, body []byte, spill bool) {
 		}
 		inline = []byte("TRUNCATED PREVIEW")
 	}
-	_, err := s.Traffic.DB().Exec(`INSERT INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path) VALUES(?,?,'fixture.local','POST','/test',?,200,'application/octet-stream',2,?,'')`, id, time.Now().Unix(), "https://fixture.local/"+id, len(body))
+	_, err := s.Traffic.DB().Exec(`INSERT INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path) VALUES(?,?,'fixture.local','POST','/test',?,200,'application/octet-stream',2,?,'')`, id, time.Now().Unix(), evidenceURL(tag, id), len(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,11 +180,11 @@ func seedExchange(t *testing.T, s *Store, id string, body []byte, spill bool) {
 }
 
 func TestEvidenceBindingLifecycle(t *testing.T) {
-	s, in, _ := evidenceFixture(t)
+	s, in, _, tag := evidenceFixture(t)
 	ctx := context.Background()
 	large := bytes.Repeat([]byte{0, 1, 2, 255, 'a', 'b'}, 180000)
 	for i := 0; i < 3; i++ {
-		seedExchange(t, s, fmt.Sprint(i), large, i == 2)
+		seedExchange(t, s, tag, fmt.Sprint(i), large, i == 2)
 	}
 	refs := []db.TrafficRef{{TrafficID: "0", Role: "baseline", Note: "normal"}, {TrafficID: "1", Role: "proof", Note: "proof"}, {TrafficID: "2", Role: "verification", Note: "binary"}}
 	r, err := s.Record(ctx, in, refs)
@@ -170,12 +276,18 @@ func TestEvidenceBindingLifecycle(t *testing.T) {
 }
 
 func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
-	s, in, dir := evidenceFixture(t)
+	s, in, dir, tag := evidenceFixture(t)
 	ctx := context.Background()
-	seedExchange(t, s, "valid", []byte("OK"), false)
-	counts := func() (findings, nodes int) {
-		s.DB.QueryRow(`SELECT count(*) FROM findings WHERE task_id=$1`, in.TaskID).Scan(&findings)
-		s.DB.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=$1 AND kind='finding'`, in.ExplorationID).Scan(&nodes)
+	seedExchange(t, s, tag, "valid", []byte("OK"), false)
+	counts := func(t *testing.T) (findings, nodes int) {
+		t.Helper()
+		// 计数查询本身失败也必须判红：吞掉错误会让"零残留"断言永远成立。
+		if err := s.DB.QueryRow(`SELECT count(*) FROM findings WHERE task_id=?`, in.TaskID).Scan(&findings); err != nil {
+			t.Fatalf("回读 findings 计数失败: %v", err)
+		}
+		if err := s.DB.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=? AND kind='finding'`, in.ExplorationID).Scan(&nodes); err != nil {
+			t.Fatalf("回读 exploration_nodes 计数失败: %v", err)
+		}
 		return
 	}
 	for _, kind := range []string{"missing_id", "missing_body", "disk_failure", "database_failure"} {
@@ -185,7 +297,7 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 			local := *s
 			switch kind {
 			case "missing_body":
-				seedExchange(t, s, "broken", []byte("more than preview"), false)
+				seedExchange(t, s, tag, "broken", []byte("more than preview"), false)
 				s.Traffic.DB().Exec(`UPDATE exchange_bodies SET resp_body=? WHERE id='broken'`, []byte("x"))
 				refs = []db.TrafficRef{{TrafficID: "valid"}, {TrafficID: "broken"}}
 			case "disk_failure":
@@ -195,13 +307,18 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 				}
 				refs = refs[:1]
 			case "database_failure":
+				// 注入一个不存在的资产引用逼停在落库途中失败。PG 时代这条由
+				// exploration_anchors 的外键兜住；TiDB 基线不建外键，改由
+				// RecordFindingTx 的引用校验（validateAnchorAssetsTx）在同一事务
+				// 落第一行之前拒绝 —— 失败点更靠前，但"整笔原子回滚、零残留"的
+				// 断言完全同一口径。
 				input.AssetIDs = []int64{9223372036854775807}
 				refs = refs[:1]
 			}
 			if _, err := local.Record(ctx, input, refs); err == nil {
 				t.Fatal("expected failure")
 			}
-			if f, n := counts(); f != 0 || n != 0 {
+			if f, n := counts(t); f != 0 || n != 0 {
 				t.Fatalf("partial record: findings=%d nodes=%d", f, n)
 			}
 		})
@@ -210,7 +327,8 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 	os.MkdirAll(legacy, 0o700)
 	os.WriteFile(filepath.Join(legacy, "request.http"), []byte("GET / HTTP/1.1\nHost: old.local\n"), 0o600)
 	os.WriteFile(filepath.Join(legacy, "response.http"), []byte("HTTP 200\n\nlegacy body"), 0o600)
-	_, err := s.Traffic.DB().Exec(`INSERT INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path) VALUES('old',1,'old.local','GET','/','http://old.local/',200,'text/plain',0,11,'legacy')`)
+	// url 带本轮 tag（与 seedExchange 同一判据）：这条 legacy 快照才能被精确回读清理。
+	_, err := s.Traffic.DB().Exec(`INSERT INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path) VALUES('old',1,'old.local','GET','/',?,200,'text/plain',0,11,'legacy')`, "http://old.local/"+tag+"/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,9 +341,9 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 }
 
 func TestEvidenceConcurrentBindAndDelete(t *testing.T) {
-	s, in, _ := evidenceFixture(t)
+	s, in, _, tag := evidenceFixture(t)
 	ctx := context.Background()
-	seedExchange(t, s, "race", bytes.Repeat([]byte("large"), 90000), true)
+	seedExchange(t, s, tag, "race", bytes.Repeat([]byte("large"), 90000), true)
 	r, err := s.Record(ctx, in, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -272,9 +390,9 @@ func TestEvidenceConcurrentBindAndDelete(t *testing.T) {
 }
 
 func TestEvidenceGCGraceAndActiveRestore(t *testing.T) {
-	s, in, _ := evidenceFixture(t)
+	s, in, _, tag := evidenceFixture(t)
 	ctx := context.Background()
-	seedExchange(t, s, "gc", []byte("unique unreferenced gc body"), false)
+	seedExchange(t, s, tag, "gc", []byte("unique unreferenced gc body"), false)
 	f, err := s.Record(ctx, in, []db.TrafficRef{{TrafficID: "gc"}})
 	if err != nil {
 		t.Fatal(err)

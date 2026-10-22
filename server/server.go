@@ -225,18 +225,32 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
-		go s.evidenceStore().RunGC(s.ctx)
-		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
-		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
-		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
-		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
-		go newNotifier(s).Run(s.ctx)
-		// Fill the tool cache for any enabled MCP that has none yet (notably the
-		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
-		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
+		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		// EnvIsolateRuntimes 是集成测试的隔离开关（见 isolatedRuntimes）：这一组后台
+		// 组件都会主动扫描并改动**本进程之外**的共享库数据（evidence GC、触发器调度、
+		// 日志回灌），或向真实外部端点投递（IM 推送、MCP 探测），因此测试进程里不启动。
+		if isolatedRuntimes() {
+			log.Printf("[isolate] background runtimes skipped: evidence GC / scheduler / notifier / MCP discover / log sink")
+		} else {
+			go s.evidenceStore().RunGC(s.ctx)
+			go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
+			// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
+			// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
+			go newNotifier(s).Run(s.ctx)
+			// Fill the tool cache for any enabled MCP that has none yet (notably the
+			// seeded browser MCP on first run). Async so it never blocks startup.
+			go s.discoverEmptyMCPsOnStartup()
+			logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
+		}
 	}
 	// precedence: persisted DB config > env.
+	if isolatedRuntimes() {
+		// 隔离模式下**不装配任何 LLM provider**：共享库里保存的真实 LLM 配置一旦生效，
+		// 测试里的 planner/worker 就会真的去打外部模型 API（产生计费且不可复现）。
+		// 需要模型的用例一律自行注入 scripted provider。
+		log.Printf("[isolate] LLM provider not loaded — engine stays idle unless a test installs its own provider")
+		return s
+	}
 	if cfg, ok := s.loadLLMConfig(); ok {
 		if err := s.applyLLM(cfg); err != nil {
 			log.Printf("[engine] saved LLM config init failed — engine idle: %v", err)
@@ -257,6 +271,19 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
+}
+
+// EnvIsolateRuntimes 打开后，Server 只装配请求路径所需的组件，不启动任何会自主
+// 扫描共享数据库、收养既有任务、外发 IM 消息或调用真实 LLM 的后台运行时。
+//
+// 该开关只供集成测试进程使用（见 server/testmain_test.go）：业务测试跑在共享的
+// TiDB 开发库上，库里存有真实用户任务。若测试进程照旧启动调度器并收养这些任务，
+// 它会改写别人的业务数据、用别人的模型额度跑 planner/worker，测试也就失去确定性。
+const EnvIsolateRuntimes = "ARTEX_TEST_ISOLATE_RUNTIMES"
+
+// isolatedRuntimes 报告当前进程是否处于上述测试隔离模式。
+func isolatedRuntimes() bool {
+	return os.Getenv(EnvIsolateRuntimes) == "1"
 }
 
 // Restored deadline and worker loops must inherit the same context as new tasks,

@@ -7,11 +7,7 @@ import (
 )
 
 func TestListTasksBulkHydratesTaskContext(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	stamp := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
@@ -68,11 +64,7 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 }
 
 func TestTaskListMetricsAll(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	task, err := d.CreateTask("task-list-metrics", "goal", nil, 0, 0)
 	if err != nil {
@@ -82,17 +74,19 @@ func TestTaskListMetricsAll(t *testing.T) {
 
 	resultAt := time.Now().Add(-time.Second).Truncate(time.Second)
 	latestAt := resultAt.Add(time.Second)
+	// TiDB 严格模式：activity.metadata 是 NOT NULL 且 TEXT 无 DDL 默认值，必须显式给；
+	// 同一列在两条 VALUES 里各绑一次，实参按 SQL 文本出现顺序重复传。
 	if _, err := d.Exec(`
 INSERT INTO activity(
-    exploration_id, kind, input_tokens, output_tokens,
+    exploration_id, kind, metadata, input_tokens, output_tokens,
     cache_read_tokens, cache_write_tokens, created_at
-) VALUES ($1,'result',11,7,3,2,$2), ($1,'tool_result',999,999,999,999,$3)`,
-		task.ExplorationID, resultAt, latestAt); err != nil {
+) VALUES (?,'result','{}',11,7,3,2,?), (?,'tool_result','{}',999,999,999,999,?)`,
+		task.ExplorationID, resultAt, task.ExplorationID, latestAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.Exec(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, state)
-VALUES ($1,'goal','{}','met'), ($1,'goal','{}','open')`, task.ExplorationID); err != nil {
+VALUES (?,'goal','{}','met'), (?,'goal','{}','open')`, task.ExplorationID, task.ExplorationID); err != nil {
 		t.Fatal(err)
 	}
 

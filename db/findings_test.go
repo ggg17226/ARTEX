@@ -19,11 +19,7 @@ import (
 // TestDeleteFinding verifies删除漏洞 removes both the findings row and its
 // originating exploration node (kind='finding').
 func TestDeleteFinding(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	tk, err := d.CreateTask("删除漏洞测试", "目标", nil, 0, 0)
 	if err != nil {
@@ -53,7 +49,7 @@ func TestDeleteFinding(t *testing.T) {
 		t.Fatalf("finding row should be gone, got %+v", f)
 	}
 	var cnt int
-	d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE id=$1`, nodeID).Scan(&cnt)
+	d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE id=?`, nodeID).Scan(&cnt)
 	if cnt != 0 {
 		t.Fatalf("originating finding node should be deleted, still %d", cnt)
 	}
@@ -68,15 +64,11 @@ func TestDeleteFinding(t *testing.T) {
 // FindingStats against the live dev PG. It tags its rows with a unique vulnclass
 // so assertions are isolated from any pre-existing data, and cleans up after.
 func TestFindingsPageAndStats(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	const vc = "__test_vc_pagination__"
 	// clean any leftovers from a prior aborted run, and clean up on exit
-	cleanup := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc) }
+	cleanup := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=?`, vc) }
 	cleanup()
 	defer cleanup()
 
@@ -172,7 +164,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 		t.Fatalf("new finding report should be empty, got %q", one.Report)
 	}
 	// report column round-trips through GetFinding.
-	if _, err := d.Exec(`UPDATE findings SET report=$1 WHERE id=$2`, "# 报告\n正文", ids[0]); err != nil {
+	if _, err := d.Exec(`UPDATE findings SET report=? WHERE id=?`, "# 报告\n正文", ids[0]); err != nil {
 		t.Fatal(err)
 	}
 	if one, _ = d.GetFinding(ids[0]); one.Report != "# 报告\n正文" {
@@ -198,7 +190,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 			}
 		})
 	}
-	if _, err := d.Exec(`UPDATE findings SET name=$1 WHERE id=$2`, "literal %_ marker", ids[1]); err != nil {
+	if _, err := d.Exec(`UPDATE findings SET name=? WHERE id=?`, "literal %_ marker", ids[1]); err != nil {
 		t.Fatal(err)
 	}
 	matches, searchTotal, err := d.ListFindingsPage(FindingFilter{VulnClass: vc, Query: "%_"}, 1, 20)
@@ -223,14 +215,10 @@ func TestFindingsPageAndStats(t *testing.T) {
 }
 
 func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	vc := fmt.Sprintf("__test_finding_stable_page_%d__", time.Now().UnixNano())
-	defer d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc)
+	defer d.Exec(`DELETE FROM findings WHERE vulnclass=?`, vc)
 	ids := make([]int64, 0, 7)
 	for i := 0; i < 7; i++ {
 		id, addErr := d.AddFinding(0, 0, vc, "", SeverityHigh, fmt.Sprintf("finding %d", i), "", "test", nil)
@@ -240,7 +228,7 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 		ids = append(ids, id)
 	}
 	sharedCreatedAt := time.Date(2026, time.August, 21, 8, 30, 0, 0, time.UTC)
-	if _, err := d.Exec(`UPDATE findings SET created_at=$1 WHERE vulnclass=$2`, sharedCreatedAt, vc); err != nil {
+	if _, err := d.Exec(`UPDATE findings SET created_at=? WHERE vulnclass=?`, sharedCreatedAt, vc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -271,14 +259,10 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 }
 
 func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	vc := fmt.Sprintf("__test_finding_groups_%d__", time.Now().UnixNano())
-	cleanupFindings := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc) }
+	cleanupFindings := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=?`, vc) }
 	defer cleanupFindings()
 
 	taskA, err := d.CreateTask("group A", "goal", nil, 0, 0)
@@ -415,11 +399,7 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 }
 
 func TestAddFindingFollowUpIntent(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	task, err := d.CreateTask("finding follow-up", "goal", nil, 0, 0)
 	if err != nil {
@@ -433,7 +413,7 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE id=$1`, assetID)
+	defer deleteAssetsByWhere(t, d, "WHERE id=?", assetID)
 
 	store := d.Exploration(task.ExplorationID)
 	findingNodeID, err := store.AddNode(KindFinding, map[string]any{"summary": "source"}, 5, "confirmed", "worker", []int64{assetID})
@@ -471,11 +451,11 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 		t.Fatalf("follow-up intent metadata: %+v", node)
 	}
 	var anchorCount, edgeCount int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_anchors WHERE node_id=$1 AND asset_id=$2`, intentID, assetID).Scan(&anchorCount); err != nil {
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_anchors WHERE node_id=? AND asset_id=?`, intentID, assetID).Scan(&anchorCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges
-		WHERE exploration_id=$1 AND src_id=$2 AND rel=$3 AND dst_id=$4`,
+		WHERE exploration_id=? AND src_id=? AND rel=? AND dst_id=?`,
 		task.ExplorationID, findingNodeID, RelDerivedFrom, intentID).Scan(&edgeCount); err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +464,7 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	}
 	var persistedAuditCount int
 	if err := d.QueryRow(`SELECT COUNT(*) FROM activity
-		WHERE id=$1 AND exploration_id=$2 AND node_id=$3 AND worker='system' AND summary=$4`,
+		WHERE id=? AND exploration_id=? AND node_id=? AND worker='system' AND summary=?`,
 		audit.ID, task.ExplorationID, intentID, expectedAuditSummary).Scan(&persistedAuditCount); err != nil {
 		t.Fatal(err)
 	}
@@ -493,22 +473,30 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	}
 
 	var nodesBefore, activitiesBefore int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=$1`, task.ExplorationID).Scan(&nodesBefore); err != nil {
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=?`, task.ExplorationID).Scan(&nodesBefore); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=$1`, task.ExplorationID).Scan(&activitiesBefore); err != nil {
+	if err := d.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=?`, task.ExplorationID).Scan(&activitiesBefore); err != nil {
 		t.Fatal(err)
 	}
+	// 这一步要的是"审计写入必然失败"，从而验证图变更整笔回滚。
+	// PG 时代靠 metadata 列是 JSONB：塞一个非法 JSON（`{`）就被数据库拒绝。
+	// TiDB 的 activity.metadata 是 mediumtext（TiDB 的 TEXT 系列不吃 JSON 校验），
+	// 非法 JSON 不再构成失败。改用一个在 TiDB 上同样必然被拒绝的写入：
+	// activity.input_tokens 是 4 字节 INT，严格模式（STRICT_TRANS_TABLES）下
+	// 超界的值直接 1264，事务必须整笔回滚。
+	outOfRangeTokens := 1 << 40
 	if _, _, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "must roll back", Activity{
-		Worker: "system", Kind: "text", Summary: "invalid audit", Metadata: json.RawMessage(`{`),
+		Worker: "system", Kind: "text", Summary: "invalid audit",
+		Metadata: json.RawMessage(`{`), InputTokens: &outOfRangeTokens,
 	}); err == nil {
 		t.Fatal("invalid activity metadata should fail the transaction")
 	}
 	var nodesAfter, activitiesAfter int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=$1`, task.ExplorationID).Scan(&nodesAfter); err != nil {
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=?`, task.ExplorationID).Scan(&nodesAfter); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=$1`, task.ExplorationID).Scan(&activitiesAfter); err != nil {
+	if err := d.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=?`, task.ExplorationID).Scan(&activitiesAfter); err != nil {
 		t.Fatal(err)
 	}
 	if nodesAfter != nodesBefore || activitiesAfter != activitiesBefore {
@@ -516,7 +504,7 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 			nodesBefore, nodesAfter, activitiesBefore, activitiesAfter)
 	}
 
-	if _, err := d.Exec(`DELETE FROM exploration_nodes WHERE id=$1`, findingNodeID); err != nil {
+	if _, err := d.Exec(`DELETE FROM exploration_nodes WHERE id=?`, findingNodeID); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "should fail", auditInput); !errors.Is(err, ErrFindingOriginUnavailable) {
@@ -832,7 +820,9 @@ func TestFindings_StrictInsertsPopulateEveryNotNullTextColumn(t *testing.T) {
 			table: "findings", required: []string{"task_id", "node_id", "vulnclass", "name", "severity", "summary", "evidence", "worker", "asset_ids", "status", "report"},
 		},
 		{
-			name: "CreateFindingRetest", file: "finding_retests.go", decl: "func (d *DB) CreateFindingRetest(",
+			// CreateFindingRetest 现在只是"撞去重唯一索引 → 新事务重放"的重试外壳，
+			// 真正的 SQL 在 createFindingRetestOnce 里，所以这条按新函数体抠。
+			name: "CreateFindingRetest", file: "finding_retests.go", decl: "func (d *DB) createFindingRetestOnce(",
 			table: "finding_retests", required: []string{"finding_id", "conversation_id", "status", "notes", "verdict", "summary", "evidence", "error", "snapshot"},
 		},
 		{
@@ -1448,8 +1438,17 @@ func TestFindings_DeleteFindingsByTaskSerializesEvidenceWriters(t *testing.T) {
 				}
 				err := d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
 					// 与删除共用证据门禁，因此这段"存在性检查 + 追加绑定"整体串行。
+					//
+					// 存在性检查必须是**当前读**（FOR UPDATE）：PG 的 READ COMMITTED 每条
+					// 语句取新快照，拿到门禁锁之后的第一条 SELECT 必然看得见刚提交的删除；
+					// TiDB 默认 REPEATABLE READ，普通读沿用本事务进入时的旧快照，会拿着
+					// "漏洞还在"的旧结论在已删漏洞上挂出绑定。生产侧同一协议
+					// （LockFindingEvidenceTx）本来就是先锁 findings 行再判定，这里对齐。
 					var live int
-					if err := tx.QueryRow(`SELECT COUNT(*) FROM findings WHERE id = ?`, findingID).Scan(&live); err != nil {
+					if err := tx.QueryRow(`SELECT 1 FROM findings WHERE id = ? FOR UPDATE`, findingID).Scan(&live); err != nil {
+						if errors.Is(err, sql.ErrNoRows) {
+							return nil // 漏洞已删：不挂绑定，也不报错
+						}
 						return err
 					}
 					if live == 0 {

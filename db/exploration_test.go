@@ -211,6 +211,10 @@ func TestExploration_AddNodeUsesLastInsertID(t *testing.T) {
 	eng := newExpMockEngine()
 	d := openExpMockDB(t, eng)
 	eng.setNextInsertID(9001)
+	// TiDB 基线不建外键，AddNode 先核对 anchors 指向的资产确实存在（validateAnchorAssetsTx）。
+	// 替身必须把这两个 id 答成"存在"，否则合法的锚定路径会被自家门禁挡在门外。
+	eng.on("FROM assets WHERE id IN", []string{"id"},
+		[]driver.Value{int64(11)}, []driver.Value{int64(22)})
 
 	nodeID, err := d.Exploration(501).AddNode("intent", map[string]any{"summary": "probe"}, 7, "open", "planner", []int64{11, 22})
 	if err != nil {
@@ -218,6 +222,29 @@ func TestExploration_AddNodeUsesLastInsertID(t *testing.T) {
 	}
 	if nodeID != 9001 {
 		t.Fatalf("nodeID=%d, want the LastInsertId 9001", nodeID)
+	}
+
+	// 资产存在性核验必须发生在**任何一行写入之前**（悬空锚点一旦落库，对应任务的
+	// DeleteTask 会因锁不到锚点资产而永久漂移，见 validateAnchorAssetsTx 注释）。
+	calls := eng.snapshotCalls()
+	probe := -1
+	firstWrite := -1
+	for i, c := range calls {
+		if strings.Contains(c.Query, "FROM assets") {
+			if probe < 0 {
+				probe = i
+			}
+			continue
+		}
+		if strings.Contains(c.Query, "INSERT INTO") && firstWrite < 0 {
+			firstWrite = i
+		}
+	}
+	if probe < 0 {
+		t.Fatalf("AddNode must probe assets existence before anchoring: %v", calls)
+	}
+	if firstWrite >= 0 && firstWrite < probe {
+		t.Fatalf("asset probe must precede every INSERT (probe=%d firstWrite=%d)", probe, firstWrite)
 	}
 
 	inserts := eng.statements(func(c expMockCall) bool {
@@ -908,17 +935,16 @@ func TestExploration_NewMainSessionSequencesInGo(t *testing.T) {
 // =====================================================================
 
 func TestExplorationFlow(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("test", "拿下测试目标")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=?`, expID) // cascades nodes/edges/activity
+	// TiDB 基线不建外键级联：原注释里的 "cascades nodes/edges/activity" 是 PG 时代的
+	// 错误假设。原先只删 explorations 父行且吞错，本用例的 goals/intents/findings/
+	// edges/activity 会永久残留成孤儿（审查 R-02）。统一走完整逆拓扑清理并判红。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	es := d.Exploration(expID)
 
 	// goal node + two intents
@@ -1019,17 +1045,16 @@ func TestExplorationFlow(t *testing.T) {
 }
 
 func TestIntentPauseResumeAndCancelCleanup(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("test", "worker control cleanup")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=?`, expID)
+	// CancelIntent 只收走被取消的 intent 支路；kept intent/keptFact/keptActivity 仍留在
+	// 本 exploration 名下。原先 `defer d.Exec` 只删 explorations 父行且吞错，这些行连同
+	// 边都会成为孤儿（审查 R-02），改为完整逆拓扑清理并判红。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	es := d.Exploration(expID)
 
 	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{
@@ -1038,7 +1063,7 @@ func TestIntentPauseResumeAndCancelCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, assetID)
+	defer deleteAsset(t, d, assetID)
 
 	otherIntent, err := es.AddIntent(map[string]any{"summary": "keep intent"}, 1, nil, "planner")
 	if err != nil {
@@ -1144,7 +1169,9 @@ func TestIntentPauseResumeAndCancelCleanup(t *testing.T) {
 	assertCount(`SELECT COUNT(*) FROM findings WHERE id=?`, 0, findingRowID)
 	assertCount(`SELECT COUNT(*) FROM activity WHERE id=?`, 0, activityID)
 	assertCount(`SELECT COUNT(*) FROM activity WHERE id=?`, 1, keptActivityID)
-	assertCount(`SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=? AND (src_id=? OR dst_id=?)`, 0, expID, intentID)
+	// 同一条边的两个端点都按 intentID 判定：TiDB 的 `?` 按出现顺序逐个绑，
+	// 同一个值在 SQL 里出现两次就要传两次。
+	assertCount(`SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=? AND (src_id=? OR dst_id=?)`, 0, expID, intentID, intentID)
 	assertCount(`SELECT COUNT(*) FROM exploration_anchors WHERE node_id=?`, 0, directFact)
 	assertCount(`SELECT COUNT(*) FROM assets WHERE id=?`, 1, assetID)
 }
@@ -1152,17 +1179,14 @@ func TestIntentPauseResumeAndCancelCleanup(t *testing.T) {
 // TestNodesPageQueryMatchesID verifies the 播报板 search filters on node id (both
 // the bare number and the「#id」form the UI shows) in addition to payload/origin.
 func TestNodesPageQueryMatchesID(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("test", "id 搜索")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=?`, expID)
+	// 只删 explorations 父行会把本用例的 fact 节点留在库里成为孤儿（审查 R-02）。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	es := d.Exploration(expID)
 
 	target, err := es.AddNode("fact", map[string]any{"summary": "needle-alpha"}, 0, "confirmed", "worker-a", nil)

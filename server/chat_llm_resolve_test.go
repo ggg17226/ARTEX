@@ -12,12 +12,7 @@ import (
 // to the actual configuration state: nothing configured vs. configured-but-not-
 // activated must read differently so the user knows what to do.
 func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 
@@ -26,7 +21,7 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	for _, p := range existing {
 		if p.IsDefault {
 			// The active profile cannot be deleted directly; clear the flag first.
-			_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, p.ID)
+			_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=?`, p.ID)
 		}
 		_ = m.pg.DeleteProfile(p.ID)
 	}
@@ -40,7 +35,7 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, id)
+		_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=?`, id)
 		_ = m.pg.DeleteProfile(id)
 	})
 
@@ -63,12 +58,7 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 // agent even when NO global profile is active, so the send precheck stops
 // rejecting it with "LLM 未配置".
 func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 

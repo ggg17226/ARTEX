@@ -11,16 +11,7 @@ import (
 )
 
 func TestInterceptFilterHTTP(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn, _, err := db.DSN()
-	if err != nil {
-		t.Skip("no test database configured")
-	}
-	d, err := db.Open(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
+	d := newTestDB(t)
 	m := &Manager{pg: d, interceptor: intercept.New(d)}
 	s := &Server{m: m, jwtKey: []byte("approval-filter-test-key")}
 	h := s.Handler()
@@ -29,7 +20,7 @@ func TestInterceptFilterHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope := "approval-http-filter"
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN ($1,$2)`, scope, scope+"-other") })
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN (?,?)`, scope, scope+"-other") })
 	_, baseline, err := d.ListAllInterceptsPage(1, 20, db.InterceptApprovalFilter{Status: "denied", DecisionSource: "model"})
 	if err != nil {
 		t.Fatal(err)

@@ -9,11 +9,7 @@ import (
 
 func TestDeleteTaskTrafficHostsUseOneLockedTransaction(t *testing.T) {
 	dsn := testDSN(t)
-	d, err := Open(dsn)
-	if err != nil {
-		t.Skipf("TiDB unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDBWithDSN(t, dsn)
 
 	t.Run("sharing committed before deletion lock is observed", func(t *testing.T) {
 		first, second, host, rootAssetID := createTaskDeleteRaceFixture(t, d)
@@ -21,7 +17,7 @@ func TestDeleteTaskTrafficHostsUseOneLockedTransaction(t *testing.T) {
 		t.Cleanup(func() {
 			_ = d.DeleteTask(first.ID)
 			_ = d.DeleteTask(second.ID)
-			_, _ = d.Exec(`DELETE FROM assets WHERE id = ? OR url = ?`, rootAssetID, serviceURL)
+			deleteAssetsByWhere(t, d, "WHERE id = ? OR url = ?", rootAssetID, serviceURL)
 		})
 
 		// 共享者先提交，再启动删除：TiDB 基线不建外键，PG 里"新共享者把删除挡在任务行
@@ -30,8 +26,10 @@ func TestDeleteTaskTrafficHostsUseOneLockedTransaction(t *testing.T) {
 		// host 已被两个任务共享，就必须被排除在流量删除之外。
 		writer, _ := openTaskDeleteTestDB(t, dsn)
 		if _, err := writer.Exec(`
-INSERT INTO assets(type, url, service_type, domain, task_ids)
-VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID); err != nil {
+INSERT INTO assets(type, url, service_type, domain, task_ids,
+ company_source, bound_domains, open_ports, record_value, technologies, auth, params, extra)
+VALUES ('service', ?, 'http', ?, JSON_ARRAY(?),
+ 'scope', '[]', '[]', '', '[]', '[]', '[]', '{}')`, serviceURL, host, second.ID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -68,7 +66,7 @@ VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID); 
 		t.Cleanup(func() {
 			_ = d.DeleteTask(first.ID)
 			_ = d.DeleteTask(second.ID)
-			_, _ = d.Exec(`DELETE FROM assets WHERE id = ? OR url = ?`, rootAssetID, serviceURL)
+			deleteAssetsByWhere(t, d, "WHERE id = ? OR url = ?", rootAssetID, serviceURL)
 		})
 
 		deleter, _ := openTaskDeleteTestDB(t, dsn)
@@ -115,8 +113,10 @@ VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID); 
 		writerDone := make(chan error, 1)
 		go func() {
 			_, writeErr := writer.Exec(`
-INSERT INTO assets(type, url, service_type, domain, task_ids)
-VALUES ('service', ?, 'http', ?, JSON_ARRAY(?))`, serviceURL, host, second.ID)
+INSERT INTO assets(type, url, service_type, domain, task_ids,
+ company_source, bound_domains, open_ports, record_value, technologies, auth, params, extra)
+VALUES ('service', ?, 'http', ?, JSON_ARRAY(?),
+ 'scope', '[]', '[]', '', '[]', '[]', '[]', '{}')`, serviceURL, host, second.ID)
 			writerDone <- writeErr
 		}()
 
@@ -155,19 +155,25 @@ func createTaskDeleteRaceFixture(t *testing.T, d *DB) (first, second *Task, host
 	return first, second, host, rootAssetID
 }
 
-// openTaskDeleteTestDB 建立一条**只有 1 个物理连接**的删除/写入会话。
+// openTaskDeleteTestDB 建立一条**最多 2 个物理连接**的删除/写入会话。
 //
 // 连接由 db 包自己的 Open 建立（go-sql-driver/mysql + DSN 规范化），不再按驱动名直接
 // 建连；PG 专有的 statement_timeout 换成 TiDB 的 innodb_lock_wait_timeout（10s），
 // 后端进程号换成 CONNECTION_ID()。
+//
+// 上限为什么是 2 而不是 1：删除走 lockorder.TxRunner，它会在删除事务之外另开一条
+// 独立连接做非加锁的重新定位读（TiDB 没有 READ ONLY 事务，见 lockorder 的降级说明），
+// 这两条连接必然并存。连接池只给 1 时，重新定位读永远等在池上 —— 那不是数据库锁，
+// 没有任何超时，删除连 prepare 回调都到不了，用例只看到"卡死到超时"。
+// 产品契约约束的是删除侧只有**一个持锁事务**，与连接池规模无关。
 func openTaskDeleteTestDB(t *testing.T, dsn string) (*DB, int) {
 	d, err := Open(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sqlDB := d.DB
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetMaxOpenConns(2)
+	sqlDB.SetMaxIdleConns(2)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if _, err := sqlDB.Exec(`SET SESSION innodb_lock_wait_timeout = 10`); err != nil {
 		t.Fatal(err)

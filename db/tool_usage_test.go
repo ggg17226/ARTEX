@@ -3,18 +3,14 @@ package db
 import "testing"
 
 func TestToolUsageLedger(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	const (
 		toolA = "zz_test_tool_usage_a"
 		toolB = "zz_test_tool_usage_b"
 	)
 	cleanup := func() {
-		_, _ = d.Exec(`DELETE FROM tool_usage WHERE tool_key IN ($1,$2)`, toolA, toolB)
+		_, _ = d.Exec(`DELETE FROM tool_usage WHERE tool_key IN (?,?)`, toolA, toolB)
 	}
 	cleanup()
 	defer cleanup()

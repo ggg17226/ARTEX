@@ -4,6 +4,7 @@ import (
 	"context"
 	"iter"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
@@ -83,18 +84,44 @@ func (meteredStreamProvider) Stream(context.Context, llm.CompletionRequest) iter
 }
 
 func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	// 连库门控（spec §3.1.1 / §4.3）：ARTEX_PG_DSN 与 postgres:// 已彻底废除。
+	//   - 没配 ARTEX_TIDB_DSN → 诚实 t.Skip，绝不伪装成通过；
+	//   - 配了却打不开 → 环境违规，必须 t.Fatalf，不许再退回 Skip 假绿。
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_TIDB_DSN"))
 	if dsn == "" {
-		t.Skip("requires isolated ARTEX_PG_DSN")
+		t.Skip("ARTEX_TIDB_DSN not set")
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ARTEX_TIDB_DSN 已配置但打开 TiDB 失败（环境违规，必须判红而不是 Skip）: %v", err)
 	}
-	defer pg.Close()
+	t.Cleanup(func() {
+		if err := pg.Close(); err != nil {
+			t.Errorf("关闭 TiDB 连接池失败: %v", err)
+		}
+	})
+
+	// 每一轮一个随机 profile 名，既是唯一的物理判据，也保证清理只会圈到本轮行。
+	trackProfile := func(profile string) {
+		t.Helper()
+		t.Cleanup(func() {
+			if _, err := pg.Exec(`DELETE FROM llm_usage WHERE profile_name=?`, profile); err != nil {
+				t.Errorf("清理 llm_usage fixture 失败 (profile=%s): %v", profile, err)
+			}
+			var left int
+			if err := pg.QueryRow(`SELECT count(*) FROM llm_usage WHERE profile_name=?`, profile).Scan(&left); err != nil {
+				t.Errorf("回读 llm_usage fixture 失败 (profile=%s): %v", profile, err)
+				return
+			}
+			if left != 0 {
+				t.Errorf("llm_usage fixture 未归零 (profile=%s): 残留 %d 行", profile, left)
+			}
+		})
+	}
+
 	for _, early := range []bool{false, true} {
 		profile := "btw-metering-" + uuid.NewString()
+		trackProfile(profile)
 		ctx, cancel := context.WithCancel(transcript.WithSessionID(t.Context(), "exp0-btw-test"))
 		recorder := Wrap(meteredStreamProvider{}, pg, "fixture", profile, "", "", func() bool { return false })
 		for event, err := range recorder.Stream(ctx, llm.CompletionRequest{}) {
@@ -110,8 +137,7 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 		var count, input, output int
 		var worker, status string
 		err = pg.QueryRow(`SELECT count(*),max(input_tokens),max(output_tokens),max(worker),max(status)
-FROM llm_usage WHERE profile_name=$1`, profile).Scan(&count, &input, &output, &worker, &status)
-		_, _ = pg.Exec(`DELETE FROM llm_usage WHERE profile_name=$1`, profile)
+FROM llm_usage WHERE profile_name=?`, profile).Scan(&count, &input, &output, &worker, &status)
 		if err != nil {
 			t.Fatal(err)
 		}

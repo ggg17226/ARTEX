@@ -8,11 +8,7 @@ import (
 )
 
 func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	task, err := d.CreateTask("manual scope registration", "goal", nil, 0, 0)
 	if err != nil {
@@ -78,7 +74,7 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 		t.Fatalf("invalid CIDR error=%v", err)
 	}
 	var rollbackAssets int
-	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE type='root_domain' AND domain=$1`, rollbackDomain).Scan(&rollbackAssets); err != nil {
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE type='root_domain' AND domain=?`, rollbackDomain).Scan(&rollbackAssets); err != nil {
 		t.Fatal(err)
 	}
 	if rollbackAssets != 0 {
@@ -87,11 +83,7 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 }
 
 func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	task, err := d.CreateTask("asset editing", "goal", nil, 0, 0)
 	if err != nil {
@@ -131,20 +123,16 @@ func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 		t.Fatalf("detached task assets=%+v err=%v", assets, err)
 	}
 	var global, anchors, links int
-	_ = d.QueryRow(`SELECT count(*) FROM assets WHERE id=$1`, assetID).Scan(&global)
-	_ = d.QueryRow(`SELECT count(*) FROM exploration_anchors WHERE node_id=$1 AND asset_id=$2`, intentID, assetID).Scan(&anchors)
-	_ = d.QueryRow(`SELECT count(*) FROM task_asset_links WHERE task_id=$1 AND asset_id=$2`, task.ID, assetID).Scan(&links)
+	_ = d.QueryRow(`SELECT count(*) FROM assets WHERE id=?`, assetID).Scan(&global)
+	_ = d.QueryRow(`SELECT count(*) FROM exploration_anchors WHERE node_id=? AND asset_id=?`, intentID, assetID).Scan(&anchors)
+	_ = d.QueryRow(`SELECT count(*) FROM task_asset_links WHERE task_id=? AND asset_id=?`, task.ID, assetID).Scan(&links)
 	if global != 1 || anchors != 1 || links != 0 {
 		t.Fatalf("global=%d anchors=%d links=%d", global, anchors, links)
 	}
 }
 
 func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	source, err := d.CreateTask("source assets", "goal", nil, 0, 0)
 	if err != nil {

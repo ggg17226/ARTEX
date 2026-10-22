@@ -174,9 +174,11 @@ func (d *DB) SeedTool(key, desc string, schemaDoc, agents json.RawMessage) error
 		agents = json.RawMessage("[]")
 	}
 	identity, hash := toolKeyIdentity(key)
+	// TiDB 不给 TEXT 列 DDL 默认值：kind / exec 在 PG 里靠 DEFAULT 'builtin' / '{}' 兜底，
+	// 这里必须显式写出，否则 strict 模式插入报 1364。
 	_, err := d.Exec(`
-INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`)
-VALUES (?, ?, ?, TRUE, ?, ?, ?, TRUE)`,
+INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`, `+"`kind`"+`, `+"`exec`"+`)
+VALUES (?, ?, ?, TRUE, ?, ?, ?, TRUE, 'builtin', '{}')`,
 		key, identity, hash, desc, schemaDoc, agents)
 	if err != nil {
 		if tidb.IsDuplicateKey(err) {
@@ -344,9 +346,11 @@ func (d *DB) UpsertToolForce(key, desc string, schemaDoc, agents json.RawMessage
 		agents = json.RawMessage("[]")
 	}
 	identity, hash := toolKeyIdentity(key)
+	// kind / exec 同 SeedTool：TiDB 无 TEXT 默认值，插入分支必须显式补齐；
+	// 更新分支不动它们，避免把页面上的自定义执行规格覆盖回默认值。
 	_, err := d.Exec(`
-INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`)
-VALUES (?, ?, ?, TRUE, ?, ?, ?, TRUE)
+INSERT INTO tools(`+toolKeyCol+`, key_identity, key_hash, `+"`system`"+`, description, `+"`schema`"+`, agents, `+"`enabled`"+`, `+"`kind`"+`, `+"`exec`"+`)
+VALUES (?, ?, ?, TRUE, ?, ?, ?, TRUE, 'builtin', '{}')
 ON DUPLICATE KEY UPDATE
   description   = VALUES(description),
   `+"`schema`"+`      = VALUES(`+"`schema`"+`),

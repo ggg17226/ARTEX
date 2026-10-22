@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/db/lockorder"
 	"github.com/Autumn-27/artex/db/schema"
 	"github.com/Autumn-27/artex/db/tidb"
 )
@@ -203,9 +204,51 @@ func archiveDecodeValue(column schema.Column, raw json.RawMessage) (any, error) 
 	}
 }
 
+// archiveLegacyCompatColumns 是**已知历史兼容列**的白名单：老归档包（v3 那批
+// "Additive v3 archive fields"）导出时这两列还没上线，manifest 里整列缺席是合法输入。
+//
+// PG 时代它们靠 `ADD COLUMN ... JSONB NOT NULL DEFAULT '{}'` 兜底，
+// `json_populate_recordset` 缺键即取列默认值；TiDB 严格模式禁止给 MEDIUMTEXT 声明列
+// 默认值（Error 1101，见 schema/generator.go 的 renderColumnFor），Catalog 只把
+// `'{}'` 记成声明期元数据，所以缺列的 INSERT 会直接 1364。恢复层只在这一小组登记在案
+// 的列上把同一份默认值补回去，等价于 PG 的列默认值；**其余任何缺失的必填列一律
+// fail-closed**（继续缺席，由 TiDB 严格模式报错），绝不替未知列凭空造值。
+var archiveLegacyCompatColumns = map[string]map[string]bool{
+	"side_question_sessions": {"memory": true},
+	"side_question_requests": {"context_info": true},
+}
+
+// archiveLegacyColumnValue 计算历史兼容列缺失时要补的值。取值只有一个来源：Catalog
+// 登记的应用层默认（Column.Default），二者不一致或列的形态不符合"NOT NULL 且 TiDB 不给
+// 列默认值的文本/JSON 列"这一前提时直接上抛，绝不静默造默认值。
+// handled=false 表示这张表的这一列不在历史兼容白名单里（调用方保持列缺席）。
+func archiveLegacyColumnValue(table string, column schema.Column) (any, bool, error) {
+	if !archiveLegacyCompatColumns[table][column.Name] {
+		return nil, false, nil
+	}
+	switch column.Type {
+	case schema.TJSON, schema.TText:
+	default:
+		return nil, false, fmt.Errorf(
+			"archive restore %s.%s: 历史兼容默认值只适用于 TJSON/TText 列，实际类型 %v",
+			table, column.Name, column.Type)
+	}
+	if !column.NotNull {
+		return nil, false, fmt.Errorf(
+			"archive restore %s.%s: 历史兼容默认值只补 NOT NULL 列（可空列应落 NULL）", table, column.Name)
+	}
+	if len(column.Default) < 2 || column.Default[0] != '\'' || column.Default[len(column.Default)-1] != '\'' {
+		return nil, false, fmt.Errorf(
+			"archive restore %s.%s: Catalog 未登记字符串形态的应用层默认值，拒绝猜测: %q",
+			table, column.Name, column.Default)
+	}
+	return strings.ReplaceAll(column.Default[1:len(column.Default)-1], "''", "'"), true, nil
+}
+
 // archiveRowProjection 把一行 manifest 折成 (列名, 绑定值)，顺序即写入白名单顺序。
-// manifest 里没有的列一律缺席，交给列默认值（v3 老冷包的 memory/context_info 兜底
-// 就依赖这一点，不再需要 json_populate_recordset 时代的空对象补齐）。
+// manifest 里没有的列默认一律缺席（TiDB 没有列默认值可兜底，缺必填列就由严格模式 1364
+// 判红）；唯一的例外是 archiveLegacyCompatColumns 登记在案的历史兼容列，由恢复层按
+// Catalog 的应用层默认显式补齐。
 func archiveRowProjection(table string, row map[string]json.RawMessage) ([]string, []any, error) {
 	columns, err := archiveImportColumns(table)
 	if err != nil {
@@ -214,13 +257,22 @@ func archiveRowProjection(table string, row map[string]json.RawMessage) ([]strin
 	names := make([]string, 0, len(columns))
 	values := make([]any, 0, len(columns))
 	for _, name := range columns {
-		raw, ok := row[name]
-		if !ok {
-			continue
-		}
 		column, err := archiveColumnOf(table, name)
 		if err != nil {
 			return nil, nil, err
+		}
+		raw, ok := row[name]
+		if !ok {
+			value, legacy, err := archiveLegacyColumnValue(table, column)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !legacy {
+				continue
+			}
+			names = append(names, name)
+			values = append(values, value)
+			continue
 		}
 		value, err := archiveDecodeValue(column, raw)
 		if err != nil {
@@ -794,10 +846,23 @@ func stripTaskFromAssetOwnership(tx *sql.Tx, taskID int64) error {
 	return nil
 }
 
-// deleteExclusiveArchiveAssets 删除只属于本任务的资产。归属判定在 DELETE 里重算
-// 一遍（与冷包导出时的独占判据一致），避免导出与压缩之间的窗口里被别的任务认领后
-// 仍然被误删。
+// deleteExclusiveArchiveAssets 删除只属于本任务的资产。归属判定在删除前重算
+// 一遍（与冷包导出时的独占判据完全一致：company_id IS NULL + 无其他未删除任务
+// 认领 + 无其他未删除任务的活跃锚点），避免导出与压缩之间的窗口里被别的任务认领后
+// 仍然被误删。判据用 `SELECT … FOR UPDATE` 当前读复核：TiDB 里事务内的普通
+// SELECT 走快照读，可能读到加锁前的旧 task_ids，只有锁定读才与原来那条
+// 「DELETE … WHERE NOT EXISTS」的当前读判据等价（TiDB 悲观模式下 DML 与锁定读
+// 对同一份计划行加锁，锁足迹与原语句一致）。
+//
+// 删本体复用产品级收尾 deleteAssetsByIDsWithTx（db/assets.go）：同一事务内
+// 「按物理 PK 锁资产行 → 清 exploration_anchors / finding_assets /
+// task_asset_links 引用 → 按 PK 删本体」，任一步失败整体回滚。TiDB 基线不建
+// 外键，原来这条裸 DELETE 会把引用行原样留在热库成为悬空引用，而 task_closure
+// 会把 link/anchor 指向的资产算进任务删除闭包、cascade_executor 再按 PK FOR
+// UPDATE 锁它们 —— 悬空 id 锁不到行 ⇒ 成员漂移 ⇒ 对应任务永久删不掉（与刚修好的
+// AssetStore.DeleteByIDs 同型缺陷）。删除范围没有扩大：复核不通过的 id 一个都不交给它。
 func deleteExclusiveArchiveAssets(tx *sql.Tx, taskID int64, exclusiveIDs []int64) error {
+	ctx := context.Background()
 	for _, batch := range archiveIDBatches(exclusiveIDs) {
 		// 绑定顺序必须与 SQL 里占位符出现的顺序一致：先 IN 列表，再两个 task.id<>?。
 		args := make([]any, 0, len(batch)+2)
@@ -805,15 +870,22 @@ func deleteExclusiveArchiveAssets(tx *sql.Tx, taskID int64, exclusiveIDs []int64
 			args = append(args, id)
 		}
 		args = append(args, taskID, taskID)
-		query := `DELETE FROM assets WHERE id IN (` + questionPlaceholders(len(batch)) + `) AND company_id IS NULL
+		query := `SELECT id FROM assets WHERE id IN (` + questionPlaceholders(len(batch)) + `) AND company_id IS NULL
 AND NOT EXISTS (SELECT 1 FROM tasks task WHERE task.id<>? AND task.deleted_at IS NULL AND
   JSON_CONTAINS(COALESCE(assets.task_ids, '[]'), CAST(task.id AS JSON)))
 AND NOT EXISTS (
  SELECT 1 FROM exploration_anchors anchor JOIN exploration_nodes node ON node.id=anchor.node_id
  JOIN tasks task ON task.exploration_id=node.exploration_id
  WHERE anchor.asset_id=assets.id AND task.id<>? AND task.deleted_at IS NULL
-)`
-		if _, err := tx.Exec(query, args...); err != nil {
+) ORDER BY id FOR UPDATE`
+		var deletable []int64
+		if err := queryInt64s(ctx, tx, &deletable, query, args...); err != nil {
+			return err
+		}
+		if len(deletable) == 0 {
+			continue
+		}
+		if _, _, err := deleteAssetsByIDsWithTx(ctx, tx, deletable); err != nil {
 			return err
 		}
 	}
@@ -879,15 +951,96 @@ func (d *DB) restoreTaskArchive(
 	if streamedLLMRecords != "" && llmRecords == nil {
 		return nil, fmt.Errorf("%w: streamed LLM records are missing", ErrTaskArchiveFormatMismatch)
 	}
-	ctx := context.Background()
-	tx, err := d.Begin()
-	if err != nil {
+	// 归档恢复同样是"引用分类的写者"（审查 I-R01）：它会把冷包里的 tasks.category_id
+	// 写回归档 stub。DeleteTaskCategory 与全体任务写者都在 lockorder 的共同 Business
+	// Gate 内提交，而旧实现是裸 Begin + 只协调 maintenance 行 —— maintenance 单例行
+	// （db/tidb/lock.go）与 Runner 的 locks('business_relations') 不是同一把锁，两者
+	// 之间没有共同串行点，于是"恢复读到分类还在 → 删除分类提交 → 恢复写回
+	// category_id"能提交出没有外键可挡的悬空引用。现在整段恢复事务在**同一道门禁**里
+	// 执行，并在回写引用前对分类物理行做锁定读重验（见下方 lockTaskCategoryRow）。
+	var warnings []string
+	if err := d.runArchiveRestoreTx(func(ctx context.Context, tx *sql.Tx) error {
+		restored, err := d.restoreTaskArchiveAttempt(ctx, tx, archiveID, snapshot, remainingTimeoutSeconds, llmRecords)
+		if err != nil {
+			return err
+		}
+		warnings = restored
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	defer tx.Rollback() //nolint:errcheck
+	return warnings, nil
+}
+
+// runArchiveRestoreTx 在统一 Business Gate（TxRunnerOptions{RequiresBusinessGate:true}）
+// 内执行一次归档恢复事务，与 CreateTask / SetTaskCategory / DeleteTaskCategory /
+// 任务级联删除互相串行。
+//
+// **绝不自动退避重放**：v2 冷包的 llm_records 是流式 io.Reader，第二次尝试只能拿到已被
+// 消费过的流。Runner 会把 1062/1205/1213 分类成可重试冲突，因此这里把 payload 错误重包成
+// "终态错误"：保留原文本与业务哨兵，但不再暴露 MySQL 编号，使 IsRetryableConflict 判为
+// 不可重试 —— 与改造前的裸 Begin 语义一致：失败即整体回滚并把错误交回调用方。
+// 提交结局未知仍按 Runner 语义返回 ErrOutcomeUnknown 并封锁本地门禁（fail closed）。
+func (d *DB) runArchiveRestoreTx(fn func(ctx context.Context, tx *sql.Tx) error) error {
+	runner := d.taskTxRunner()
+	err := runner.Run(context.Background(), lockorder.TxRunnerOptions{RequiresBusinessGate: true},
+		func(ctx context.Context, tx *sql.Tx, _ *lockorder.LockContext) error {
+			if payloadErr := fn(ctx, tx); payloadErr != nil {
+				return &archiveRestoreTerminalError{
+					message:  payloadErr.Error(),
+					sentinel: archiveRestoreSentinel(payloadErr),
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		var terminal *archiveRestoreTerminalError
+		if errors.As(err, &terminal) {
+			return terminal
+		}
+		return err
+	}
+	return nil
+}
+
+// archiveRestoreTerminalError 是归档恢复的终态错误：只携带**原文本**与业务哨兵，
+// 刻意不 Unwrap 底层 *mysql.MySQLError —— 那会让 Runner 的结构化编号分类把它当成
+// 1062/1205/1213 可重试冲突，进而自动重放只可消费一次的流式 payload。
+type archiveRestoreTerminalError struct {
+	message  string
+	sentinel error
+}
+
+func (e *archiveRestoreTerminalError) Error() string { return e.message }
+
+// Unwrap 只暴露业务哨兵（ErrTaskArchiveState / ErrTaskArchiveFormatMismatch），
+// 调用方的 errors.Is 判定与既有测试断言保持不变。
+func (e *archiveRestoreTerminalError) Unwrap() error { return e.sentinel }
+
+// archiveRestoreSentinel 挑出恢复流程对外的业务哨兵供 errors.Is 判定。
+func archiveRestoreSentinel(err error) error {
+	for _, sentinel := range []error{ErrTaskArchiveFormatMismatch, ErrTaskArchiveState} {
+		if errors.Is(err, sentinel) {
+			return sentinel
+		}
+	}
+	return nil
+}
+
+// restoreTaskArchiveAttempt 是单次恢复尝试：**只写不提交**，提交由 TxRunner 统一负责
+// （payload 内部自行 Commit 会让 Runner 的第二次 Commit 得到 ErrTxDone，变成假失败）。
+func (d *DB) restoreTaskArchiveAttempt(
+	ctx context.Context,
+	tx *sql.Tx,
+	archiveID int64,
+	snapshot *TaskArchiveSnapshot,
+	remainingTimeoutSeconds int64,
+	llmRecords io.Reader,
+) ([]string, error) {
 	if err := d.coordinateWithSchemaMigration(tx); err != nil {
 		return nil, err
 	}
+	streamedLLMRecords := snapshot.StreamedTables["llm_records"]
 	var taskID, expID int64
 	var state string
 	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
@@ -926,9 +1079,30 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 	}
 	taskRow := taskRows[0]
 	categoryID, _ := jsonInt64(taskRow["category_id"])
-	if categoryID > 0 && !rowExists(tx, "task_categories", categoryID) {
-		taskRow["category_id"] = nil
-		warnings = append(warnings, fmt.Sprintf("任务分类 %d 已删除，已恢复为未分类", categoryID))
+	if categoryID > 0 {
+		// 悬空引用的唯一可靠挡法是**锁定读**分类物理行（审查 I-R01）。原来的
+		// rowExists 是 COUNT(*) 普通快照读：DeleteTaskCategory 能在"读到分类还在"与
+		// restoreTaskStub 写回 category_id 之间提交，写回一个没有外键可挡的悬空 id。
+		// task_categories 的行锁是删除者与全体引用写者（Create/Set/批 Set/restore）
+		// 共同的串行点：本事务持锁到提交为止，这期间删除无法提交，判定也就不会过期。
+		//
+		// 锁序：本事务已通过 `task_archives JOIN tasks … FOR UPDATE` 锁住 stub 任务行，
+		// 现在才碰分类（TableOrder tasks=1 < task_categories=51），与 SetTaskCategory
+		// 同向，不会拧出"分类→任务"的反向依赖。
+		categoryAlive, err := lockTaskCategoryRow(ctx, tx, categoryID)
+		if err != nil {
+			return nil, err
+		}
+		// 诊断探针（仅测试安装）：此刻分类行锁已经在本事务手里、还没写回 category_id。
+		// 在这里放一个并发删分类者，就是在审查 I-R01 的窗口正中敲门 —— 它要是能挤进来
+		// 提交，就说明 restore 根本没有和其他引用写者共用共同门禁。
+		notifyTaskCategoryWriterHook("restore_category_locked", categoryID)
+		if !categoryAlive {
+			// 分类已被删除：沿用既有产品语义退化为未分类并给出明确 warning，
+			// 绝不写回指向已删分类的悬空 category_id。
+			taskRow["category_id"] = nil
+			warnings = append(warnings, fmt.Sprintf("任务分类 %d 已删除，已恢复为未分类", categoryID))
+		}
 	}
 	companyID, _ := jsonInt64(taskRow["company_id"])
 	if companyID > 0 && !rowExists(tx, "companies", companyID) {
@@ -1021,7 +1195,9 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 	if _, err := tx.Exec(`UPDATE task_archives SET warnings=?,phase='database_restored',progress=85,error='' WHERE id=?`, string(warningsRaw), archiveID); err != nil {
 		return nil, err
 	}
-	return warnings, tx.Commit()
+	// 提交点在 TxRunner 里：payload 只负责写，Runner 负责 Commit 与
+	// unknown-outcome 的 fail-closed 封锁（审查 I-R01）。
+	return warnings, nil
 }
 
 // archiveSnapshotWithoutBindingPKs 返回一份仅剥离 finding_traffic_bindings 旧物理
@@ -1352,6 +1528,10 @@ func archiveStubValue(table, column string, row map[string]json.RawMessage) (any
 // 原实现是 `UPDATE ... FROM json_populate_record(NULL::tasks, $2::json)`，TiDB 没有
 // 集合值函数，这里按列显式绑定；paused 且仍有剩余时长时用
 // `DATE_ADD(NOW(3), INTERVAL ? SECOND)` 续期（原 make_interval(secs=>)）。
+//
+// **前置契约（审查 I-R01，改调用方前先读）**：row["category_id"] 必须已经在**本事务内**
+// 通过 lockTaskCategoryRow 持锁核验过（不存在就要置成 nil）。本函数自己不再核验：
+// 分类行锁从核验那一刻持到提交，中途没人能把它删掉，写回的引用因此不会悬空。
 func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) error {
 	raw, err := archiveEncodeTaskRow(row)
 	if err != nil {
@@ -1799,7 +1979,8 @@ func restoreTaskRelations(ctx context.Context, tx *sql.Tx, taskID int64, raw jso
 }
 
 // restoreSideQuestionSessions 还原旁路会话。物理 row_id 交给 TiDB 重新分配；
-// memory/context_info 一类缺列由列默认值兜底，不再手工塞 {}。
+// 老冷包整列缺席的 memory 由 archiveLegacyCompatColumns 按 Catalog 应用层默认补 '{}'
+// （TiDB 没有可用的列默认值，缺列直接 1364，见 archiveRowProjection）。
 func restoreSideQuestionSessions(ctx context.Context, tx *sql.Tx, raw json.RawMessage) ([]string, error) {
 	if err := insertArchiveTableRows(ctx, tx, "side_question_sessions", raw); err != nil {
 		return nil, err

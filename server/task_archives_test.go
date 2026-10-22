@@ -12,12 +12,7 @@ import (
 )
 
 func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("archive api", "verify 202", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -27,8 +22,9 @@ func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.pg.Exec(`DELETE FROM task_archives WHERE task_id=$1`, taskID)
-		_ = m.pg.DeleteTask(taskID)
+		mustCleanup(t, m.pg, `DELETE FROM task_archives WHERE task_id=?`, taskID)
+		assertZero(t, m.pg, `SELECT COUNT(*) FROM task_archives WHERE task_id=?`, taskID)
+		mustDeleteTaskRow(t, m, taskID)
 	}()
 
 	// Start with an already-cancelled context so the background archive worker

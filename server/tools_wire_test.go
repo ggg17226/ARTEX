@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -22,16 +21,7 @@ func names(tools []actool.CoreTool) map[string]actool.CoreTool {
 // catalog, ToolResolve keeps record_fact for worker but drops it for planner (not
 // bound), and an edited description + injected default flow through.
 func TestWireTools(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn, _, err := db.DSN()
-	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
-	}
-	pg, err := db.Open(dsn)
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer pg.Close()
+	pg := newTestDB(t)
 
 	wireTools(pg, nil) // nil domainReg: test only covers filter/decoration, not injection
 	t.Cleanup(func() { agent.ToolResolve = nil })

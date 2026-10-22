@@ -8,11 +8,7 @@ import (
 // TestCustomToolCRUD exercises create/list/update/delete of a user-defined tool
 // (system=false) with kind/exec/deferred. Skips when no Postgres is configured.
 func TestCustomToolCRUD(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	key := "ct_test_tool"
 	_ = d.DeleteCustomTool(key) // clean slate

@@ -18,12 +18,7 @@ import (
 // TestCoreTaskLifecyclePG exercises the migrated core (tasks/exploration on PG)
 // through the real HTTP mux: create → goal nodes seeded → list → delete cascade.
 func TestCoreTaskLifecyclePG(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()
@@ -68,10 +63,34 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 		t.Fatalf("create task: %d (%v)", code, out)
 	}
 	id, _ := out["id"].(string)
-	expID := int64(out["exploration_id"].(float64))
+	// 迁移后的 wire 契约：整型 id 一律以十进制字符串出（见 dto.i64s）。
+	expIDRaw, ok := out["exploration_id"].(string)
+	if !ok {
+		t.Fatalf("exploration_id 必须是字符串 id，实际 %T (%v)", out["exploration_id"], out["exploration_id"])
+	}
+	expID, parseErr := strconv.ParseInt(expIDRaw, 10, 64)
+	if parseErr != nil {
+		t.Fatalf("解析 exploration_id %q: %v", expIDRaw, parseErr)
+	}
 	if id == "" || expID == 0 {
 		t.Fatalf("bad task payload: %v", out)
 	}
+	// 兜底清理：本用例任何一步 t.Fatal 都必须把这个 task 连子图一起删掉，
+	// 否则共享库里会留下没人认领的 tasks/explorations/exploration_nodes 行。
+	// t.Cleanup 是 LIFO，这里最先登记 → 最后执行，仍在活的连接池上。
+	nid, parseErr := strconv.ParseInt(id, 10, 64)
+	if parseErr != nil {
+		t.Fatalf("解析 task id %q: %v", id, parseErr)
+	}
+	t.Cleanup(func() {
+		if _, err := m.DeleteTask(id, DeleteTaskOptions{
+			DeleteAssets: true, DeleteFindings: true, DeleteLLMRecords: true, DeleteFiles: true,
+		}); err != nil {
+			t.Errorf("兜底删除任务 %s 失败: %v", id, err)
+		}
+		assertZero(t, m.pg, `SELECT COUNT(*) FROM tasks WHERE id=?`, nid)
+		assertZero(t, m.pg, `SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=?`, expID)
+	})
 
 	// the exploration owns goal node(s) — goal seeding is async, poll briefly
 	var goals []*db.Node
@@ -126,7 +145,6 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sidechainPath, "subagents", "child.jsonl"), []byte("{}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	nid, _ := strconv.ParseInt(id, 10, 64)
 	findingID, err := m.pg.AddFinding(nid, 0, "__core_task_delete__", "", db.SeverityHigh, "summary", "evidence", "tester", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -169,11 +187,11 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 		t.Fatalf("finding should be deleted, got finding=%+v err=%v", finding, err)
 	}
 	var llmRecords int
-	if err := m.pg.QueryRow(`SELECT count(*) FROM llm_records WHERE task_id=$1`, id).Scan(&llmRecords); err != nil || llmRecords != 0 {
+	if err := m.pg.QueryRow(`SELECT count(*) FROM llm_records WHERE task_id=?`, id).Scan(&llmRecords); err != nil || llmRecords != 0 {
 		t.Fatalf("task LLM records should be deleted, count=%d err=%v", llmRecords, err)
 	}
 	var n int
-	m.pg.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=$1`, expID).Scan(&n)
+	m.pg.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=?`, expID).Scan(&n)
 	if n != 0 {
 		t.Fatalf("exploration nodes should be cascade-deleted, got %d", n)
 	}

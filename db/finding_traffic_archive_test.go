@@ -15,15 +15,11 @@ func TestFindingEvidenceLockNamespace(t *testing.T) {
 }
 
 func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
+	d := openTestDB(t)
+	if err := d.EnsureLLMRecordsTable(); err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
-	if err = d.EnsureLLMRecordsTable(); err != nil {
-		t.Fatal(err)
-	}
-	if err = d.EnsureLLMUsageTable(); err != nil {
+	if err := d.EnsureLLMUsageTable(); err != nil {
 		t.Fatal(err)
 	}
 	for _, version := range []int{1, 2} {
@@ -32,7 +28,14 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID); d.DeleteTask(task.ID) }()
+			// 清理必须检查错误（审查 I-05）：原先这里既用了 PG 的 $n 占位符，又把
+			// d.Exec / DeleteTask 的错误一起丢掉，清理其实一直在静默失败并往共享库留残留行。
+			t.Cleanup(func() {
+				mustCleanup(t, d, `DELETE FROM task_archives WHERE task_id=?`, task.ID)
+				if err := d.DeleteTask(task.ID); err != nil {
+					t.Errorf("删除 fixture 任务 %d 失败: %v", task.ID, err)
+				}
+			})
 			f, err := d.Exploration(task.ExplorationID).RecordFinding(t.Context(), RecordFindingInput{TaskID: task.ID, ExplorationID: task.ExplorationID, Summary: "legacy", Severity: "low"})
 			if err != nil {
 				t.Fatal(err)
@@ -44,9 +47,8 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = d.ClaimTaskArchiveJob(t.Context()); err != nil {
-				t.Fatal(err)
-			}
+			// 只领取自己那条记录：全局 FIFO 领取会先把**别人的**队首改成活跃态（RR-I03）。
+			claimOwnArchiveJob(t, t.Context(), d, archive.ID, ArchiveQueued, Archiving)
 			snapshot, err := d.SnapshotTaskArchive(task.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -69,9 +71,7 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 			if _, err = d.QueueTaskArchiveRestore(archive.ID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err = d.ClaimTaskArchiveJob(t.Context()); err != nil {
-				t.Fatal(err)
-			}
+			claimOwnArchiveJob(t, t.Context(), d, archive.ID, RestoreQueued, Restoring)
 			if _, err = d.RestoreTaskArchive(archive.ID, snapshot, 0); err != nil {
 				t.Fatal(err)
 			}

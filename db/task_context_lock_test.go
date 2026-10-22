@@ -8,11 +8,7 @@ import (
 
 func TestTaskLLMProfileMutationsLockTaskBeforeProfile(t *testing.T) {
 	dsn := testDSN(t)
-	d, err := Open(dsn)
-	if err != nil {
-		t.Skipf("TiDB unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDBWithDSN(t, dsn)
 
 	suffix := time.Now().UnixNano()
 	first, err := d.SaveProfile(&LLMProfile{
@@ -107,11 +103,7 @@ func TestDeleteProfileLocksNonTaskReferencesBeforeProfile(t *testing.T) {
 	dsn := testDSN(t)
 
 	t.Run("agent", func(t *testing.T) {
-		d, err := Open(dsn)
-		if err != nil {
-			t.Skipf("TiDB unavailable (%v) - skipping", err)
-		}
-		defer d.Close()
+		d := openTestDBWithDSN(t, dsn)
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -164,11 +156,7 @@ func TestDeleteProfileLocksNonTaskReferencesBeforeProfile(t *testing.T) {
 	})
 
 	t.Run("conversation", func(t *testing.T) {
-		d, err := Open(dsn)
-		if err != nil {
-			t.Skipf("TiDB unavailable (%v) - skipping", err)
-		}
-		defer d.Close()
+		d := openTestDBWithDSN(t, dsn)
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -220,11 +208,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 	dsn := testDSN(t)
 
 	t.Run("agent", func(t *testing.T) {
-		d, err := Open(dsn)
-		if err != nil {
-			t.Skipf("TiDB unavailable (%v) - skipping", err)
-		}
-		defer d.Close()
+		d := openTestDBWithDSN(t, dsn)
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -268,11 +252,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 	})
 
 	t.Run("conversation", func(t *testing.T) {
-		d, err := Open(dsn)
-		if err != nil {
-			t.Skipf("TiDB unavailable (%v) - skipping", err)
-		}
-		defer d.Close()
+		d := openTestDBWithDSN(t, dsn)
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -318,11 +298,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 
 func TestCreateConversationAndDeleteProfileDoNotDeadlock(t *testing.T) {
 	dsn := testDSN(t)
-	d, err := Open(dsn)
-	if err != nil {
-		t.Skipf("TiDB unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDBWithDSN(t, dsn)
 
 	suffix := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
@@ -398,11 +374,7 @@ func TestCreateConversationAndDeleteProfileDoNotDeadlock(t *testing.T) {
 
 func TestDeleteProfileRetriesReferenceCommittedAfterInitialScan(t *testing.T) {
 	dsn := testDSN(t)
-	d, err := Open(dsn)
-	if err != nil {
-		t.Skipf("TiDB unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDBWithDSN(t, dsn)
 
 	suffix := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
@@ -434,8 +406,10 @@ SET llm_profile_id=?, active_llm_profile_id=?
 WHERE id = ?`, profileID, profileID, task.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := referenceTx.Exec(`INSERT INTO task_llm_profiles(task_id, profile_id, position)
-VALUES (?, ?, 0)`, task.ID, profileID); err != nil {
+	// status 在 PG 里是 NOT NULL DEFAULT 'ready'；TiDB 不给 TEXT 列 DDL 默认值，
+	// 夹具必须显式写同一个默认值，否则 strict 模式直接 1364。
+	if _, err := referenceTx.Exec(`INSERT INTO task_llm_profiles(task_id, profile_id, position, status)
+VALUES (?, ?, 0, 'ready')`, task.ID, profileID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -508,16 +482,32 @@ func lockObservationProbe(done <-chan error) error {
 	}
 }
 
-// tidbLockWaiting 尝试用 MySQL/TiDB 侧的锁等待视图**强证明** pid 上的语句正在等行锁。
+// tidbLockWaiting 尝试用 TiDB 侧的事务视图**强证明** pid 上的语句正在等行锁。
 //
-// 返回 available=false 表示这个 TiDB 版本没有提供可查询的锁等待视图（表/列不存在、权限
-// 不足、视图不维护等待状态），调用方据此降级到保守观察。
+// TiDB 8.5 不提供 MySQL 的 information_schema.innodb_trx（查它直接报
+// "Table 'information_schema.innodb_trx' doesn't exist"）；等价物是 tidb_trx：
+// SESSION_ID 就是 CONNECTION_ID()，STATE 是
+// enum('Idle','Running','LockWaiting','Committing','RollingBack')，等锁的会话为
+// 'LockWaiting'。
+//
+// 但 information_schema.tidb_trx 是**实例本地**视图：多 TiDB 实例部署下它只列出连到
+// 自己的那些会话，观察连接落在别的实例上就永远看不到被观察连接（本用例的连接由
+// 连接池/负载均衡分配，无法指定实例）。因此优先查集群聚合视图
+// information_schema.cluster_tidb_trx（多一列 INSTANCE，聚合全部 TiDB 实例，且不要
+// PROCESS 权限），它不可用时（单实例部署、cluster_* 系统表被关掉）才回退本地视图。
+//
+// 返回 available=false 表示两个视图都查不动（表或列不存在、权限不足），
+// 调用方据此降级到保守观察。
 func tidbLockWaiting(observer *DB, pid int) (waiting bool, available bool) {
 	var pending int
-	err := observer.QueryRow(`SELECT COUNT(1) FROM information_schema.innodb_trx
- WHERE trx_mysql_thread_id = ? AND trx_state = 'LOCK WAIT'`, pid).Scan(&pending)
+	err := observer.QueryRow(`SELECT COUNT(1) FROM information_schema.cluster_tidb_trx
+ WHERE SESSION_ID = ? AND STATE = 'LockWaiting'`, pid).Scan(&pending)
 	if err != nil {
-		return false, false
+		err = observer.QueryRow(`SELECT COUNT(1) FROM information_schema.tidb_trx
+ WHERE SESSION_ID = ? AND STATE = 'LockWaiting'`, pid).Scan(&pending)
+		if err != nil {
+			return false, false
+		}
 	}
 	return pending > 0, true
 }
@@ -526,8 +516,8 @@ func tidbLockWaiting(observer *DB, pid int) (waiting bool, available bool) {
 // blocker，并**唯一一次**消费 done（审查 F05 恢复的协议）。
 //
 // 强观察契约（杜绝无锁空转假绿，闭环 F05）：
-// 必须在 information_schema.innodb_trx 或 data_lock_waits 视图中明确观测到该连接进入
-// 'LOCK WAIT' 状态；严禁在无等待证据时仅凭 done 暂无值就降级返回成功。
+// 必须在 tidb_trx 事务视图（TiDB 8.5 的等价视图，STATE='LockWaiting'）中明确观测到该
+// 连接进入锁等待；严禁在无等待证据时仅凭 done 暂无值就降级返回成功。
 func waitForBackendBlock(observer *DB, pid int, done <-chan error) error {
 	const (
 		budget   = 10 * time.Second

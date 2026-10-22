@@ -41,7 +41,7 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	s, initial, request := trafficEvidenceServer(t)
 	pg := s.m.pg
 	ctx := context.Background()
-	if _, err := pg.Exec(`DELETE FROM settings WHERE key=$1`, settingAgentTrafficBinding); err != nil {
+	if _, err := pg.Exec("DELETE FROM settings WHERE `key`=?", settingAgentTrafficBinding); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pg.SetBool(settingAgentTrafficBinding, false) })

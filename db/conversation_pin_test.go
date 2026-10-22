@@ -7,11 +7,7 @@ import (
 )
 
 func TestConversationPinOrderingAndPatch(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	suffix := time.Now().UnixNano()
 	first, err := d.CreateConversation("mainagent", fmt.Sprintf("pin-first-%d", suffix), nil)

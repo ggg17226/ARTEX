@@ -334,7 +334,9 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 		if err := lockCompanyScopeMutation(tx); err != nil {
 			return err
 		}
-		scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
+		// scopeBarrier=true：本事务已持锁，归属解析因此走加锁当前读（TiDB 的锁等待
+		// 不会推进本事务快照，屏障内再用快照读就会解析出排队前的旧范围）。
+		scoped := &AssetStore{db: s.db, company: s.company, tx: tx, scopeBarrier: true}
 		for _, rule := range parsed {
 			taskScope := TaskScope{TaskID: taskID, Source: "manual", Reason: manualTaskScopeSummary}
 			var assetID int64

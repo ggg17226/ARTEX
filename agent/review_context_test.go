@@ -14,29 +14,19 @@ import (
 	"github.com/Autumn-27/norma/tool"
 )
 
-// Real PostgreSQL + SDK hooks: Worker reviews receive the current call only.
+// Real TiDB + SDK hooks: Worker reviews receive the current call only.
 // Intent summaries, inherited background and prior execution are excluded.
 func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn, _, err := db.DSN()
-	if err != nil {
-		t.Skip("no test database configured")
-	}
-	d, err := db.Open(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
+	// 连库门控统一走 testDB：未配置数据源 → 诚实 Skip；配了却打不开 → 判红。
+	d := testDB(t)
 	expID, err := d.CreateExploration("只操作隔离测试目录", "验证创建和清理")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("创建 exploration fixture 失败: %v", err)
 	}
 	ts := d.Exploration(expID)
 	taskID := fmt.Sprint(expID)
-	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id=$1`, taskID)
-		_, _ = d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
-	})
+	// expID 是本轮新建 exploration 的自增主键：它就是本轮 fixture 的精确物理判据。
+	cleanupExplorationFixture(t, d, expID)
 	ic := intercept.New(d)
 	priorTools, err := ic.GetEnabledTools()
 	if err != nil {

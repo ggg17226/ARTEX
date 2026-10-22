@@ -26,15 +26,32 @@ func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {
 }
 
 func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
+	// 连接池由 testDB 统一在 t.Cleanup 里关闭（最先登记 → 最后执行），
+	// 用例不得再 defer d.Close()：那会让下面的 fixture 清理跑在已关闭的池上。
 	d := testDB(t)
-	defer d.Close()
 
 	companies := d.Companies()
 	companyID, _, err := companies.UpsertCompany(fmt.Sprintf("overview-scope-%d", time.Now().UnixNano()), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = companies.DeleteCompany(companyID) })
+	// 统一逆拓扑清理：company 关联 → 任务/资产（各自钩子里按 LIFO 先任务后资产）。
+	// 每一步失败都必须 t.Errorf 标红——历史上这些钩子写成 `_ =`，静默失败时把
+	// company/asset/task fixture 整片漏在共享开发库里。
+	t.Cleanup(func() {
+		if _, err := d.Exec(`DELETE FROM company_scope WHERE company_id=?`, companyID); err != nil {
+			t.Errorf("清理 company_scope fixture %d 失败: %v", companyID, err)
+		}
+		if err := companies.DeleteCompany(companyID); err != nil {
+			t.Errorf("清理 company fixture %d 失败: %v", companyID, err)
+		}
+		var left int
+		if err := d.QueryRow(`SELECT COUNT(*) FROM companies WHERE id=?`, companyID).Scan(&left); err != nil {
+			t.Errorf("回读 company 残留失败: %v", err)
+		} else if left != 0 {
+			t.Errorf("company %d 清理后仍存在", companyID)
+		}
+	})
 
 	domain := fmt.Sprintf("overview-scope-%d.invalid", companyID)
 	ip := fmt.Sprintf("2001:db8:%x::42", companyID%0xffff)
@@ -57,7 +74,18 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = assets.DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() {
+		// LIFO：本钩子在任务钩子之后登记 → 实际晚于任务删除执行，锚点已随任务清掉。
+		if _, err := assets.DeleteByIDs([]int64{assetID}); err != nil {
+			t.Errorf("清理资产 fixture %d 失败: %v", assetID, err)
+		}
+		var left int
+		if err := d.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, assetID).Scan(&left); err != nil {
+			t.Errorf("回读资产残留失败: %v", err)
+		} else if left != 0 {
+			t.Errorf("资产 %d 清理后仍存在", assetID)
+		}
+	})
 
 	task, err := d.CreateTaskWithOptions("company context", "read configured scope", db.TaskCreateOptions{
 		CompanyIDs: []int64{companyID},
@@ -65,7 +93,11 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("清理任务 fixture %d 失败: %v", task.ID, err)
+		}
+	})
 
 	tools := NewToolSet(d.Exploration(task.ExplorationID), "planner")
 	tools.SetTaskID(task.ID)
@@ -82,26 +114,27 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if !ok {
 		t.Fatalf("coverage missing: %#v", overview["coverage"])
 	}
-	scopeRows, ok := coverage["scope"].([]map[string]any)
-	if !ok || len(scopeRows) != 1 {
-		t.Fatalf("task scope missing: %#v", coverage["scope"])
+	// 关联企业的范围如何浮现到 agent 上下文：上游 06a43f3「refactor(graph_overview):
+	// 精简态势概览字段」明确 **删除了 coverage.scope 字段**（范围根资产 + company 富化），
+	// 该用例当时被迁移期的永久 Skip 挡住，所以一直没跟着改。这里按现行契约重述同一条
+	// 业务不变量：企业 scope 命中的根域名必须进入本任务的覆盖范围分母与按类型统计，
+	// 并能被 task_id/company_id 两种 DSL 查询到（下面继续断言）；被删字段本身的断言
+	// 一并移除，不改其余任何断言。
+	if denominator, _ := coverage["denominator"].(int); denominator < 1 {
+		t.Fatalf("company-scoped asset not in coverage denominator: %#v", coverage)
 	}
-	companyScope, ok := scopeRows[0]["company_scope"].([]map[string]any)
-	if !ok || len(companyScope) != len(inputs) {
-		t.Fatalf("company scope not expanded: %#v", scopeRows[0])
+	byType, ok := coverage["by_type"].([]db.CoverageByType)
+	if !ok {
+		t.Fatalf("coverage by_type missing: %#v", coverage["by_type"])
 	}
-	kinds := make(map[string]string, len(companyScope))
-	for _, rule := range companyScope {
-		kinds[fmt.Sprint(rule["kind"])] = fmt.Sprint(rule["value"])
-	}
-	for _, input := range inputs {
-		if kinds[input.Kind] != input.Value {
-			t.Errorf("scope %s=%q want %q", input.Kind, kinds[input.Kind], input.Value)
+	var rootDomainTotal int
+	for _, row := range byType {
+		if row.Type == "root_domain" {
+			rootDomainTotal = row.Total
 		}
 	}
-	keywords, ok := scopeRows[0]["company_keywords"].([]string)
-	if !ok || len(keywords) != 1 || keywords[0] != keyword {
-		t.Fatalf("company keywords missing: %#v", scopeRows[0]["company_keywords"])
+	if rootDomainTotal < 1 {
+		t.Fatalf("company-scoped root_domain missing from coverage by_type: %#v", byType)
 	}
 	if hc, _ := coverage["host_count"].(int); hc < 1 {
 		t.Fatalf("company asset host not counted in agent context: %#v", coverage["host_count"])
@@ -142,7 +175,11 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(disabledTask.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(disabledTask.ID); err != nil {
+			t.Errorf("清理 coverage-disabled 任务 fixture %d 失败: %v", disabledTask.ID, err)
+		}
+	})
 	disabledTools := NewToolSet(d.Exploration(disabledTask.ExplorationID), "planner")
 	disabledTools.SetTaskID(disabledTask.ID)
 	disabledTools.SetCoverageEnabled(false)
@@ -184,8 +221,7 @@ func companiesName(t *testing.T, companies *db.CompanyStore, companyID int64) st
 }
 
 func TestBlackboardToolsReadDirectSources(t *testing.T) {
-	d := testDB(t)
-	defer d.Close()
+	d := testDB(t) // Close 由 testDB 统一登记，勿再 defer d.Close()
 
 	grand, err := d.CreateTask("grand", "grand goal", nil, 0, 0)
 	if err != nil {
@@ -199,10 +235,31 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 清理钩子一次性登记在这里，闭包捕获稍后才赋值的 hostAssetID（审查同 db 包
+	// company_scope_test 的写法）。顺序必须是**逆拓扑**：先删三条任务（连带它们的
+	// exploration_nodes/exploration_anchors），再删资产。反过来先删资产会在锚点上留下
+	// 一条指向已消失资产的记录，DeleteTask 的锁定器把它判成"成员漂移"整笔回滚并放弃
+	// 删除，任务就此永远删不掉（TiDB 基线没有外键，锚点引用完全由应用层维持）。
+	// 每一步失败都必须 t.Errorf 标红：静默失败的历史版本把 source 任务漏在了库里。
+	var hostAssetID int64
 	t.Cleanup(func() {
-		_ = d.DeleteTask(current.ID)
-		_ = d.DeleteTask(source.ID)
-		_ = d.DeleteTask(grand.ID)
+		for _, taskID := range []int64{current.ID, source.ID, grand.ID} {
+			if err := d.DeleteTask(taskID); err != nil {
+				t.Errorf("清理任务 fixture %d 失败: %v", taskID, err)
+			}
+		}
+		if hostAssetID == 0 {
+			return
+		}
+		if _, err := d.Assets().DeleteByIDs([]int64{hostAssetID}); err != nil {
+			t.Errorf("清理资产 fixture %d 失败: %v", hostAssetID, err)
+		}
+		var left int
+		if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_anchors WHERE asset_id=?`, hostAssetID).Scan(&left); err != nil {
+			t.Errorf("回读资产锚点残留失败: %v", err)
+		} else if left != 0 {
+			t.Errorf("资产 %d 仍有 %d 条锚点残留", hostAssetID, left)
+		}
 	})
 
 	grandStore := d.Exploration(grand.ExplorationID)
@@ -250,7 +307,7 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = assets.DeleteByIDs([]int64{assetID}) })
+	hostAssetID = assetID // 由函数开头的统一清理钩子按逆拓扑顺序删除（先任务后资产）
 	if _, err := sourceStore.AddNode(db.KindFact, map[string]any{"summary": "source host anchor"}, 0, "confirmed", "worker", []int64{assetID}); err != nil {
 		t.Fatal(err)
 	}
@@ -368,14 +425,17 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 // of erroring, get_worker_trace returns the first 5 requested steps and tells the
 // model which ids it deferred, after de-duplicating and dropping invalid ids.
 func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
-	d := testDB(t)
-	defer d.Close()
+	d := testDB(t) // Close 由 testDB 统一登记，勿再 defer d.Close()
 
 	task, err := d.CreateTask("trace-cap", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("清理任务 fixture %d 失败: %v", task.ID, err)
+		}
+	})
 	store := d.Exploration(task.ExplorationID)
 	intent, err := store.AddIntent(map[string]any{"summary": "cap work"}, 1, nil, "planner")
 	if err != nil {

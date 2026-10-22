@@ -231,7 +231,7 @@ func TestConversation_DeleteConversation_FullClosureAndRetestSemantics(t *testin
 	reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
 	reqIdent := schema.SideQuestionRequestsIdentity(convKey, 1, "test_client")
 	reqHash := schema.CanonicalHash(reqIdent)
-	if _, err := d.Exec("INSERT INTO side_question_requests (id, session_key, generation, client_id, identity, identity_hash, question, answer, status, error, model, usage, context_info, snapshot_at, created_at) VALUES (?, ?, 1, 'test_client', ?, ?, 'test question', '', 'running', '', '{}', '{}', '{}', NOW(3), NOW(3))", reqID, convKey, reqIdent, reqHash[:]); err != nil {
+	if _, err := d.Exec("INSERT INTO side_question_requests (id, session_key, generation, client_id, identity, identity_hash, question, answer, status, error, model, `usage`, context_info, snapshot_at, created_at) VALUES (?, ?, 1, 'test_client', ?, ?, 'test question', '', 'running', '', '{}', '{}', '{}', NOW(3), NOW(3))", reqID, convKey, reqIdent, reqHash[:]); err != nil {
 		t.Fatalf("seed side_question_requests failed: %v", err)
 	}
 
@@ -1636,7 +1636,7 @@ func TestSideQuestions_StartRequestCarriesCanonicalIdentity(t *testing.T) {
 	wantIdentity := schema.SideQuestionRequestsIdentity("conv-77", 7, "client-1")
 	wantHash := schema.CanonicalHash(wantIdentity)
 	if len(insert.Args) != 14 {
-		t.Fatalf("参数必须是 (id, session_key, generation, client_id, identity, identity_hash, question, answer, status, error, model, usage, context_info, snapshot_at)，实际 %d 个：%v", len(insert.Args), insert.Args)
+		t.Fatalf("参数必须是 (id, session_key, generation, client_id, identity, identity_hash, question, answer, status, error, model, `usage`, context_info, snapshot_at)，实际 %d 个：%v", len(insert.Args), insert.Args)
 	}
 	if got, ok := insert.Args[4].([]byte); !ok || string(got) != string(wantIdentity) {
 		t.Errorf("identity 必须是 canonical 载荷 (session_key, generation, client_id)，实际 %v", insert.Args[4])

@@ -314,11 +314,15 @@ LIMIT 1 FOR UPDATE`, taskID).Scan(&dependent)
 	err = tx.QueryRow(`SELECT id, state FROM task_archives WHERE task_id=? FOR UPDATE`, taskID).Scan(&existingId, &existingState)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
+		// archive_path / sha256 / data_counts / aggregate_stats 在 PG 里靠列默认值
+		// ('' / '' / '{}' / '{}') 兜底；TiDB 不给 TEXT/JSON 列声明 DDL 默认值，
+		// 严格模式下漏一列就是 1364，插入必须按同一套默认值显式补齐。
 		if _, err := tx.Exec(`INSERT INTO task_archives(
  task_id,state,phase,progress,error,warnings,format_version,task_name,
  task_description,task_goal,original_status,category_id_snapshot,
- category_name_snapshot,source_task_ids,remaining_timeout_seconds,requested_at)
-VALUES(?,?,'queued',0,'','[]',?,?,?,?,?,?,?,?,?,NOW(3))`,
+ category_name_snapshot,source_task_ids,archive_path,sha256,data_counts,aggregate_stats,
+ remaining_timeout_seconds,requested_at)
+VALUES(?,?,'queued',0,'','[]',?,?,?,?,?,?,?,?,'','','{}','{}',?,NOW(3))`,
 			taskID, ArchiveQueued, TaskArchiveFormatVersion, name, description, goal, status,
 			categoryID, categoryName, string(sourcesRaw), remaining); err != nil {
 			return nil, err

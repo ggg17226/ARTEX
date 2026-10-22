@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,12 +20,7 @@ import (
 // → llm_records. The unit tests cover each hop; this proves the raw bodies
 // actually survive all the way into the row an operator opens when debugging.
 func TestRecorderPersistsRawWireBodies(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	pg := m.PG()
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		t.Fatalf("ensure table: %v", err)
@@ -64,16 +60,32 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
-	const session = "exp999999-rawtest"
+	// llmrec 的写入方按 session 反查归属任务（"parent task is missing or deleted"
+	// 时直接丢记录），所以 session 必须挂在本用例真实创建的任务上，不能凭空编一个。
+	task, err := m.CreateTask("llmrec raw wire", "persist raw bodies", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskRowID := mustTaskID(t, task.ID)
+	t.Cleanup(func() {
+		if _, err := m.DeleteTask(task.ID, DeleteTaskOptions{}); err != nil {
+			t.Errorf("清理任务 %s 失败: %v", task.ID, err)
+		}
+		assertZero(t, pg, `SELECT COUNT(*) FROM tasks WHERE id=?`, taskRowID)
+	})
+	// session 的格式是 exp<task id>-<role>，其中的数字是**任务主键**（llmrec 会按它
+	// 反查归属任务），不是 exploration id。
+	session := fmt.Sprintf("exp%d-rawtest", taskRowID)
 	rec := llmrec.Wrap(inner, pg, cfg.Model, "raw-test-profile", "", "", func() bool { return true })
 
 	// Clean up whatever this test writes, whether or not it passes. Must be a
 	// defer registered after `defer m.Close()` (LIFO puts it first) — a
 	// t.Cleanup would run after the manager already closed the pool.
 	defer func() {
-		if _, err := pg.Exec(`DELETE FROM llm_records WHERE session_id = $1`, session); err != nil {
-			t.Logf("cleanup: %v", err)
+		if _, err := pg.Exec(`DELETE FROM llm_records WHERE session_id = ?`, session); err != nil {
+			t.Errorf("清理 llm_records fixture (session=%s) 失败: %v", session, err)
 		}
+		assertZero(t, pg, `SELECT COUNT(*) FROM llm_records WHERE session_id=?`, session)
 	}()
 
 	ctx := transcript.WithSessionID(context.Background(), session)
@@ -93,7 +105,7 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 	}
 
 	var id int64
-	if err := pg.QueryRow(`SELECT id FROM llm_records WHERE session_id=$1 ORDER BY id DESC LIMIT 1`, session).Scan(&id); err != nil {
+	if err := pg.QueryRow(`SELECT id FROM llm_records WHERE session_id=? ORDER BY id DESC LIMIT 1`, session).Scan(&id); err != nil {
 		t.Fatalf("no record written: %v", err)
 	}
 	got, err := pg.GetLLMRecord(id)

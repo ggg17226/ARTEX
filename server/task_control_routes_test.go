@@ -9,12 +9,7 @@ import (
 )
 
 func TestWorkerControlRoutes(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)

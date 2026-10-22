@@ -13,16 +13,7 @@ import (
 )
 
 func TestInterceptDetailHTTP(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn, _, err := db.DSN()
-	if err != nil {
-		t.Skip("no test database configured")
-	}
-	d, err := db.Open(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
+	d := newTestDB(t)
 	// Exercise the authenticated HTTP surface without starting unrelated task
 	// schedulers or mutating the process-global tool assembly used by other tests.
 	m := &Manager{pg: d, interceptor: intercept.New(d)}
@@ -36,7 +27,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM intercept_pending WHERE id=$1`, id) })
+	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM intercept_pending WHERE id=?`, id) })
 	do := func(method, path, body string, authenticated bool) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		if authenticated {
@@ -70,7 +61,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM conversations WHERE id=$1`, conv.ID) })
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM conversations WHERE id=?`, conv.ID) })
 	seq, err := d.AppendConvActivity(conv.ID, db.Activity{Worker: "test", Kind: "tool_use", Tool: "Bash", ToolUseID: "http-source", Summary: "pwd"})
 	if err != nil {
 		t.Fatal(err)
@@ -79,7 +70,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE id=$1`, sourceID) })
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE id=?`, sourceID) })
 	sourceReply := do(http.MethodGet, fmt.Sprintf("/api/intercept/history/%d/execution", sourceID), "", true)
 	// P03 R05 / R23 I-1：execution 的 map 响应里 seq / conversation_id 都是 string
 	// （i64s / i64Ptr），必须按 string 解码；解成 int64 会在 W5 接库后报

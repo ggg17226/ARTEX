@@ -62,3 +62,6 @@ Thumbs.db
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+# Go 构建缓存（代理/门禁执行时生成的独立缓存目录，体积极大，绝不提交）
+/.gocache/
+/.gocache-*/

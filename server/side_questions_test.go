@@ -123,7 +123,7 @@ func TestSideHTTPPreparationCancellationAndClear(t *testing.T) {
 				t.Fatalf("cancel usage: %+v", row)
 			}
 			var memory string
-			if err = f.m.pg.QueryRow(`SELECT memory::text FROM side_question_sessions WHERE session_key=$1`, p.Key()).Scan(&memory); err != nil || memory != "{}" {
+			if err = f.m.pg.QueryRow(`SELECT CAST(memory AS CHAR) FROM side_question_sessions WHERE session_key=?`, p.Key()).Scan(&memory); err != nil || memory != "{}" {
 				t.Fatalf("late summary saved: %s %v", memory, err)
 			}
 		})
@@ -140,11 +140,7 @@ type sideHTTPFixture struct {
 
 func newSideHTTPFixture(t *testing.T) *sideHTTPFixture {
 	t.Helper()
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
+	m := newTestManager(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, jwtKey: []byte("btw-test-signing-key-only"), chatBusy: map[string]bool{}}
 	s.initSideQuestions()
@@ -167,7 +163,6 @@ func newSideHTTPFixture(t *testing.T) *sideHTTPFixture {
 		}
 		<-s.side.done
 		s.flushSideSnapshots()
-		m.Close()
 	})
 	return f
 }
@@ -297,7 +292,7 @@ func TestSideHTTPBusyIsolationClearAndReconnect(t *testing.T) {
 		t.Fatal("clear lost main snapshot")
 	}
 	var count int
-	if err := f.m.pg.QueryRow(`SELECT count(*) FROM conversation_activities WHERE conversation_id=$1`, p.ConversationID).Scan(&count); err != nil || count != 0 {
+	if err := f.m.pg.QueryRow(`SELECT count(*) FROM conversation_activities WHERE conversation_id=?`, p.ConversationID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("side contaminated main activity %d %v", count, err)
 	}
 	f.s.cfgMu.Lock()
@@ -332,7 +327,7 @@ func TestSideHTTPGlobalLimitTaskWorkerAndDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := strconv.ParseInt(task.ID, 10, 64)
-	t.Cleanup(func() { _ = f.m.pg.DeleteTask(id) })
+	t.Cleanup(func() { mustDeleteTaskRow(t, f.m, id) })
 	iid, err := task.Store.AddNode(db.KindIntent, map[string]any{"summary": "own worker"}, 1, "paused", "planner", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -434,7 +429,7 @@ func TestSideRejectsDeletedOrChangedCachedProfile(t *testing.T) {
 	if _, err = f.s.sideProvider(model); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.m.pg.Exec(`UPDATE llm_profiles SET model='changed' WHERE id=$1`, id); err != nil {
+	if _, err = f.m.pg.Exec(`UPDATE llm_profiles SET model='changed' WHERE id=?`, id); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = f.s.sideProvider(model); err == nil {
@@ -455,7 +450,7 @@ func TestSideTaskDrainPersistsBeforeArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := strconv.ParseInt(task.ID, 10, 64)
-	t.Cleanup(func() { _ = f.m.pg.DeleteTask(id) })
+	t.Cleanup(func() { mustDeleteTaskRow(t, f.m, id) })
 	p := sidequestion.Parent{TaskID: id, ExplorationID: task.ExpID}
 	f.checkpoint(t, p)
 	path := "/api/tasks/" + task.ID + "/chat/side-questions"
@@ -500,7 +495,7 @@ func TestSideRestoredWorkerRuntimePublishesNewCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := strconv.ParseInt(task.ID, 10, 64)
-	t.Cleanup(func() { _ = f.m.pg.DeleteTask(id) })
+	t.Cleanup(func() { mustDeleteTaskRow(t, f.m, id) })
 	if err := f.m.pg.SetPaused(id, true); err != nil {
 		t.Fatal(err)
 	}

@@ -13,18 +13,13 @@ import (
 )
 
 func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("metadata patch", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() { _ = m.pg.DeleteTask(taskID) }()
+	t.Cleanup(func() { mustDeleteTaskRow(t, m, taskID) })
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
@@ -62,12 +57,7 @@ func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
 }
 
 func TestConversationBatchDeleteReportsMissing(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	first, err := m.pg.CreateConversation("mainagent", "batch-http-first", nil)
 	if err != nil {
@@ -86,8 +76,11 @@ func TestConversationBatchDeleteReportsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 迁移后的 wire 契约：批量入参里的 id 是十进制字符串。
 	missing := int64(1<<62 - 1)
-	body, _ := json.Marshal(map[string]any{"ids": []int64{first.ID, missing, second.ID}})
+	body, _ := json.Marshal(map[string]any{"ids": []string{
+		strconv.FormatInt(first.ID, 10), strconv.FormatInt(missing, 10), strconv.FormatInt(second.ID, 10),
+	}})
 	req := httptest.NewRequest(http.MethodPost, "/api/conversations/delete/batch", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()

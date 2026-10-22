@@ -385,10 +385,63 @@ type RecordedFinding struct {
 	Traffic   *FindingTraffic `json:"traffic"`
 }
 
+// validateAnchorAssetsTx 在写任何一行之前确认 asset_ids 指向真实存在的资产。
+//
+// PG 时代 exploration_anchors.asset_id 上挂着外键：指向不存在的资产会被数据库直接
+// 拒绝，整笔 Record 原子回滚。TiDB 基线**不建外键**，同一个入参会落成一条悬空锚点，
+// 而任务删除级联要把锚点引用的资产行逐个 FOR UPDATE 锁住，锁不到就判定"成员漂移"
+// 整笔回滚并放弃删除 —— 一条幻觉 asset id 就能让这条任务**永远删不掉**（启用
+// evidence 真实库用例时正是这样把 DeleteTask 卡死的）。迁移后的引用完整性必须由
+// 应用层补齐，这里就是 RecordFinding 这条写路径上的补位，错误口径与
+// relation_validator 一致（ErrForeignKeyViolation）。
+//
+// 参数类型取 DBTX 而不是 *sql.Tx：同一条校验要服务两类执行体 ——
+//   - RecordFindingTx / ExplorationStore.AddNode 这类已经开着事务的写路径（传 *sql.Tx）；
+//   - ExplorationStore.Anchor 这种单条幂等 INSERT（传 *DB，见 db/exploration.go，
+//     它自己把"校验 + 插入"包进一个事务，语义与这里完全一致）。
+//
+// id 列表按 assetRefPurgeBatchSize 分批，避免超长 IN；非正数与重复项由
+// normalizeAssetIDs 丢弃（与旧实现里 `id <= 0 || seen[id]` 的跳过口径一致）。
+func validateAnchorAssetsTx(ctx context.Context, exec DBTX, assetIDs []int64) error {
+	for _, chunk := range chunkInt64(normalizeAssetIDs(assetIDs), assetRefPurgeBatchSize) {
+		rows, err := exec.QueryContext(ctx,
+			`SELECT id FROM assets WHERE id IN (`+inPlaceholders(len(chunk))+`)`, int64Args(chunk)...)
+		if err != nil {
+			return err
+		}
+		found := make(map[int64]bool, len(chunk))
+		var scanErr error
+		for rows.Next() {
+			var id int64
+			if scanErr = rows.Scan(&id); scanErr != nil {
+				break
+			}
+			found[id] = true
+		}
+		if scanErr == nil {
+			scanErr = rows.Err()
+		}
+		rows.Close()
+		if scanErr != nil {
+			return scanErr
+		}
+		for _, id := range chunk {
+			if !found[id] {
+				return fmt.Errorf("%w: assets id=%d 不存在，漏洞只能锚定本库已登记的资产", ErrForeignKeyViolation, id)
+			}
+		}
+	}
+	return nil
+}
+
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
 // 事务内新加的推送事件写入同样应受调用方的取消与超时约束。
 func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
 	if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
+		return nil, err
+	}
+	// 锚点引用先校验再落库（详见函数注释）：此刻事务里一行都还没写。
+	if err := validateAnchorAssetsTx(ctx, tx, in.AssetIDs); err != nil {
 		return nil, err
 	}
 	if in.TaskID > 0 {

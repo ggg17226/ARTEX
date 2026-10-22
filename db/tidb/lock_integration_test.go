@@ -1,3 +1,8 @@
+// 本文件的真实库用例都会动 maintenance 单例行（EnsureLockInfrastructure 建表
+// DDL、抢/清 op_id、甚至直接 DELETE 单例行再补回）。这些动作打在已上线的业务库
+// （ARTEX_TIDB_DSN）上，会短暂夺走维护窗口门禁、并在进程中途被杀时留下缺行，
+// 因此一律改用 requireEmptyTiDB：只在独占空库 ARTEX_TIDB_EMPTY_DSN 上跑，
+// 未设置该变量时诚实跳过，绝不回落到业务库。
 package tidb_test
 
 import (
@@ -84,7 +89,7 @@ func requireNoMaintenanceOwnerSoon(t *testing.T, db *sql.DB) {
 }
 
 func TestAcquireReleaseMaintenance_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -144,7 +149,7 @@ func TestAcquireReleaseMaintenance_Real(t *testing.T) {
 }
 
 func TestCoordinateMaintenance_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -223,7 +228,7 @@ func TestCoordinateMaintenance_Real(t *testing.T) {
 }
 
 func TestEnsureLockInfrastructure_NoFKCheck_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -307,7 +312,7 @@ func TestAcquireMaintenance_InvalidOpID(t *testing.T) {
 // 三个入口都必须返回 ErrMaintenanceRowMissing（fail closed），且
 // AcquireMaintenance 须立即返回而不是陷入退避空转。
 func TestMaintenanceRowMissing_FailClosed_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -365,7 +370,7 @@ VALUES ('maintenance', NULL, 0, 0, NOW(3))`)
 // 并 fail closed 返回 ErrMaintenanceRowMissing，而不是无限退避直到 ctx 超时
 // 误报 DeadlineExceeded（回归：循环内缺行探测）。
 func TestAcquireMaintenance_RowDeletedDuringBackoff_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -435,7 +440,7 @@ DELETE FROM maintenance WHERE singleton_key = 'maintenance'`); err != nil {
 // B 事务的 CoordinateMaintenance 必须返回 ErrMaintenanceLocked，
 // 不得静默通过；A 释放后 B 可正常协调。
 func TestCoordinateMaintenance_LockedByOpID_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)

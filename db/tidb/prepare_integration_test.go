@@ -1,3 +1,8 @@
+// 本文件的用例会执行基础设施 DDL，并把 schema_meta.schema_version 写成 0
+// （prepare 阶段的定义如此）。因此它们**只能**跑在 requireEmptyTiDB 门控的
+// 独占空库（ARTEX_TIDB_EMPTY_DSN）上：业务库（ARTEX_TIDB_DSN）里的
+// schema_version 已经是 1，被这些用例打回 0 后应用会拒绝启动。
+// 该门控绝不回落到 ARTEX_TIDB_DSN，并且会在 DSN 撞库 / 目标库非空时直接 Fail Closed。
 package tidb_test
 
 import (
@@ -9,7 +14,7 @@ import (
 )
 
 func TestExecutePrepare_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -51,7 +56,7 @@ func TestExecutePrepare_Real(t *testing.T) {
 }
 
 func TestValidatePrepareState_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -67,7 +72,7 @@ func TestValidatePrepareState_Real(t *testing.T) {
 }
 
 func TestValidatePrepareState_VersionMismatch_Real(t *testing.T) {
-	dsn := requireTiDB(t)
+	dsn := requireEmptyTiDB(t)
 	db, _, err := tidb.OpenTiDB(dsn)
 	if err != nil {
 		t.Fatalf("OpenTiDB: %v", err)
@@ -80,6 +85,8 @@ func TestValidatePrepareState_VersionMismatch_Real(t *testing.T) {
 	if _, err := db.Exec("UPDATE schema_meta SET value=1 WHERE `key`='schema_version'"); err != nil {
 		t.Fatalf("bump version: %v", err)
 	}
+	// 版本戳复位是防御性的第二层：requireEmptyTiDB 注册的清理会 DROP 掉
+	// schema_meta，正常路径下这条 UPDATE 只是让中途读到的状态也是 v0。
 	t.Cleanup(func() {
 		_, _ = db.Exec("UPDATE schema_meta SET value=0 WHERE `key`='schema_version'")
 	})

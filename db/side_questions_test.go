@@ -2,9 +2,11 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,16 +17,18 @@ import (
 
 func sideFixture(t *testing.T) (*DB, sidequestion.Snapshot) {
 	t.Helper()
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { d.Close() })
+	d := openTestDB(t)
 	c, err := d.CreateConversation("mainagent", "side persistence", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteConversation(c.ID) })
+	// 会话删除走产品的完整闭包（side_question_requests → side_question_sessions →
+	// conversations 逆拓扑）；错误必须判红，吞掉就是往共享库里留旁路子表孤儿。
+	t.Cleanup(func() {
+		if err := d.DeleteConversation(c.ID); err != nil {
+			t.Errorf("删除旁路 fixture 会话 %d 失败: %v", c.ID, err)
+		}
+	})
 	s := sidequestion.Snapshot{Parent: sidequestion.Parent{ConversationID: c.ID}, RunID: 1, Version: 1, CapturedAt: time.Now().UTC(), Model: sidequestion.Model{Model: "fixture"}, Request: llm.CompletionRequest{Messages: []llm.Message{llm.UserText("main-only")}}}
 	if err = d.SaveSideSnapshot(t.Context(), s); err != nil {
 		t.Fatal(err)
@@ -208,53 +212,180 @@ func TestSideMemoryClearRace(t *testing.T) {
 		}()
 		wg.Wait()
 		var raw []byte
-		if err = d.QueryRow(`SELECT memory FROM side_question_sessions WHERE session_key=$1`, s.Parent.Key()).Scan(&raw); err != nil || string(raw) != "{}" {
+		if err = d.QueryRow(`SELECT memory FROM side_question_sessions WHERE session_key=?`, s.Parent.Key()).Scan(&raw); err != nil || string(raw) != "{}" {
 			t.Fatalf("late cache write: %s %v", raw, err)
 		}
 	}
 }
 
+// TestSideArchiveRowsWithoutNewFields 钉住 v3 那批老冷包"整列还没有 memory /
+// context_info"的历史兼容恢复路径（审查 I-04）。三条都必须成立：
+//
+//   - 冷包里是真的**没有**这一列（用例把它从投影结果里删掉，而不是自己再塞一个 "{}"
+//     再喂回恢复层 —— 那样等于把被测行为写进测试里，恢复层什么都不做也能绿）；
+//   - 补齐发生在**产品的恢复入口**（restoreSideQuestionSessions /
+//     restoreSideQuestionRequests）里：PG 时代靠 `ADD COLUMN ... DEFAULT '{}'` 的列
+//     默认值，TiDB 的 MEDIUMTEXT 不允许列默认值（Error 1101），缺列直接 1364，
+//     所以默认值必须由 archiveLegacyCompatColumns 显式补回；
+//   - 冷包带着原值回来时，原值必须**原样保住**，不能被默认值覆盖。
+//
+// 白名单之外的必填列依旧 fail-closed，见 TestArchiveRestoreRejectsMissingRequiredColumn。
 func TestSideArchiveRowsWithoutNewFields(t *testing.T) {
 	d, s := sideFixture(t)
-	e, _, err := d.StartSideRequest(t.Context(), s, "legacy", "legacy question")
+	ctx := t.Context()
+	e, _, err := d.StartSideRequest(ctx, s, "legacy", "legacy question")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := d.Begin()
-	if err != nil {
+	key := s.Parent.Key()
+	const (
+		legacyMemory  = `{"summary":"legacy memory"}`
+		legacyContext = `{"budget":1234}`
+	)
+	// 热表里先把两个新字段写成**非默认值**：缺列要补 '{}'，带原值不能被覆盖，
+	// 两个方向都钉住才算真的恢复了这两个字段。
+	if _, err = d.ExecContext(ctx, `UPDATE side_question_sessions SET memory=? WHERE session_key=?`, legacyMemory, key); err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
-	rows := map[string]json.RawMessage{}
-	for _, table := range []string{"side_question_sessions", "side_question_requests"} {
-		var raw []byte
-		if err = tx.QueryRow(`SELECT json_agg(t) FROM `+table+` t WHERE session_key=$1`, s.Parent.Key()).Scan(&raw); err != nil {
-			t.Fatal(err)
+	if _, err = d.ExecContext(ctx, `UPDATE side_question_requests SET context_info=? WHERE id=?`, legacyContext, e.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// export 借生产自己的冷包投影导出（形状与 manifest 完全一致），并按场景把指定列
+	// 整列删掉，模拟"这个归档包导出时还没有这一列"。
+	export := func(t *testing.T, tx *sql.Tx, table string, drop ...string) json.RawMessage {
+		t.Helper()
+		raw, _, err := archiveSelectProjection(tx, table, "session_key = ?", []any{key}, "")
+		if err != nil {
+			t.Fatalf("export %s: %v", table, err)
 		}
 		var items []map[string]json.RawMessage
-		if err = json.Unmarshal(raw, &items); err != nil {
-			t.Fatal(err)
+		if err := json.Unmarshal(raw, &items); err != nil {
+			t.Fatalf("decode %s: %v", table, err)
 		}
-		for _, item := range items {
-			delete(item, "memory")
-			delete(item, "context_info")
+		if len(items) != 1 {
+			t.Fatalf("%s fixture rows=%d want 1", table, len(items))
 		}
-		rows[table], err = json.Marshal(items)
+		for _, column := range drop {
+			if _, ok := items[0][column]; !ok {
+				t.Fatalf("%s 的投影里没有 %s 列，用例前提不成立", table, column)
+			}
+			delete(items[0], column)
+		}
+		out, err := json.Marshal(items)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("encode %s: %v", table, err)
 		}
+		return out
 	}
-	if _, err = tx.Exec(`DELETE FROM side_question_sessions WHERE session_key=$1`, s.Parent.Key()); err != nil {
+
+	for _, tc := range []struct {
+		name        string
+		dropMemory  bool
+		dropContext bool
+		wantMemory  string
+		wantContext string
+	}{
+		{name: "只缺 memory", dropMemory: true, wantMemory: "{}", wantContext: legacyContext},
+		{name: "只缺 context_info", dropContext: true, wantMemory: legacyMemory, wantContext: "{}"},
+		{name: "两列都缺", dropMemory: true, dropContext: true, wantMemory: "{}", wantContext: "{}"},
+		{name: "两列都带原值", wantMemory: legacyMemory, wantContext: legacyContext},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// 每个场景一个独立事务、收尾 Rollback：热表里的 fixture 原行始终留在库里，
+			// 下一个场景仍从同一份数据出发，且整件事在共享库上不留任何痕迹。
+			tx, err := d.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback() //nolint:errcheck // 回滚是预期收尾
+
+			var sessionDrop, requestDrop []string
+			if tc.dropMemory {
+				sessionDrop = append(sessionDrop, "memory")
+			}
+			if tc.dropContext {
+				requestDrop = append(requestDrop, "context_info")
+			}
+			sessions := export(t, tx, "side_question_sessions", sessionDrop...)
+			requests := export(t, tx, "side_question_requests", requestDrop...)
+
+			// 回灌前要清掉热表原行（否则撞 uq_side_requests_id / 会话唯一键）。
+			// 逆拓扑：先子表 side_question_requests，再父表 side_question_sessions。
+			if _, err = tx.ExecContext(ctx, `DELETE FROM side_question_requests WHERE session_key=?`, key); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.ExecContext(ctx, `DELETE FROM side_question_sessions WHERE session_key=?`, key); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restoreSideQuestionSessions(ctx, tx, sessions); err != nil {
+				t.Fatalf("restore side_question_sessions: %v", err)
+			}
+			if err := restoreSideQuestionRequests(ctx, tx, requests); err != nil {
+				t.Fatalf("restore side_question_requests: %v", err)
+			}
+
+			var memory, info string
+			if err := tx.QueryRowContext(ctx, `
+SELECT s.memory, r.context_info
+FROM side_question_sessions s JOIN side_question_requests r USING(session_key)
+WHERE r.id=?`, e.ID).Scan(&memory, &info); err != nil {
+				t.Fatal(err)
+			}
+			if memory != tc.wantMemory || info != tc.wantContext {
+				t.Fatalf("memory=%s context_info=%s；want memory=%s context_info=%s",
+					memory, info, tc.wantMemory, tc.wantContext)
+			}
+		})
+	}
+}
+
+// TestArchiveRestoreRejectsMissingRequiredColumn 与上面那条成对：历史兼容默认值只覆盖
+// archiveLegacyCompatColumns 登记在案的列，其他必填列在冷包里整列缺席时必须照旧
+// fail-closed（TiDB 严格模式 1364），绝不能被"顺手补个默认值"悄悄蒙过去。
+func TestArchiveRestoreRejectsMissingRequiredColumn(t *testing.T) {
+	d, s := sideFixture(t)
+	ctx := t.Context()
+	if _, _, err := d.StartSideRequest(ctx, s, "required-column", "question"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"side_question_sessions", "side_question_requests"} {
-		if err = insertArchiveRows(tx, table, rows[table]); err != nil {
-			t.Fatal(err)
-		}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var info, memory []byte
-	if err = tx.QueryRow(`SELECT context_info,memory FROM side_question_requests r JOIN side_question_sessions s USING(session_key) WHERE r.id=$1`, e.ID).Scan(&info, &memory); err != nil || string(info) != "{}" || string(memory) != "{}" {
-		t.Fatalf("legacy defaults: %s %s %v", info, memory, err)
+	defer tx.Rollback() //nolint:errcheck
+	raw, _, err := archiveSelectProjection(tx, "side_question_sessions", "session_key = ?", []any{s.Parent.Key()}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("fixture rows=%d want 1", len(items))
+	}
+	// run_id 是 BIGINT NOT NULL 且没有应用层默认值，也不在历史兼容白名单里。
+	if _, ok := items[0]["run_id"]; !ok {
+		t.Fatal("投影里没有 run_id 列，用例前提不成立")
+	}
+	delete(items[0], "run_id")
+	patched, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM side_question_requests WHERE session_key=?`, s.Parent.Key()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM side_question_sessions WHERE session_key=?`, s.Parent.Key()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = restoreSideQuestionSessions(ctx, tx, patched)
+	if err == nil {
+		t.Fatal("缺失非白名单必填列却恢复成功，fail-closed 失守")
+	}
+	if !strings.Contains(err.Error(), "run_id") {
+		t.Fatalf("失败原因不是缺失的 run_id 列（等于没有断到点上）: %v", err)
 	}
 }
 
@@ -320,11 +451,7 @@ func TestSideClearLateWritersAndDeletedParent(t *testing.T) {
 func TestSideTaskArchiveVersions(t *testing.T) {
 	for _, version := range []int{1, 2, 3} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
-			d, err := Open(testDSN(t))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer d.Close()
+			d := openTestDB(t)
 			if err := d.EnsureLLMRecordsTable(); err != nil {
 				t.Fatal(err)
 			}
@@ -335,10 +462,13 @@ func TestSideTaskArchiveVersions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() {
-				_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
-				_ = d.DeleteTask(task.ID)
-			}()
+			// 逆拓扑 + 检查错误：冷包行先删，再走产品的任务级联删除。
+			t.Cleanup(func() {
+				mustCleanup(t, d, `DELETE FROM task_archives WHERE task_id=?`, task.ID)
+				if err := d.DeleteTask(task.ID); err != nil {
+					t.Errorf("删除 fixture 任务 %d 失败: %v", task.ID, err)
+				}
+			})
 			iid, err := d.Exploration(task.ExplorationID).AddNode(KindIntent, map[string]any{"summary": "worker"}, 1, "paused", "planner", nil)
 			if err != nil {
 				t.Fatal(err)
@@ -376,9 +506,8 @@ func TestSideTaskArchiveVersions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = d.ClaimTaskArchiveJob(t.Context()); err != nil {
-				t.Fatal(err)
-			}
+			// 只领取自己那条记录：全局 FIFO 领取会先把**别人的**队首改成活跃态（RR-I03）。
+			claimOwnArchiveJob(t, t.Context(), d, job.ID, ArchiveQueued, Archiving)
 			archive, err := d.SnapshotTaskArchive(task.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -398,9 +527,7 @@ func TestSideTaskArchiveVersions(t *testing.T) {
 			if _, err = d.QueueTaskArchiveRestore(job.ID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err = d.ClaimTaskArchiveJob(t.Context()); err != nil {
-				t.Fatal(err)
-			}
+			claimOwnArchiveJob(t, t.Context(), d, job.ID, RestoreQueued, Restoring)
 			archive.FormatVersion = version
 			if version < 3 {
 				delete(archive.Tables, "side_question_sessions")

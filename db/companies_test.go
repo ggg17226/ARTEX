@@ -25,10 +25,17 @@ import (
 //  3. 真实 TiDB 集成用例 —— 未设置 ARTEX_TIDB_DSN 时诚实 skip，绝不算通过。
 // =====================================================================
 
-// cleanupCompany 反序清掉一家公司与其范围规则（TiDB 方言：? 占位符）。
-func cleanupCompany(d *DB, id int64) {
-	_, _ = d.Exec(`DELETE FROM company_scope WHERE company_id = ?`, id)
-	_, _ = d.Exec(`DELETE FROM companies WHERE id = ?`, id)
+// cleanupCompany 逆拓扑清掉一家（可多家）公司与其范围规则：先 company_scope（子），
+// 再 companies（父）。错误一律判红（审查 I-05：吞掉的清理失败就是下一轮的孤儿行/1062，
+// 也让"跑完查库证明终态干净"变成空话）。
+//
+// 调用方必须用 t.Cleanup（或先登记 Close 之后再 defer）—— 见 db_test.go 的 openTestDB。
+func cleanupCompany(t *testing.T, d *DB, ids ...int64) {
+	t.Helper()
+	for _, id := range ids {
+		mustCleanup(t, d, `DELETE FROM company_scope WHERE company_id = ?`, id)
+		mustCleanup(t, d, `DELETE FROM companies WHERE id = ?`, id)
+	}
 }
 
 // ── 1. 纯函数：范围三分支 canonical identity / hash（M09）───────────────────
@@ -532,9 +539,7 @@ func TestCompanies_RecomputeAttribution_UnmigratedDialect(t *testing.T) {
 		t.Fatalf("UpsertRootDomain failed: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := d.Exec("DELETE FROM assets WHERE id = ?", assetID); err != nil {
-			t.Errorf("cleanup asset failed: %v", err)
-		}
+		deleteAsset(t, d, assetID) // 先断开 link/anchor 引用，再删本体（TiDB 无外键）
 	})
 
 	// 竞争配置（根据 R4 现有精确匹配合约）：两家公司均添加了完全相同的 domain scope，但 cid < compCID；
@@ -596,7 +601,7 @@ func TestCompanies_DeleteCompanyNullifiesAssetsAndTasks(t *testing.T) {
 	if !created || cid <= 0 {
 		t.Fatalf("expected newly created company, got (%v, %d)", created, cid)
 	}
-	t.Cleanup(func() { cleanupCompany(d, cid) })
+	t.Cleanup(func() { cleanupCompany(t, d, cid) })
 
 	domain := fmt.Sprintf("cascade-%d.com", stamp)
 	if added, _, invalid, errs := d.Companies().AddScope(cid, []string{domain}, "test"); len(errs) > 0 || added != 1 || invalid != 0 {
@@ -607,9 +612,7 @@ func TestCompanies_DeleteCompanyNullifiesAssetsAndTasks(t *testing.T) {
 		"type": "root_domain", "domain": domain, "root_domain": domain, "company_id": cid,
 	})
 	t.Cleanup(func() {
-		if _, err := d.Exec("DELETE FROM assets WHERE id = ?", assetID); err != nil {
-			t.Errorf("cleanup asset failed: %v", err)
-		}
+		deleteAsset(t, d, assetID) // 先断开 link/anchor 引用，再删本体（TiDB 无外键）
 	})
 
 	// tasks：explorations 是 tasks 的唯一强前置（uq_tasks_exploration_id），
@@ -687,18 +690,14 @@ VALUES (?, ?, ?, ?, 'created', '', ?)`,
 // =====================================================================
 
 func TestCompanyUpsertAndGet(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, created, err := cs.UpsertCompany("Test Corp", "https://example.com/logo.png")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 	if !created {
 		t.Error("first upsert should report created=true")
 	}
@@ -754,11 +753,7 @@ SELECT COUNT(*) FROM companies WHERE id = ? AND (nkey_identity IS NULL OR nkey_h
 }
 
 func TestCreateCompanyWithScopeRejectsNormalizedDuplicate(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	stamp := time.Now().UnixNano()
@@ -769,7 +764,7 @@ func TestCreateCompanyWithScopeRejectsNormalizedDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 	if added != 1 || len(validationErrors) != 0 {
 		t.Fatalf("initial scope: added=%d errors=%v", added, validationErrors)
 	}
@@ -799,15 +794,11 @@ SELECT COUNT(*) FROM company_scope WHERE company_id = ?
 }
 
 func TestCreateCompanyWithScopeRollsBackOnScopeWriteFailure(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	name := fmt.Sprintf("Atomic Create %d", time.Now().UnixNano())
-	_, _, _, _, _, err = cs.CreateCompanyWithScope(name, "", []ScopeInput{
+	_, _, _, _, _, err := cs.CreateCompanyWithScope(name, "", []ScopeInput{
 		// utf8mb4 严格模式（STRICT_TRANS_TABLES）在写入非法 UTF-8 字节时返回 1366，
 		// 用来真实触发"企业行已插入、范围写入失败"这一回滚窗口。
 		{Kind: "keyword", Value: "invalid\xff-not-utf8"},
@@ -820,24 +811,20 @@ func TestCreateCompanyWithScopeRollsBackOnScopeWriteFailure(t *testing.T) {
 		t.Fatal(getErr)
 	}
 	if company != nil {
-		defer cleanupCompany(d, company.ID)
+		defer cleanupCompany(t, d, company.ID)
 		t.Fatalf("company row survived failed initial scope transaction: %+v", company)
 	}
 }
 
 func TestCompanyScope(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("ScopeTestCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 
 	lines := []string{"example.com", "192.168.1.0/24", "10.0.0.1"}
 	added, skipped, invalid, errs := cs.AddScope(id, lines, "test")
@@ -864,18 +851,14 @@ func TestCompanyScope(t *testing.T) {
 }
 
 func TestCompanyScopeInvalid(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("InvalidScopeCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 
 	// Explicitly typed TLD-only domains and overly broad CIDRs should be
 	// rejected. Untyped plain text is intentionally classified as a keyword.
@@ -893,18 +876,14 @@ func TestCompanyScopeInvalid(t *testing.T) {
 }
 
 func TestResolveCompany(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("ResolveCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 
 	cs.AddScope(id, []string{"resolve-test.io", "10.20.0.0/16"}, "test")
 
@@ -934,18 +913,14 @@ func TestResolveCompany(t *testing.T) {
 }
 
 func TestUpdateScope(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("UpdateScopeCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 
 	cs.AddScope(id, []string{"old-domain.com"}, "initial")
 
@@ -979,11 +954,7 @@ func TestUpdateScope(t *testing.T) {
 }
 
 func TestUpdateScopeRollsBackOnInsertFailure(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	name := fmt.Sprintf("Atomic Scope Update %d", time.Now().UnixNano())
@@ -991,7 +962,7 @@ func TestUpdateScopeRollsBackOnInsertFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 	oldDomain := fmt.Sprintf("old-%d.example", time.Now().UnixNano())
 	added, _, invalid, addErrors := cs.AddScopeInputs(id, []ScopeInput{{Kind: "domain", Value: oldDomain}}, "initial")
 	if added != 1 || invalid != 0 || len(addErrors) != 0 {
@@ -1014,11 +985,7 @@ func TestUpdateScopeRollsBackOnInsertFailure(t *testing.T) {
 }
 
 func TestDeleteCompany(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("DeleteMeCorp", "")
@@ -1046,11 +1013,7 @@ func TestDeleteCompany(t *testing.T) {
 }
 
 func TestDeleteCompanyWithAssetsDeletesBoth(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	stamp := time.Now().UnixNano()
@@ -1058,13 +1021,13 @@ func TestDeleteCompanyWithAssetsDeletesBoth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 	domain := fmt.Sprintf("delete-assets-%d.example", stamp)
 	assetID := assetRawInsert(t, d, map[string]any{
 		"type": "root_domain", "domain": domain, "root_domain": domain,
 		"company_id": id, "company_source": "explicit",
 	})
-	defer d.Exec(`DELETE FROM assets WHERE id = ?`, assetID) //nolint:errcheck
+	defer deleteAssetsByWhere(t, d, "WHERE id = ?", assetID)
 
 	deleted, err := cs.DeleteCompanyWithAssets(id, true)
 	if err != nil {
@@ -1090,11 +1053,7 @@ func TestDeleteCompanyWithAssetsDeletesBoth(t *testing.T) {
 }
 
 func TestRecomputeAttribution(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 	as := d.Assets()
 
@@ -1102,15 +1061,15 @@ func TestRecomputeAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
-	defer d.Exec(`DELETE FROM assets WHERE root_domain = 'attr-test.com'`) //nolint:errcheck
+	defer cleanupCompany(t, d, id)
+	defer deleteAssetsByWhere(t, d, "WHERE root_domain = 'attr-test.com'")
 
 	// insert asset before adding scope
 	assetID, err := as.UpsertRootDomain(UpsertRootDomainReq{Domain: "attr-test.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE id = ?`, assetID) //nolint:errcheck
+	defer deleteAssetsByWhere(t, d, "WHERE id = ?", assetID)
 
 	// asset should not be attributed yet
 	var companyID *int64
@@ -1132,18 +1091,14 @@ func TestRecomputeAttribution(t *testing.T) {
 }
 
 func TestListCompanies(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("ListTestCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, id)
+	defer cleanupCompany(t, d, id)
 
 	companies, err := cs.ListCompanies()
 	if err != nil {

@@ -34,12 +34,7 @@ func TestCompanyScopeInputsAcceptStructuredAndLegacyRules(t *testing.T) {
 }
 
 func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	stamp := time.Now().UnixNano()
 	name := fmt.Sprintf("HTTP Strict Company %d", stamp)
@@ -75,12 +70,7 @@ func TestCreateCompanyRejectsNormalizedDuplicateWithoutChangingScope(t *testing.
 }
 
 func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	companyID, _, err := m.pg.Companies().UpsertCompany(
 		fmt.Sprintf("Delete Company DTO %d", time.Now().UnixNano()), "",
@@ -94,7 +84,7 @@ func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer func() { mustDeleteTask(t, m, task.ID, DeleteTaskOptions{}) }()
 
 	s := &Server{m: m}
 	req := httptest.NewRequest(http.MethodDelete, "/api/companies/1", bytes.NewBufferString(`{}`))
@@ -117,12 +107,7 @@ func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 }
 
 func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := &Server{m: m}
 
 	t.Run("missing company is 404", func(t *testing.T) {
@@ -200,12 +185,7 @@ func TestCompanyScopeHTTPErrorClassificationAndBounds(t *testing.T) {
 }
 
 func TestListAssetsClassifiesValidationAndDatabaseErrors(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := &Server{m: m}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/assets?dsl=(", nil)
@@ -227,12 +207,7 @@ func TestListAssetsClassifiesValidationAndDatabaseErrors(t *testing.T) {
 }
 
 func TestDeleteCompanyRejectsBadJSONAndReportsMissing(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := &Server{m: m}
 
 	companyID, _, err := m.pg.Companies().UpsertCompany(
@@ -267,12 +242,7 @@ func TestDeleteCompanyRejectsBadJSONAndReportsMissing(t *testing.T) {
 }
 
 func TestCompanyScopeSystemFailureIsHTTP500(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := &Server{m: m}
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)

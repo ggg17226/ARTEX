@@ -20,7 +20,7 @@ func TestInterceptDetails(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE id=$1`, id) })
+		t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE id=?`, id) })
 		return id
 	}
 	t.Run("legacy and lazy payload", func(t *testing.T) {
@@ -115,14 +115,20 @@ func TestInterceptDetails(t *testing.T) {
 	t.Run("archive compatibility", func(t *testing.T) {
 		for _, legacy := range []bool{true, false} {
 			id := create(t, &InterceptAudit{InitialAction: "ask", ExecutionStatus: "not_started"})
-			var raw []byte
-			if err := d.QueryRow(`SELECT row_to_json(ip) FROM intercept_pending ip WHERE id=$1`, id).Scan(&raw); err != nil {
+			// 原 PG 写法 `SELECT row_to_json(ip)`：TiDB 侧借生产自己的冷包投影导出这一行，
+			// 形状与归档 manifest 完全一致（含 id，restore 侧按 id 复用物理主键）。
+			exported, _, err := archiveSelectProjection(d, "intercept_pending", "id = ?", []any{id}, "")
+			if err != nil {
 				t.Fatal(err)
 			}
-			var row map[string]any
-			if err := json.Unmarshal(raw, &row); err != nil {
+			var exportedRows []map[string]any
+			if err = json.Unmarshal(exported, &exportedRows); err != nil {
 				t.Fatal(err)
 			}
+			if len(exportedRows) != 1 {
+				t.Fatalf("导出行数=%d, want 1", len(exportedRows))
+			}
+			row := exportedRows[0]
 			if legacy {
 				delete(row, "audit")
 				delete(row, "decision_source")
@@ -133,7 +139,7 @@ func TestInterceptDetails(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback()
-			if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE id=$1`, id); err != nil {
+			if _, err := tx.Exec(`DELETE FROM intercept_pending WHERE id=?`, id); err != nil {
 				t.Fatal(err)
 			}
 			if err := restoreInterceptRows(tx, archived); err != nil {
@@ -141,7 +147,7 @@ func TestInterceptDetails(t *testing.T) {
 			}
 			var status, source string
 			var auditJSON []byte
-			if err := tx.QueryRow(`SELECT status, decision_source, audit FROM intercept_pending WHERE id=$1`, id).Scan(&status, &source, &auditJSON); err != nil {
+			if err := tx.QueryRow(`SELECT status, decision_source, audit FROM intercept_pending WHERE id=?`, id).Scan(&status, &source, &auditJSON); err != nil {
 				t.Fatal(err)
 			}
 			if status != "timeout" || source != "model" {

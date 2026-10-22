@@ -7,11 +7,46 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/notify"
 )
+
+// fanOutDeliveryHookFunc 是 fan-out 的测试屏障：在**已经读出启用渠道列表、
+// 还没有写入任何投递行**时被调用。
+//
+// 为什么需要它：投递行一旦插下去，channel_id 指向的就是"读渠道那一刻"的快照。
+// TiDB 基线没有外键，渠道被并发删除/停用都挡不住这条 INSERT，留下的就是列表
+// JOIN 看不见、队列与统计照算的孤儿投递。这段窗口在真机上只有几十微秒，
+// sleep 式并发测试既复现不稳、也证明不了什么，所以在这里留一道显式屏障，
+// 让测试能把"已读渠道 → 渠道被删并提交 → 继续插投递"钉成确定交错。
+//
+// 契约同 db 包其它测试钩子（见 TaskCascadeTestHookAfterSnapshot）：
+//   - 默认永远为 nil，生产路径只多一次 atomic.Pointer.Load；
+//   - 只允许 db 包内测试经 SetFanOutDeliveryTestHook 赋值；
+//   - 回调在 fan-out 事务内执行，回调自身不得再写这个库。
+type fanOutDeliveryHookFunc func(stage string, channelIDs []int64)
+
+var fanOutDeliveryHook atomic.Pointer[fanOutDeliveryHookFunc]
+
+// SetFanOutDeliveryTestHook 安装 fan-out 屏障；传 nil 卸载。
+func SetFanOutDeliveryTestHook(h fanOutDeliveryHookFunc) {
+	if h == nil {
+		fanOutDeliveryHook.Store(nil)
+		return
+	}
+	fanOutDeliveryHook.Store(&h)
+}
+
+// notifyFanOutDeliveryHook 是无钩子时零成本的调用点包装。
+func notifyFanOutDeliveryHook(stage string, channelIDs []int64) {
+	if hook := fanOutDeliveryHook.Load(); hook != nil {
+		(*hook)(stage, channelIDs)
+	}
+}
 
 // 本文件是 IM 推送的渠道配置与事件层。投递任务的领取与状态流转见
 // db/notification_delivery.go。
@@ -211,17 +246,85 @@ WHERE channel_id = ? AND state IN (?, ?)`,
 	})
 }
 
-// DeleteNotificationChannel 删除渠道。其投递历史随外键级联删除
+// DeleteNotificationChannel 删除渠道。其投递历史一并删除
 // （渠道配置都没了，历史无从解读）。
+//
+// PG 时代 notification_deliveries.channel_id 带 REFERENCES … ON DELETE CASCADE，
+// 级联由数据库顺带完成；TiDB 基线不建外键，这道级联必须在这里显式做掉，否则会
+// 留下指向已删渠道的孤儿投递，被 worker 继续领取、甚至继续往外发。
+// 两步放同一个事务：渠道删了、投递没删干净，就是那种要等下一轮 tick 才暴露的脏数据。
+//
+// 渠道行锁是与 fan-out 共同的串行点（审查 I-02）：这里**先锁渠道再删**。
+// FanOutPendingEvents 在 INSERT 投递行之前同样按 id 升序锁这批渠道行并持锁重验存活，
+// 两边同向排队，不会出现"fan-out 拿着旧渠道快照往已删渠道里插投递"的孤儿。
+// 统一全序：渠道行 → 该渠道的投递行（SetNotificationChannelEnabled 同序）；
+// fan-out 拿齐全部渠道锁之后才插投递，因此不存在"持着投递锁回头等渠道锁"的反向边。
 func (d *DB) DeleteNotificationChannel(ctx context.Context, id int64) error {
-	res, err := d.ExecContext(ctx, `DELETE FROM notification_channels WHERE id = ?`, id)
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // 任一步失败都整笔撤销，不留半删状态
+	// 先持渠道行锁：从这一刻起，任何 fan-out 的"插投递前重验"都必须排在本事务后面，
+	// 它要么看见还活着的渠道，要么看见本事务删完之后的结果，不存在中间态。
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_channels WHERE id = ? FOR UPDATE`, id).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotificationChannelNotFound
+		}
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM notification_channels WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		// 已持锁却删不到行：与"渠道不存在"同义（并发删除的赢家已先提交）。
 		return ErrNotificationChannelNotFound
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `DELETE FROM notification_deliveries WHERE channel_id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// lockNotificationChannelsForInsert 按 id 升序锁住本轮要写投递行的渠道，返回持锁后
+// **仍然存活且启用**的渠道集合（审查 I-02）。
+//
+// 为什么必须在 INSERT 之前锁着再看一眼：投递行里的 channel_id 记的是"读渠道那一刻"
+// 的快照。TiDB 基线没有外键，渠道被并发删除/停用都挡不住这条 INSERT，插下去就是
+// 指向已删渠道的孤儿 —— 列表 JOIN 渠道把它藏起来，投递队列与统计照算不误。
+//
+// 锁序与渠道删除/启停一致（渠道行按 id 升序 → 之后才碰投递行），两边不会反向。
+// 这里必须是 FOR UPDATE：TiDB 下锁定读才是当前读，返回缺行代表渠道已被删除，
+// 而本事务此前那句普通 SELECT 完全可能还看得见它。
+func lockNotificationChannelsForInsert(ctx context.Context, tx *sql.Tx, channelIDs []int64) (map[int64]bool, error) {
+	alive := make(map[int64]bool, len(channelIDs))
+	if len(channelIDs) == 0 {
+		return alive, nil
+	}
+	ph, args := markList(channelIDs)
+	rows, err := tx.QueryContext(ctx, `SELECT id, enabled FROM notification_channels
+WHERE id IN (`+ph+`) ORDER BY id FOR UPDATE`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id      int64
+			enabled bool
+		)
+		if err := rows.Scan(&id, &enabled); err != nil {
+			return nil, err
+		}
+		// 渠道还在但已被停用：本轮不给它补新行（停用者已把存量置为 skipped）。
+		alive[id] = enabled
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return alive, nil
 }
 
 // RecordNotificationEventTx 在调用方的事务里**尽力**写入一条推送事件。
@@ -309,7 +412,70 @@ func (d *DB) AddNotificationEvent(ctx context.Context, kind string, findingID in
 //
 // 未命中任何渠道的事件同样会被标记 fanned_out ——否则它会永远留在待分派集合里，
 // 每个 tick 被重扫一遍。
+//
+// 生产语义 = **全局 FIFO 有界领取**：本函数不认事件归属，队首是谁就分派谁。
+// 需要在共享库上"只分派自己那一条"的调用方（db 包内的竞态回归测试）请使用
+// fanOutOwnEventForChannels —— 它与本函数共用同一个核心，只是把领取与匹配
+// 钉死在自有行上（复审 RR-I02）。
 func (d *DB) FanOutPendingEvents(ctx context.Context, limit int) (eventCount, deliveryCount int, err error) {
+	return d.fanOutPendingEvents(ctx, limit, fanOutOwnership{})
+}
+
+// fanOutOwnership 把一次 fan-out 允许触碰的行钉死在调用方**自有**的那一批。
+//
+// 零值 = 生产语义（全局 FIFO 有界领取 + 全量启用渠道匹配），一个字节都不改变。
+type fanOutOwnership struct {
+	// eventID > 0 ⇒ 领取语句里追加 `AND id = ?`：这条 SELECT 在 SQL 层面就**不可能**
+	// 返回别人的事件行，因此后面所有 UPDATE fanned_out / INSERT delivery 都只可能
+	// 落在自有事件上。这是结构性的，不依赖"跑前先 COUNT 一次队列是干净的"。
+	eventID int64
+	// allowedChannelIDs 非空 ⇒ 匹配集合先被裁剪成这批渠道，INSERT 之前再逐个复核。
+	// 挡住的是另一条侵害路径：共享库里某个既有渠道在本用例运行期间把过滤条件改宽
+	// （on_status_change 打开 + 不限 vuln-class），自有事件仍会被投进别人家。
+	allowedChannelIDs []int64
+}
+
+// errFanOutClaimNotOwned 表示受控领取读到了不属于自有的行。
+//
+// 走到这里只有两种可能：SQL 绑定被后人改坏，或数据库行为异常。无论哪种，本函数
+// **在第一条 DML 之前**返回错误，外层 defer Rollback 把行锁原样归还 —— 别人的事件
+// 一个字节都不会被改写。
+var errFanOutClaimNotOwned = errors.New("fan-out 受控领取读到了非自有事件")
+
+// fanOutOwnEventForChannels 是**仅供 db 包内测试**使用的受控分派入口
+// （复审 RR-I02：跑前 COUNT、随机哨兵、事后断言都不是隔离权）。
+//
+// 与生产 FanOutPendingEvents 的区别只有"归属绑定"这一条，核心处理逻辑完全共用：
+//  1. 领取语句绑定 `AND id = eventID` ⇒ 领取集合在 SQL 层面就等于 {eventID}；
+//  2. 渠道集合裁剪到 channelIDs ⇒ 匹配与 INSERT 都不可能落到别人的渠道；
+//  3. 领取之后、任何 DML 之前再复核一次归属，读到非自有行立即带错误返回并回滚。
+//
+// 于是"替别人分派事件""把事件投进别人的渠道"这两条侵害路径都在**写入之前**
+// 就不成立，与归档侧 claimOwnArchiveJob 的"先核归属、后发 UPDATE"同一强度。
+func (d *DB) fanOutOwnEventForChannels(ctx context.Context, eventID int64, channelIDs []int64) (eventCount, deliveryCount int, err error) {
+	if eventID <= 0 {
+		return 0, 0, fmt.Errorf("受控 fan-out 需要正数事件 id，实际 %d", eventID)
+	}
+	allowed := make([]int64, 0, len(channelIDs))
+	seen := make(map[int64]struct{}, len(channelIDs))
+	for _, id := range channelIDs {
+		if id <= 0 {
+			return 0, 0, fmt.Errorf("受控 fan-out 的渠道 id 必须为正数，实际 %d", id)
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		allowed = append(allowed, id)
+	}
+	if len(allowed) == 0 {
+		return 0, 0, fmt.Errorf("受控 fan-out 至少需要一个自有渠道")
+	}
+	return d.fanOutPendingEvents(ctx, 1, fanOutOwnership{eventID: eventID, allowedChannelIDs: allowed})
+}
+
+// fanOutPendingEvents 是分派核心；ownership 零值时与生产 FanOutPendingEvents 完全同语义。
+func (d *DB) fanOutPendingEvents(ctx context.Context, limit int, ownership fanOutOwnership) (eventCount, deliveryCount int, err error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -323,8 +489,36 @@ func (d *DB) FanOutPendingEvents(ctx context.Context, limit int) (eventCount, de
 	if err != nil {
 		return 0, 0, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id, kind, finding_id, snapshot FROM notification_events
-WHERE NOT fanned_out ORDER BY id LIMIT ? FOR UPDATE`, limit)
+	// 受控模式：把"本轮可能收到投递的渠道"裁剪到自有集合（见 fanOutOwnership）。
+	// 裁剪在屏障**之前**，钩子里看到的渠道集合与真正要写的一致。
+	if owned := ownership.allowedChannelIDs; len(owned) > 0 {
+		allow := make(map[int64]struct{}, len(owned))
+		for _, id := range owned {
+			allow[id] = struct{}{}
+		}
+		kept := channels[:0]
+		for _, ch := range channels {
+			if _, ok := allow[ch.ID]; ok {
+				kept = append(kept, ch)
+			}
+		}
+		channels = kept
+	}
+	hookChannelIDs := make([]int64, 0, len(channels))
+	for _, ch := range channels {
+		hookChannelIDs = append(hookChannelIDs, ch.ID)
+	}
+	notifyFanOutDeliveryHook("channels_read", hookChannelIDs)
+	claimQuery := `SELECT id, kind, finding_id, snapshot FROM notification_events
+WHERE NOT fanned_out`
+	claimArgs := make([]any, 0, 2)
+	if ownership.eventID > 0 {
+		claimQuery += ` AND id = ?`
+		claimArgs = append(claimArgs, ownership.eventID)
+	}
+	claimQuery += ` ORDER BY id LIMIT ? FOR UPDATE`
+	claimArgs = append(claimArgs, limit)
+	rows, err := tx.QueryContext(ctx, claimQuery, claimArgs...)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -352,6 +546,15 @@ WHERE NOT fanned_out ORDER BY id LIMIT ? FOR UPDATE`, limit)
 	if err := rows.Err(); err != nil {
 		return 0, 0, err
 	}
+	// 受控领取的**事务内归属复核**（复审 RR-I02）：读到非自有事件就在第一条 DML
+	// 之前上抛，由 defer Rollback 归还行锁。这里没有"先标记再补救"的分支。
+	if ownership.eventID > 0 {
+		for _, ev := range events {
+			if ev.ID != ownership.eventID {
+				return 0, 0, fmt.Errorf("%w: id=%d，本调用只拥有 id=%d", errFanOutClaimNotOwned, ev.ID, ownership.eventID)
+			}
+		}
+	}
 	if len(events) == 0 {
 		return 0, 0, tx.Commit()
 	}
@@ -369,6 +572,51 @@ WHERE NOT fanned_out ORDER BY id LIMIT ? FOR UPDATE`, limit)
 			toInsert = append(toInsert, pending{eventID: events[i].ID, channelID: ch.ID})
 		}
 	}
+	// 投递行只能指向"此刻仍然存活"的渠道，因此 INSERT 之前按 id 升序锁住本轮要用的渠道行
+	// 并持锁重验（审查 I-02）：上面那份渠道列表是加锁之前的普通读，期间渠道可能被删除
+	// （DeleteNotificationChannel）或被停用（SetNotificationChannelEnabled），
+	// 两个写者都按同一把渠道行锁与本处排队。重验不通过的渠道整条丢弃，
+	// 绝不留下指向已删 / 已停渠道的孤儿投递。
+	//
+	// 锁序：本事务此刻已持有事件行锁，再按 id 升序取渠道行锁，最后才写投递行；
+	// 渠道侧的删除/启停都是「渠道行 → 投递行」，且从不碰事件行，两边不会反向。
+	if len(toInsert) > 0 {
+		refs := make([]int64, 0, len(toInsert))
+		seen := make(map[int64]struct{}, len(channels))
+		for _, p := range toInsert {
+			if _, ok := seen[p.channelID]; !ok {
+				seen[p.channelID] = struct{}{}
+				refs = append(refs, p.channelID)
+			}
+		}
+		sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+		alive, err := lockNotificationChannelsForInsert(ctx, tx, refs)
+		if err != nil {
+			return 0, 0, err
+		}
+		kept := toInsert[:0]
+		for _, p := range toInsert {
+			if alive[p.channelID] {
+				kept = append(kept, p)
+			}
+		}
+		toInsert = kept
+	}
+
+	// 受控模式的第二道复核（复审 RR-I02）：INSERT 之前逐条核对渠道归属，越界就在
+	// **第一条投递写入之前**上抛，由 defer Rollback 归还全部行锁。
+	if owned := ownership.allowedChannelIDs; len(owned) > 0 {
+		allow := make(map[int64]struct{}, len(owned))
+		for _, id := range owned {
+			allow[id] = struct{}{}
+		}
+		for _, p := range toInsert {
+			if _, ok := allow[p.channelID]; !ok {
+				return 0, 0, fmt.Errorf("fan-out 受控渠道集合越界：事件 %d 命中非自有渠道 %d", p.eventID, p.channelID)
+			}
+		}
+	}
+
 	if len(toInsert) > 0 {
 		var (
 			vals []string

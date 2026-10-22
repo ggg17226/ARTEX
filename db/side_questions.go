@@ -125,7 +125,11 @@ func (d *DB) SideSnapshot(ctx context.Context, key string) (*sidequestion.Snapsh
 	return &s, err
 }
 
-const sideCols = `id,ordinal,session_key,generation,client_id,question,answer,status,error,model,snapshot_at,created_at,sequence,usage,context_info`
+// sideCols 是 side_question_requests 的读取列清单。
+//
+// usage 在 MySQL/TiDB 里是保留关键字（SHOW GRANTS 的 USAGE），必须反引号包裹，
+// 否则语句解析直接 1064；context_info 不是关键字，保持原样。
+const sideCols = "id,ordinal,session_key,generation,client_id,question,answer,status,error,model,snapshot_at,created_at,sequence,`usage`,context_info"
 
 // ExistingSideRequest 取"同一会话当前代次 + 同一客户端请求 ID"的既有请求（幂等重试）。
 // 代次仍然用子查询现读：MySQL/TiDB 允许在 SELECT 的 WHERE 里对**另一张表**做子查询
@@ -263,8 +267,7 @@ func (d *DB) StartSideRequest(ctx context.Context, s sidequestion.Snapshot, clie
 	}
 	id := uuid.NewString()
 	identity, identityHash := canonicalIdentityPair(schema.SideQuestionRequestsIdentity(s.Parent.Key(), uint64(generation), clientID))
-	res, err := tx.ExecContext(ctx, `INSERT INTO side_question_requests(id,session_key,generation,client_id,identity,identity_hash,question,answer,status,error,model,usage,context_info,snapshot_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	res, err := tx.ExecContext(ctx, "INSERT INTO side_question_requests(id,session_key,generation,client_id,identity,identity_hash,question,answer,status,error,model,`usage`,context_info,snapshot_at)\nVALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		id, s.Parent.Key(), generation, clientID, identity, identityHash,
 		question, "", "running", "", string(model), "{}", "{}", s.CapturedAt)
 	if err != nil {
@@ -299,8 +302,7 @@ func (d *DB) UpdateSideRequest(ctx context.Context, e sidequestion.Exchange) (bo
 	if err != nil {
 		return false, err
 	}
-	r, err := d.ExecContext(ctx, `UPDATE side_question_requests r SET answer=?,status=?,error=?,sequence=?,usage=?,context_info=?
-WHERE r.id = ? AND r.status='running' AND r.sequence < ? AND EXISTS(SELECT 1 FROM side_question_sessions s WHERE s.session_key=r.session_key AND s.generation=r.generation)`,
+	r, err := d.ExecContext(ctx, "UPDATE side_question_requests r SET answer=?,status=?,error=?,sequence=?,`usage`=?,context_info=?\nWHERE r.id = ? AND r.status='running' AND r.sequence < ? AND EXISTS(SELECT 1 FROM side_question_sessions s WHERE s.session_key=r.session_key AND s.generation=r.generation)",
 		e.Answer, e.Status, e.Error, e.Sequence, string(usage), string(info), e.ID, e.Sequence)
 	if err != nil {
 		return false, err

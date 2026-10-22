@@ -22,18 +22,83 @@ func testDSN(t *testing.T) string {
 	return dsn
 }
 
-// TestOpenSeed 打开真实 TiDB：连接池 + UTC 探测 + 只读基线校验 + seed 必须全部走通，
-// 并且重复 Open 幂等（内置 agent 不会被插成两份）。
-func TestOpenSeed(t *testing.T) {
-	d, err := Open(testDSN(t))
+// openTestDB 是集成测试唯一的"打开真实 TiDB"入口（审查 M-02 / I-05）。
+//
+//   - DSN 缺失：testDSN 已经诚实 t.Skip，这里不会看到空 DSN；
+//   - DSN 已配置却打不开：属于环境违规，必须 t.Fatal 判红。绝不再退回
+//     `Open` 失败 → t.Skip 的假绿路径（那会让"基线缺失/连不上"整批用例静默跳过）；
+//   - 连接生命周期：Close 在**本函数内**登记为 t.Cleanup。因为是测试里最先登记的
+//     一条，它按 LIFO 最后执行 → 用例随后登记的任何清理都跑在还活着的连接池上。
+//     用例**不得**再写 `defer d.Close()`（审查 I-03/I-05：defer 先于 t.Cleanup 执行，
+//     清理会在已关闭的池上静默失败并留下孤儿行）。
+func openTestDB(t *testing.T) *DB {
+	t.Helper()
+	return openTestDBWithDSN(t, testDSN(t))
+}
+
+// openTestDBWithDSN 与 openTestDB 完全同一口径，只是 DSN 由调用方拿着：
+// 锁观测类用例还要把同一个 DSN 再开成"单连接池"的独立会话。
+func openTestDBWithDSN(t *testing.T, dsn string) *DB {
+	t.Helper()
+	d, err := Open(dsn)
 	if err != nil {
-		t.Fatalf("Open failed: %v", err)
+		t.Fatalf("ARTEX_TIDB_DSN 已配置但打开 TiDB 失败（环境违规，必须判红而不是 Skip）: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := d.Close(); err != nil {
-			t.Errorf("close DB failed: %v", err)
+			t.Errorf("关闭 TiDB 连接池失败: %v", err)
 		}
 	})
+	return d
+}
+
+// mustCleanup 执行一条 fixture 清理语句并检查错误（审查 I-05：清理失败不许吞错）。
+// 共享库里的孤儿行会把下一轮用例踩中，也让人无法用"跑完查库"证明终态干净。
+func mustCleanup(t *testing.T, d *DB, query string, args ...any) {
+	t.Helper()
+	if _, err := d.Exec(query, args...); err != nil {
+		t.Errorf("清理 fixture 失败: %q args=%v: %v", query, args, err)
+	}
+}
+
+// cleanupExploration 逆拓扑删掉一次 exploration fixture（审查 R-02：完整逆拓扑）。
+//
+// TiDB 基线不建外键（不会级联删除）：只删 explorations 父行，会把 exploration_edges /
+// exploration_anchors / activity / exploration_nodes 整批留在库里指向一条已经不存在的
+// exploration（审查 I-05：activity_page_test.go 原来正是这样，且吞掉了错误）。
+// 完整逆拓扑：exploration_edges + exploration_anchors → activity → exploration_nodes
+// → explorations。exploration_anchors 没有 exploration_id 列，只能经 exploration_nodes
+// JOIN 按归属删除（与产品侧 task_archives.go 的同表清理同一口径）。
+// 每一步都经 mustCleanup 判红，清理失败绝不再静默。
+func cleanupExploration(t *testing.T, d *DB, expID int64) {
+	t.Helper()
+	mustCleanup(t, d, `DELETE FROM exploration_edges WHERE exploration_id = ?`, expID)
+	mustCleanup(t, d, `DELETE anchor FROM exploration_anchors anchor
+ JOIN exploration_nodes node ON node.id = anchor.node_id
+ WHERE node.exploration_id = ?`, expID)
+	mustCleanup(t, d, `DELETE FROM activity WHERE exploration_id = ?`, expID)
+	mustCleanup(t, d, `DELETE FROM exploration_nodes WHERE exploration_id = ?`, expID)
+	mustCleanup(t, d, `DELETE FROM explorations WHERE id = ?`, expID)
+}
+
+// cleanupTask 用产品级级联删除（DeleteTask → DeleteTaskCascade）清掉一个任务 fixture
+// 并判红（审查 R-02-R：清理失败不许吞错、不许只删父行）。
+//
+// DeleteTask 保留共享资产（deleteAssets=false），但在同一事务里把任务与它的
+// exploration 子图（exploration_nodes/edges/anchors、activity、task_scope、
+// task_asset_links 等）按逆拓扑物理删净，并带防悬空断言——比测试手写的
+// `DELETE FROM tasks/explorations` 两句更完整，也天然免疫漏表。
+func cleanupTask(t *testing.T, d *DB, taskID int64) {
+	t.Helper()
+	if err := d.DeleteTask(taskID); err != nil {
+		t.Errorf("清理任务 fixture %d 失败: %v", taskID, err)
+	}
+}
+
+// TestOpenSeed 打开真实 TiDB：连接池 + UTC 探测 + 只读基线校验 + seed 必须全部走通，
+// 并且重复 Open 幂等（内置 agent 不会被插成两份）。
+func TestOpenSeed(t *testing.T) {
+	d := openTestDB(t) // Close 由 openTestDB 统一登记
 
 	wantAgents := len(builtinAgents)
 	agents := countRows(t, d, `SELECT COUNT(*) FROM agents WHERE builtin`)

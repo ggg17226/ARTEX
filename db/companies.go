@@ -362,11 +362,12 @@ func (s *CompanyStore) DeleteCompanyWithAssets(id int64, deleteAssets bool) (ass
 		return 0, err
 	}
 	if deleteAssets {
-		res, err := tx.ExecContext(ctx, `DELETE FROM assets WHERE company_id = ?`, id)
+		// TiDB 基线不建外键：裸 `DELETE FROM assets WHERE company_id = ?` 会把
+		// task_asset_links / exploration_anchors / finding_assets 里指向这些资产的行
+		// 留在库里成为悬空引用（对应任务的 DeleteTask 会因此永久判定成员漂移）。
+		// 这里复用资产侧唯一实现：同一事务内「锁候选 → 清引用 → 按 PK 删本体」。
+		assetsDeleted, err = deleteAssetsByCompanyIDTx(ctx, tx, id)
 		if err != nil {
-			return 0, err
-		}
-		if assetsDeleted, err = res.RowsAffected(); err != nil {
 			return 0, err
 		}
 	}
@@ -1105,6 +1106,10 @@ func (s *CompanyStore) ResolveCompanyWithICP(rootDomain, ipStr, icp string) (*in
 // resolveCompanyWithICP 复用资产侧那份 TiDB 归属解析（assets.go 的
 // resolveAssetCompany）：插入期解析与全局重算必须是同一套语义，
 // 两处各写一遍就等于给"资产已存在归属、重算却给出另一个答案"留口子。
+//
+// currentRead 固定 false：这两个入口都在 s.db 上以自动提交口径读，每条语句本身就是
+// 新鲜快照；加锁当前读只在 AssetStore 自己持有企业/范围写者屏障时才需要
+// （见 assets.go resolveCompanyWithICP 的注释）。
 func resolveCompanyWithICP(q assetScopeQueryer, rootDomain, ipStr, icp string) (*int64, error) {
-	return resolveAssetCompany(q, rootDomain, ipStr, icp)
+	return resolveAssetCompany(q, rootDomain, ipStr, icp, false)
 }

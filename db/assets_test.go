@@ -27,20 +27,27 @@ import (
 // testSetup opens a TiDB connection and returns both stores. Skips without ARTEX_TIDB_DSN.
 func testSetup(t *testing.T) (*DB, *AssetStore, *CompanyStore) {
 	t.Helper()
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("tidb unavailable (%v)", err)
-	}
+	d := openTestDB(t)
 	return d, d.Assets(), d.Companies()
 }
 
-// deleteAsset removes one v2 asset by id.
-func deleteAsset(d *DB, id int64) {
-	d.Exec(`DELETE FROM assets WHERE id = ?`, id)
+// deleteAsset removes one v2 asset by id. 清理失败必须判红：吞掉的失败就是下一轮
+// 用例踩到的孤儿资产（共享库尤其明显）。
+func deleteAsset(t *testing.T, d *DB, id int64) {
+	t.Helper()
+	deleteAssets(t, d, []int64{id})
 }
 
 // deleteAssets removes a batch of assets by id（TiDB 没有 `id = ANY($1::bigint[])`）。
-func deleteAssets(d *DB, ids []int64) {
+//
+// 与产品侧 DeleteByIDs 同一口径：**先断开从属引用，再删资产本体**。TiDB 基线不建
+// 外键，原来这条裸 `DELETE FROM assets` 会把 task_asset_links / exploration_anchors /
+// finding_assets 的行留在共享库里变成悬空引用 —— 用例是过了，但下一轮用例的
+// DeleteTask 会因为闭包"锁不到锚点引用的资产"判定成员漂移而莫名变红，
+// 共享库还会一路攒脏数据。
+func deleteAssets(t *testing.T, d *DB, ids []int64) {
+	t.Helper()
+	purgeAssetReferencesForTest(t, d, ids)
 	if len(ids) == 0 {
 		return
 	}
@@ -50,7 +57,46 @@ func deleteAssets(d *DB, ids []int64) {
 		ph[i] = "?"
 		args = append(args, id)
 	}
-	d.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(ph, ",")+")", args...) //nolint:errcheck
+	mustCleanup(t, d, "DELETE FROM assets WHERE id IN ("+strings.Join(ph, ",")+")", args...)
+}
+
+// purgeAssetReferencesForTest 按 asset_id 断开一批资产的全部从属引用行。
+// 清理顺序与产品实现（db/assets.go 的 assetReferenceTables）保持一致。
+func purgeAssetReferencesForTest(t *testing.T, d *DB, ids []int64) {
+	t.Helper()
+	if len(ids) == 0 {
+		return
+	}
+	ph := strings.Join(repeatQuestion(len(ids)), ",")
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	mustCleanup(t, d, "DELETE FROM exploration_anchors WHERE asset_id IN ("+ph+")", args...)
+	mustCleanup(t, d, "DELETE FROM finding_assets WHERE asset_id IN ("+ph+")", args...)
+	mustCleanup(t, d, "DELETE FROM task_asset_links WHERE asset_id IN ("+ph+")", args...)
+}
+
+// deleteAssetsByWhere 按 WHERE 条件删除资产，并**先断开这些资产的从属引用**。
+//
+// 测试清理里原来到处是一句 `DELETE FROM assets WHERE …`：TiDB 基线不建外键，这么删
+// 会把 task_asset_links / exploration_anchors / finding_assets 的行留在共享库里成为
+// 悬空引用 —— 用例自己过了，下一轮用例的 DeleteTask 却因为闭包"锁不到锚点引用的资产"
+// 判定成员漂移而变红，共享库还会一路攒脏数据（本轮清理工单实测到 136 link / 42 anchor）。
+// where 必须自带 "WHERE …" 前缀：没有条件的全表删除在这里直接判红。
+func deleteAssetsByWhere(t *testing.T, d *DB, where string, args ...any) {
+	t.Helper()
+	cond := strings.TrimSpace(where)
+	if cond == "" || !strings.HasPrefix(strings.ToUpper(cond), "WHERE") {
+		t.Fatalf("deleteAssetsByWhere: where 必须是以 WHERE 开头的非空条件，实得 %q", where)
+	}
+	// 用**子查询**定位资产，而不是 JOIN assets：调用方传的条件（`WHERE id = ?`、
+	// `WHERE url = ?` 等）本来是按 assets 单表写的，JOIN 进来后 id/url 这类两边都有的
+	// 列名会直接 Error 1052 列名歧义，把清理本身打爆。
+	for _, table := range []string{"exploration_anchors", "finding_assets", "task_asset_links"} {
+		mustCleanup(t, d, "DELETE FROM "+table+" WHERE asset_id IN (SELECT id FROM assets "+cond+")", args...)
+	}
+	mustCleanup(t, d, "DELETE FROM assets "+cond, args...)
 }
 
 // assetRawInsert 以 TiDB 方言直接写入一行受控资产并回读自增 PK。
@@ -96,25 +142,75 @@ func assetRawInsert(t *testing.T, d *DB, cols map[string]any) int64 {
 	return id
 }
 
+// assetTestTaskSet 造 n 个**真实存活**的父任务，给资产用例当 TaskID 桩。
+//
+// 资产的写入路径遵循写者协议：先 lockTaskRowAlive 校验父任务存在且未删除，
+// 随便填 1 / 2 / 90001 这种虚拟 id 会直接报
+// "task writer: parent task is missing or deleted: task N"（TiDB 基线不建外键，
+// 这道校验就是唯一把关点）。
+//
+// 清理为什么可以直接用调用方的连接：本文件的连接统一由 openTestDB 打开，Close 是
+// **最先登记**的 t.Cleanup，按 LIFO 最后执行，所以这里登记的清理一定跑在活连接上。
+// 审查 I-05 之前这里是另开一条连接，绕的是"用例里 `defer d.Close()` 先于 t.Cleanup
+// 跑完、清理在已关闭的池上静默失败并把任务留在库里"那个老问题；`defer d.Close()`
+// 全部撤掉之后，这条绕行就没有存在理由了（留着反而每次清理多开一个连接池）。
+func assetTestTaskSet(t *testing.T, d *DB, n int) []int64 {
+	t.Helper()
+	if n < 1 {
+		t.Fatalf("assetTestTaskSet: n=%d", n)
+	}
+	ids := make([]int64, 0, n)
+	for i := 0; i < n; i++ {
+		task, err := d.CreateTask(fmt.Sprintf("asset fixture task %d", i), "fixture", nil, 0, 0)
+		if err != nil {
+			t.Fatalf("创建父任务 %d 失败: %v", i, err)
+		}
+		ids = append(ids, task.ID)
+	}
+	t.Cleanup(func() {
+		for _, id := range ids {
+			// 用例自己的 defer 往往已经把资产行删了，但归属（task_asset_links 行、
+			// 别的资产 task_ids JSON 里挂着的这个 id）还留在库里。DeleteTask 的 lockorder
+			// 定位器会按归属逐个 FOR UPDATE 复核，找不到行就判定"成员漂移"、整笔回滚并
+			// 重试到次数耗尽。先把归属清干净，再走产品级级联删除。
+			if _, err := d.Exec(`DELETE FROM task_asset_links WHERE task_id = ?`, id); err != nil {
+				t.Errorf("清理任务 %d 的资产归属失败: %v", id, err)
+			}
+			deleteAssetsByWhere(t, d, `WHERE JSON_CONTAINS(COALESCE(task_ids,'[]'), CAST(? AS JSON))`, id)
+			if err := d.DeleteTask(id); err != nil {
+				t.Errorf("删除父任务 %d 失败: %v", id, err)
+			}
+		}
+	})
+	return ids
+}
+
+// assetTestTasks 是最常见的形状：两个互相独立的存活任务（先建、再改，或两个任务共享同一资产）。
+func assetTestTasks(t *testing.T, d *DB) (int64, int64) {
+	t.Helper()
+	ids := assetTestTaskSet(t, d, 2)
+	return ids[0], ids[1]
+}
+
 // =====================================================================
 // RootDomain
 // =====================================================================
 
 func TestUpsertRootDomain(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, taskB := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
-	id1, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "roottest.io", ICP: "A12345", TaskID: 1})
+	id1, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "roottest.io", ICP: "A12345", TaskID: taskA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id1)
+	defer deleteAsset(t, d, id1)
 	if id1 == 0 {
 		t.Fatal("expected non-zero id")
 	}
 
 	// upsert again — same id (dedup), ICP preserved
-	id2, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "roottest.io", TaskID: 2})
+	id2, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "roottest.io", TaskID: taskB})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +218,7 @@ func TestUpsertRootDomain(t *testing.T) {
 		t.Errorf("dedup failed: %d != %d", id2, id1)
 	}
 
-	// task_ids should now contain both 1 and 2
+	// task_ids 现在应同时挂着 taskA 与 taskB 两个任务
 	var taskIDs []byte
 	d.QueryRow(`SELECT task_ids FROM assets WHERE id = ?`, id1).Scan(&taskIDs)
 
@@ -135,8 +231,7 @@ func TestUpsertRootDomain(t *testing.T) {
 }
 
 func TestUpsertRootDomainEmpty(t *testing.T) {
-	d, av2, _ := testSetup(t)
-	defer d.Close()
+	_, av2, _ := testSetup(t)
 
 	_, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: ""})
 	if err == nil {
@@ -150,17 +245,17 @@ func TestUpsertRootDomainEmpty(t *testing.T) {
 
 func TestUpsertIP(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, taskB := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
 	id1, err := av2.UpsertIP(UpsertIPReq{
 		IP:        "192.168.10.5",
 		OpenPorts: []PortService{{Port: 22, Service: "ssh"}, {Port: 80, Service: "http"}},
-		TaskID:    1,
+		TaskID:    taskA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id1)
+	defer deleteAsset(t, d, id1)
 
 	// c_segment should be 192.168.10.0/24
 	var cseg *string
@@ -173,7 +268,7 @@ func TestUpsertIP(t *testing.T) {
 	id2, err := av2.UpsertIP(UpsertIPReq{
 		IP:        "192.168.10.5",
 		OpenPorts: []PortService{{Port: 443, Service: "https"}},
-		TaskID:    2,
+		TaskID:    taskB,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +287,6 @@ func TestUpsertIP(t *testing.T) {
 
 func TestUpsertIPBoundDomains(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id, err := av2.UpsertIP(UpsertIPReq{
 		IP:           "10.1.2.3",
@@ -201,7 +295,7 @@ func TestUpsertIPBoundDomains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id)
+	defer deleteAsset(t, d, id)
 
 	// append a second domain
 	id2, err := av2.UpsertIP(UpsertIPReq{
@@ -224,13 +318,12 @@ func TestUpsertIPBoundDomains(t *testing.T) {
 
 func TestAppendIPPort(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id, err := av2.UpsertIP(UpsertIPReq{IP: "10.9.8.7"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id)
+	defer deleteAsset(t, d, id)
 
 	if err := av2.AppendIPPort("10.9.8.7", 3306, "mysql"); err != nil {
 		t.Fatal(err)
@@ -252,19 +345,19 @@ func TestAppendIPPort(t *testing.T) {
 
 func TestUpsertSubdomain(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, _ := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
 	id, err := av2.UpsertSubdomain(UpsertSubdomainReq{
 		Domain:      "sub.subdtest.com",
 		RecordType:  "A",
 		RecordValue: []string{"1.2.3.4"},
 		ICP:         "B99",
-		TaskID:      1,
+		TaskID:      taskA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE domain IN ('sub.subdtest.com', 'subdtest.com') OR ip = '1.2.3.4'`)
+	defer deleteAssetsByWhere(t, d, "WHERE domain IN ('sub.subdtest.com', 'subdtest.com') OR ip = '1.2.3.4'")
 
 	if id == 0 {
 		t.Fatal("expected non-zero id")
@@ -294,13 +387,12 @@ func TestUpsertSubdomain(t *testing.T) {
 
 func TestUpsertSubdomainDedup(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id1, err := av2.UpsertSubdomain(UpsertSubdomainReq{Domain: "dedup.subdtest2.net", RecordType: "A", RecordValue: []string{"5.5.5.5"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE domain IN ('dedup.subdtest2.net', 'subdtest2.net') OR ip = '5.5.5.5'`)
+	defer deleteAssetsByWhere(t, d, "WHERE domain IN ('dedup.subdtest2.net', 'subdtest2.net') OR ip = '5.5.5.5'")
 
 	id2, err := av2.UpsertSubdomain(UpsertSubdomainReq{Domain: "dedup.subdtest2.net", RecordType: "A", RecordValue: []string{"5.5.5.5"}})
 	if err != nil {
@@ -317,13 +409,12 @@ func TestUpsertSubdomainDedup(t *testing.T) {
 
 func TestUpsertAppByBundle(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id1, err := av2.UpsertApp(UpsertAppReq{Name: "MyApp", BundleID: "com.example.myapp", Category: "tools"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id1)
+	defer deleteAsset(t, d, id1)
 
 	// dedup by bundle
 	id2, err := av2.UpsertApp(UpsertAppReq{Name: "MyApp Updated", BundleID: "com.example.myapp"})
@@ -337,13 +428,12 @@ func TestUpsertAppByBundle(t *testing.T) {
 
 func TestUpsertAppByName(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id1, err := av2.UpsertApp(UpsertAppReq{Name: "UniqueAppNoBundle", Category: "utility"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id1)
+	defer deleteAsset(t, d, id1)
 
 	id2, err := av2.UpsertApp(UpsertAppReq{Name: "UniqueAppNoBundle"})
 	if err != nil {
@@ -360,7 +450,7 @@ func TestUpsertAppByName(t *testing.T) {
 
 func TestUpsertHTTPService(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, taskB := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
 	sc := 200
 	cl := int64(1024)
@@ -370,12 +460,12 @@ func TestUpsertHTTPService(t *testing.T) {
 		StatusCode:    &sc,
 		ContentLength: &cl,
 		PageTitle:     "Test Site",
-		TaskID:        1,
+		TaskID:        taskA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE url = 'https://www.httptest.example.com' OR domain = 'www.httptest.example.com' OR domain = 'httptest.example.com'`)
+	defer deleteAssetsByWhere(t, d, "WHERE url = 'https://www.httptest.example.com' OR domain = 'www.httptest.example.com' OR domain = 'httptest.example.com'")
 
 	if id1 == 0 {
 		t.Fatal("expected non-zero id")
@@ -392,7 +482,7 @@ func TestUpsertHTTPService(t *testing.T) {
 	id2, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{
 		URL:          "https://www.httptest.example.com/",
 		Technologies: []string{"react", "webpack"},
-		TaskID:       2,
+		TaskID:       taskB,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -409,24 +499,24 @@ func TestUpsertHTTPService(t *testing.T) {
 
 func TestUpsertHTTPServiceAuthAppend(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, taskB := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
 	auth1 := []map[string]any{{"type": "basic", "username": "admin", "password": "pass"}}
 	id1, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{
 		URL:    "http://authtest.example.org/",
 		Auth:   auth1,
-		TaskID: 1,
+		TaskID: taskA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE url = 'http://authtest.example.org' OR domain IN ('authtest.example.org', 'example.org')`)
+	defer deleteAssetsByWhere(t, d, "WHERE url = 'http://authtest.example.org' OR domain IN ('authtest.example.org', 'example.org')")
 
 	auth2 := []map[string]any{{"type": "bearer", "token": "tok123"}}
 	id2, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{
 		URL:    "http://authtest.example.org/",
 		Auth:   auth2,
-		TaskID: 2,
+		TaskID: taskB,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -449,18 +539,18 @@ func TestUpsertHTTPServiceAuthAppend(t *testing.T) {
 
 func TestUpsertOtherService(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, _ := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
 	id1, err := av2.UpsertOtherService(UpsertOtherServiceReq{
 		IP:          "172.16.0.1",
 		Port:        22,
 		ServiceName: "ssh",
-		TaskID:      1,
+		TaskID:      taskA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE (type = 'service' AND service_name = 'ssh' AND ip = '172.16.0.1') OR (type = 'ip' AND ip = '172.16.0.1')`)
+	defer deleteAssetsByWhere(t, d, "WHERE (type = 'service' AND service_name = 'ssh' AND ip = '172.16.0.1') OR (type = 'ip' AND ip = '172.16.0.1')")
 
 	if id1 == 0 {
 		t.Fatal("expected non-zero id")
@@ -489,7 +579,6 @@ func TestUpsertOtherService(t *testing.T) {
 
 func TestUpsertOtherServiceAuthAppend(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	auth1 := []map[string]any{{"username": "admin", "password": "secret"}}
 	id1, err := av2.UpsertOtherService(UpsertOtherServiceReq{
@@ -501,7 +590,7 @@ func TestUpsertOtherServiceAuthAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE (type = 'service' AND ip = '10.5.5.5') OR (type = 'ip' AND ip = '10.5.5.5')`)
+	defer deleteAssetsByWhere(t, d, "WHERE (type = 'service' AND ip = '10.5.5.5') OR (type = 'ip' AND ip = '10.5.5.5')")
 
 	auth2 := []map[string]any{{"username": "root", "password": "root"}}
 	id2, err := av2.UpsertOtherService(UpsertOtherServiceReq{
@@ -527,19 +616,19 @@ func TestUpsertOtherServiceAuthAppend(t *testing.T) {
 
 func TestUpsertEndpoint(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	taskA, taskB := assetTestTasks(t, d) // 写者协议要求父任务真实存活
 
 	params1 := []map[string]any{{"location": "query", "name": "id", "value": "1"}}
 	id1, err := av2.UpsertEndpoint(UpsertEndpointReq{
 		URL:    "https://api.eptest.com/users?id=1",
 		Method: "GET",
 		Params: params1,
-		TaskID: 1,
+		TaskID: taskA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM assets WHERE url LIKE '%eptest.com%' OR domain IN ('api.eptest.com', 'eptest.com')`)
+	defer deleteAssetsByWhere(t, d, "WHERE url LIKE '%eptest.com%' OR domain IN ('api.eptest.com', 'eptest.com')")
 
 	if id1 == 0 {
 		t.Fatal("expected non-zero id")
@@ -550,7 +639,7 @@ func TestUpsertEndpoint(t *testing.T) {
 		URL:    "https://api.eptest.com/users?id=1",
 		Method: "GET",
 		Params: []map[string]any{{"location": "query", "name": "filter", "value": "active"}},
-		TaskID: 2,
+		TaskID: taskB,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -568,8 +657,7 @@ func TestUpsertEndpoint(t *testing.T) {
 }
 
 func TestUpsertEndpointRequiredFields(t *testing.T) {
-	d, av2, _ := testSetup(t)
-	defer d.Close()
+	_, av2, _ := testSetup(t)
 
 	_, err := av2.UpsertEndpoint(UpsertEndpointReq{URL: "", Method: "GET"})
 	if err == nil {
@@ -588,13 +676,12 @@ func TestUpsertEndpointRequiredFields(t *testing.T) {
 
 func TestQueryByType(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "querytest.example.net"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id)
+	defer deleteAsset(t, d, id)
 
 	assets, err := av2.QueryByType("root_domain", 10, 0)
 	if err != nil {
@@ -614,22 +701,21 @@ func TestQueryByType(t *testing.T) {
 // TestDeleteByTaskID: 独有资产被删,与其他任务共享的资产仅解除关联(保留),host 反查正确。
 func TestDeleteByTaskID(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
-	const taskA = int64(90001)
-	const taskB = int64(90002)
+	// 写者协议要求父任务真实存活：虚拟 id 会被 lockTaskRowAlive 直接拒掉。
+	taskA, taskB := assetTestTasks(t, d)
 	// solo:仅属 taskA
 	solo, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "solo-del.test", TaskID: taskA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, solo)
+	defer deleteAsset(t, d, solo)
 	// shared:先 taskA 再 taskB → task_ids={A,B}
 	shared, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "shared-del.test", TaskID: taskA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, shared)
+	defer deleteAsset(t, d, shared)
 	if _, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "shared-del.test", TaskID: taskB}); err != nil {
 		t.Fatal(err)
 	}
@@ -666,14 +752,14 @@ func TestDeleteByTaskID(t *testing.T) {
 
 func TestQueryByTask(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
-	const taskID = int64(99999)
+	// 写者协议要求父任务真实存活：虚拟 id 会被 lockTaskRowAlive 直接拒掉。
+	taskID, _ := assetTestTasks(t, d)
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "taskquery.net", TaskID: taskID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id)
+	defer deleteAsset(t, d, id)
 
 	assets, err := av2.QueryByTask(taskID, "", 10, 0)
 	if err != nil {
@@ -715,9 +801,9 @@ func TestQueryByTask(t *testing.T) {
 // 任务资产列表按页取,不再被固定条数截断:60 条资产用 25/页要能完整翻出来。
 func TestQueryByTaskPaging(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
-	const taskID = int64(99998)
+	// 写者协议要求父任务真实存活：虚拟 id 会被 lockTaskRowAlive 直接拒掉。
+	taskID, _ := assetTestTasks(t, d)
 	const n = 60
 	for i := 0; i < n; i++ {
 		id, err := av2.UpsertRootDomain(UpsertRootDomainReq{
@@ -727,7 +813,7 @@ func TestQueryByTaskPaging(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer deleteAsset(d, id)
+		defer deleteAsset(t, d, id)
 	}
 
 	total, err := av2.CountByTask(taskID, "root_domain")
@@ -759,13 +845,12 @@ func TestQueryByTaskPaging(t *testing.T) {
 
 func TestQueryByCompany(t *testing.T) {
 	d, av2, cs := testSetup(t)
-	defer d.Close()
 
 	companyID, _, err := cs.UpsertCompany("QueryByCompanyCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, companyID)
+	defer cleanupCompany(t, d, companyID)
 
 	cs.AddScope(companyID, []string{"qbc-test.io"}, "test")
 
@@ -773,7 +858,7 @@ func TestQueryByCompany(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id)
+	defer deleteAsset(t, d, id)
 
 	if err := cs.RecomputeAttribution(); err != nil {
 		t.Fatal(err)
@@ -814,20 +899,19 @@ func TestQueryByCompany(t *testing.T) {
 // 企业资产列表同样按页取,不被固定条数截断。
 func TestQueryByCompanyPaging(t *testing.T) {
 	d, av2, cs := testSetup(t)
-	defer d.Close()
 
 	companyID, _, err := cs.UpsertCompany("QueryByCompanyPagingCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, companyID)
+	defer cleanupCompany(t, d, companyID)
 
 	if added, _, _, errs := cs.AddScope(companyID, []string{"qbc-paging.io"}, "test"); added != 1 {
 		t.Fatalf("AddScope: added=%d, errors=%v", added, errs)
 	}
 
 	// UpsertSubdomain 会顺带建根域名资产,一并清掉
-	defer d.Exec(`DELETE FROM assets WHERE root_domain = 'qbc-paging.io'`)
+	defer deleteAssetsByWhere(t, d, "WHERE root_domain = 'qbc-paging.io'")
 
 	const n = 60
 	for i := 0; i < n; i++ {
@@ -867,13 +951,12 @@ func TestQueryByCompanyPaging(t *testing.T) {
 
 func TestCountsByType(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "counttest.example.biz"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, id)
+	defer deleteAsset(t, d, id)
 
 	counts, err := av2.CountsByType()
 	if err != nil {
@@ -890,13 +973,12 @@ func TestCountsByType(t *testing.T) {
 
 func TestCompanyAttributionAtInsertTime(t *testing.T) {
 	d, av2, cs := testSetup(t)
-	defer d.Close()
 
 	companyID, _, err := cs.UpsertCompany("InsertAttrCorp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanupCompany(d, companyID)
+	defer cleanupCompany(t, d, companyID)
 
 	cs.AddScope(companyID, []string{"insertattr.com"}, "test")
 
@@ -905,7 +987,7 @@ func TestCompanyAttributionAtInsertTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer deleteAsset(d, assetID)
+	defer deleteAsset(t, d, assetID)
 
 	var cid *int64
 	d.QueryRow(`SELECT company_id FROM assets WHERE id = ?`, assetID).Scan(&cid)
@@ -1043,7 +1125,6 @@ func TestNormalizeURL(t *testing.T) {
 
 func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 	d, assets, _ := testSetup(t)
-	defer d.Close()
 
 	stamp := time.Now().UnixNano()
 	taskID := stamp
@@ -1061,7 +1142,7 @@ func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 		})
 		ids = append(ids, id)
 	}
-	defer func() { deleteAssets(d, ids) }()
+	defer func() { deleteAssets(t, d, ids) }()
 
 	want := slices.Clone(ids)
 	slices.Reverse(want)
@@ -1096,7 +1177,6 @@ func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 // refuse a non-address, and the message must tell the caller how to fix it.
 func TestAssetIPRejectsHostname(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
 
 	hostname := "d63cd476.cdn.ucloud.com.cn"
 	cases := []struct {
@@ -1119,7 +1199,7 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 	for _, tc := range cases {
 		id, err := tc.call()
 		if !errors.Is(err, ErrAssetIPInvalid) {
-			deleteAsset(d, id)
+			deleteAsset(t, d, id)
 			t.Fatalf("%s: err=%v, want %v", tc.name, err, ErrAssetIPInvalid)
 		}
 		// The caller has to learn the remedy, not just that something was wrong.
@@ -1134,12 +1214,12 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty ip rejected: %v", err)
 	}
-	deleteAsset(d, id)
+	deleteAsset(t, d, id)
 	id, err = av2.UpsertIP(UpsertIPReq{IP: "203.0.113.7"})
 	if err != nil {
 		t.Fatalf("valid ip rejected: %v", err)
 	}
-	deleteAsset(d, id)
+	deleteAsset(t, d, id)
 }
 
 // TestQueryDSLInScopeMembership pins the agent-facing list_assets behavior: it
@@ -1150,7 +1230,6 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 // are excluded. Direct source tasks' scope is included.
 func TestQueryDSLInScopeMembership(t *testing.T) {
 	d, assets, _ := testSetup(t)
-	defer d.Close()
 
 	task, err := d.CreateTask("scope membership", "goal", nil, 0, 0)
 	if err != nil {
@@ -1229,8 +1308,8 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		deleteAssets(d, inScopeIDs)
-		deleteAssets(d, outIDs)
+		deleteAssets(t, d, inScopeIDs)
+		deleteAssets(t, d, outIDs)
 	})
 
 	got, err := assets.QueryDSLInScope(marker, "", task.ID, 50, 0)
@@ -1756,6 +1835,15 @@ func (e *assetMockEngine) handle(c assetMockCall) assetMockReply {
 	//     真实"link 是否被写"由测试侧的语句断言负责。
 	if strings.Contains(upper, "INTO TASK_ASSET_LINKS") {
 		return assetReplyInsert(1)
+	}
+
+	// 0.5 企业/范围写者屏障：SELECT id FROM companies ORDER BY id FOR UPDATE
+	//     不带 TaskID 的裸资产写入在自己的事务里**第一条**就是它（审查 I-03 复位的
+	//     产品契约：withCompanyScopeMutation）。mock 不模拟并发，只需要让"这把锁取到
+	//     了"这件事成立；返回内容与资产写入协议无关。顺序本身由
+	//     TestAssets_BareUpsertTakesCompanyScopeBarrierFirst 在替身上钉住。
+	if strings.Contains(upper, "FROM COMPANIES ORDER BY ID FOR UPDATE") {
+		return assetMockReply{rowsAffected: 1}
 	}
 
 	// 1) 公司归属解析：一律"无匹配企业"。
@@ -2510,6 +2598,48 @@ func TestAssets_HashCollision_RejectedWithZeroWrite(t *testing.T) {
 	}
 }
 
+// TestAssets_BareUpsertTakesCompanyScopeBarrierFirst 在离线替身上钉住 I-03 复位后的
+// **语句形状**：不带 TaskID 的裸资产写入，在自己的事务里必须先取企业/范围写者屏障
+// （`SELECT id FROM companies ORDER BY id FOR UPDATE`），且必须早于归属解析
+// （FROM company_scope）与 assets INSERT。
+//
+// 真机上"确实排在别人的锁后面"由 company_scope_consistency_test.go 的 tidb_trx 观测
+// 负责；这条负责另一半：屏障被删掉、或被挪到解析/写入之后，这里立刻红，而且不需要
+// 连库（离线路径同样跑）。
+func TestAssets_BareUpsertTakesCompanyScopeBarrierFirst(t *testing.T) {
+	domain := fmt.Sprintf("p08-barrier-%d.example.com", time.Now().UnixNano())
+	eng := newAssetMockEngine()
+	d := openAssetMockDB(t, eng)
+
+	if _, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain}); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := eng.snapshot()
+	indexOf := func(pred func(assetMockCall) bool) int {
+		for i, c := range calls {
+			if pred(c) {
+				return i
+			}
+		}
+		return -1
+	}
+	barrier := indexOf(func(c assetMockCall) bool {
+		return strings.Contains(c.Query, "FROM companies ORDER BY id FOR UPDATE")
+	})
+	if barrier < 0 {
+		t.Fatalf("裸资产写入没有取企业/范围写者屏障：%s", assetCallsString(calls))
+	}
+	if resolve := indexOf(func(c assetMockCall) bool {
+		return strings.Contains(c.Query, "FROM company_scope")
+	}); resolve >= 0 && resolve < barrier {
+		t.Fatalf("屏障必须早于归属解析（barrier=%d resolve=%d）：%s", barrier, resolve, assetCallsString(calls))
+	}
+	if write := indexOf(func(c assetMockCall) bool { return c.isInsert() }); write >= 0 && write < barrier {
+		t.Fatalf("屏障必须早于 assets 写入（barrier=%d insert=%d）：%s", barrier, write, assetCallsString(calls))
+	}
+}
+
 // =============================================================================
 // ④ Path B 并发 1062：本轮整体回滚 + 全新事务转 Path A 重演
 // =============================================================================
@@ -2751,10 +2881,7 @@ func TestAssets_BranchColumnActivation(t *testing.T) {
 // openLiveTiDB 打开真库并在测试结束时关闭。
 func openLiveTiDB(t *testing.T) *DB {
 	t.Helper()
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open tidb: %v", err)
-	}
+	d := openTestDB(t)
 	t.Cleanup(func() { _ = d.Close() })
 	return d
 }
@@ -2764,6 +2891,8 @@ func openLiveTiDB(t *testing.T) *DB {
 func TestAssets_PathAUpdate_IdentityImmutable_LiveTiDB(t *testing.T) {
 	d := openLiveTiDB(t)
 	assets := d.Assets()
+	// 写者协议要求父任务真实存活。
+	taskA, taskB := assetTestTasks(t, d)
 
 	domain := fmt.Sprintf("p08-live-%d.io", time.Now().UnixNano())
 	defer func() { _, _ = assets.DeleteByHost(domain) }()
@@ -2771,12 +2900,12 @@ func TestAssets_PathAUpdate_IdentityImmutable_LiveTiDB(t *testing.T) {
 	identity := schema.AssetsRootDomainIdentity(domain)
 	sum := schema.CanonicalHash(identity)
 
-	first, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: 9001})
+	first, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: taskA})
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
 	// 大小写变体必须命中同一 canonical 身份 → 同一 PK（Path A）。
-	second, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: strings.ToUpper(domain), TaskID: 9002})
+	second, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: strings.ToUpper(domain), TaskID: taskB})
 	if err != nil {
 		t.Fatalf("path A update: %v", err)
 	}
@@ -2793,7 +2922,7 @@ func TestAssets_PathAUpdate_IdentityImmutable_LiveTiDB(t *testing.T) {
 	if string(persisted) != string(identity) {
 		t.Errorf("identity columns must stay byte-exact after update")
 	}
-	for _, want := range []string{"9001", "9002"} {
+	for _, want := range []string{fmt.Sprint(taskA), fmt.Sprint(taskB)} {
 		if !strings.Contains(taskIDs, want) {
 			t.Errorf("task_ids must merge %s, got %s", want, taskIDs)
 		}
@@ -2827,7 +2956,7 @@ func TestAssets_HashCollision_RejectedWithZeroWrite_LiveTiDB(t *testing.T) {
 		"identity_root_domain": foreignKey,
 		"hash_root_domain":     sum[:],
 	})
-	t.Cleanup(func() { deleteAssets(d, []int64{forgedID}) })
+	t.Cleanup(func() { deleteAssets(t, d, []int64{forgedID}) })
 
 	_, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, ICP: "SHOULD-NOT-BE-WRITTEN"})
 	if !errors.Is(err, schema.ErrIdentityHashCollision) {
@@ -2867,6 +2996,8 @@ func TestAssets_PathB_ConcurrentSameDomain_1062PathARetry_LiveTiDB(t *testing.T)
 	sum := schema.CanonicalHash(schema.AssetsRootDomainIdentity(domain))
 
 	const workers = 8
+	// 每个 worker 一个真实存活任务：写者协议会校验父任务存在且未删除。
+	tasks := assetTestTaskSet(t, d, workers)
 	start := make(chan struct{})
 	ids := make([]int64, workers)
 	errs := make([]error, workers)
@@ -2876,7 +3007,7 @@ func TestAssets_PathB_ConcurrentSameDomain_1062PathARetry_LiveTiDB(t *testing.T)
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			id, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: int64(7000 + i)})
+			id, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: tasks[i]})
 			ids[i], errs[i] = id, err
 		}(i)
 	}
@@ -2909,6 +3040,8 @@ func TestAssets_PathB_ConcurrentSameDomain_1062PathARetry_LiveTiDB(t *testing.T)
 func TestAssets_RootDomainUpsert_VerifyBeforeUpdate_LiveTiDB(t *testing.T) {
 	d := openLiveTiDB(t)
 	assets := d.Assets()
+	// 写者协议要求父任务真实存活。
+	taskID, _ := assetTestTasks(t, d)
 
 	domain := fmt.Sprintf("p08-order-%d.io", time.Now().UnixNano())
 	defer func() { _, _ = assets.DeleteByHost(domain) }()
@@ -2919,7 +3052,7 @@ func TestAssets_RootDomainUpsert_VerifyBeforeUpdate_LiveTiDB(t *testing.T) {
 	}
 	// 第二次写入必须走"PK 行锁 → 写前仲裁 → 身份不可变 UPDATE"，任何一步失败都会
 	// 留下身份漂移或额外行。
-	id, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, ICP: "LIVE-ICP", TaskID: 4242})
+	id, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: domain, ICP: "LIVE-ICP", TaskID: taskID})
 	if err != nil {
 		t.Fatalf("verify-before-update: %v", err)
 	}

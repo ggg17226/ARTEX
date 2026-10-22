@@ -6,17 +6,15 @@ import (
 )
 
 func TestInheritedActivityReadsRequireTerminalIntent(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("source activity boundary", "source activity boundary")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM explorations WHERE id=$1`, expID) })
+	// 原先只删 explorations 父行且 `_, _ =` 吞错：本用例的 intent 节点与 4 条 activity
+	// 会永久残留（审查 R-02），改为完整逆拓扑清理并判红。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	store := d.Exploration(expID)
 	intentID, err := store.AddIntent(map[string]any{"summary": "source work"}, 1, nil, "planner")
 	if err != nil {
@@ -89,33 +87,29 @@ func TestInheritedActivityReadsRequireTerminalIntent(t *testing.T) {
 }
 
 func TestExplorationDirectSourceReadView(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	grand, err := d.CreateTask("grand source", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 创建即登记清理（审查 R-02-R：中途 t.Fatal 不得遗留已建任务），
+	// 并按 LIFO 逆创建序删除，替换原先 `_ = d.DeleteTask(...)` 的吞错批量清理。
+	t.Cleanup(func() { cleanupTask(t, d, grand.ID) })
 	source, err := d.CreateTaskWithOptions("direct source", "source goal", TaskCreateOptions{
 		SourceTaskIDs: []int64{grand.ID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupTask(t, d, source.ID) })
 	current, err := d.CreateTaskWithOptions("current", "current goal", TaskCreateOptions{
 		SourceTaskIDs: []int64{source.ID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = d.DeleteTask(current.ID)
-		_ = d.DeleteTask(source.ID)
-		_ = d.DeleteTask(grand.ID)
-	})
+	t.Cleanup(func() { cleanupTask(t, d, current.ID) })
 
 	grandStore := d.Exploration(grand.ExplorationID)
 	sourceStore := d.Exploration(source.ExplorationID)
@@ -311,25 +305,39 @@ func TestExplorationDirectSourceReadView(t *testing.T) {
 }
 
 func TestTaskAssetContextUsesDirectSourceScopeAndAnchors(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
+	assets := d.Assets()
+
+	// 审查 R-02-R：清理钩子先于任何创建登记，闭包在测试结束时读取切片的终值——
+	// 中途任一处 t.Fatal 都不会遗留已建任务/资产；清理顺序保持原口径
+	// （任务按逆创建序 current→source→grand，随后删本用例独占的资产行），全部判红。
+	var createdTaskIDs, createdAssetIDs []int64
+	t.Cleanup(func() {
+		for i := len(createdTaskIDs) - 1; i >= 0; i-- {
+			cleanupTask(t, d, createdTaskIDs[i])
+		}
+		if len(createdAssetIDs) > 0 {
+			if _, err := assets.DeleteByIDs(createdAssetIDs); err != nil {
+				t.Errorf("清理资产 fixture %v 失败: %v", createdAssetIDs, err)
+			}
+		}
+	})
 
 	grand, err := d.CreateTask("grand assets", "grand goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	createdTaskIDs = append(createdTaskIDs, grand.ID)
 	source, err := d.CreateTaskWithOptions("source assets", "source goal", TaskCreateOptions{SourceTaskIDs: []int64{grand.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	createdTaskIDs = append(createdTaskIDs, source.ID)
 	current, err := d.CreateTaskWithOptions("current assets", "current goal", TaskCreateOptions{SourceTaskIDs: []int64{source.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assets := d.Assets()
+	createdTaskIDs = append(createdTaskIDs, current.ID)
 	sourceTestedDomain := fmt.Sprintf("context-tested-%d.invalid", source.ID)
 	sourceUntestedDomain := fmt.Sprintf("context-untested-%d.invalid", source.ID)
 	sourceAnchoredOnlyDomain := fmt.Sprintf("context-anchor-only-%d.invalid", source.ID)
@@ -338,24 +346,22 @@ func TestTaskAssetContextUsesDirectSourceScopeAndAnchors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	createdAssetIDs = append(createdAssetIDs, sourceTestedID)
 	sourceUntestedID, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: sourceUntestedDomain, TaskID: source.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
+	createdAssetIDs = append(createdAssetIDs, sourceUntestedID)
 	sourceAnchoredOnlyID, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: sourceAnchoredOnlyDomain, TaskID: source.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
+	createdAssetIDs = append(createdAssetIDs, sourceAnchoredOnlyID)
 	grandID, err := assets.UpsertRootDomain(UpsertRootDomainReq{Domain: grandDomain, TaskID: grand.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = d.DeleteTask(current.ID)
-		_ = d.DeleteTask(source.ID)
-		_ = d.DeleteTask(grand.ID)
-		_, _ = assets.DeleteByIDs([]int64{sourceTestedID, sourceUntestedID, sourceAnchoredOnlyID, grandID})
-	})
+	createdAssetIDs = append(createdAssetIDs, grandID)
 	if _, err := assets.AddAgentScope(source.ID, "root_domain", sourceTestedDomain, "test", "agent"); err != nil {
 		t.Fatal(err)
 	}

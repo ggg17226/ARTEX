@@ -15,12 +15,7 @@ import (
 )
 
 func TestTaskTemplateHTTPCRUD(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
 	token, err := signJWT(s.jwtKey)
@@ -49,8 +44,13 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%v", code, created)
 	}
-	id := int64(created["id"].(float64))
-	t.Cleanup(func() { _, _ = m.pg.DeleteTaskTemplate(id) })
+	id := wireID(t, created["id"])
+	t.Cleanup(func() {
+		if _, err := m.pg.DeleteTaskTemplate(id); err != nil {
+			t.Errorf("清理任务模板 %d 失败: %v", id, err)
+		}
+		assertZero(t, m.pg, `SELECT COUNT(*) FROM task_templates WHERE id=?`, id)
+	})
 
 	code, duplicate := do(http.MethodPost, "/api/task-templates", map[string]any{
 		"name": "  " + name + "  ", "description": "other", "goal": "other",
@@ -80,18 +80,13 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 		t.Fatalf("list status=%d body=%v", code, listed)
 	}
 	code, deleted := do(http.MethodDelete, fmt.Sprintf("/api/task-templates/%d", id), nil)
-	if code != http.StatusOK || int64(deleted["deleted"].(float64)) != id {
+	if code != http.StatusOK || wireID(t, deleted["deleted"]) != id {
 		t.Fatalf("delete status=%d body=%v", code, deleted)
 	}
 }
 
 func TestConversationPatchReturnsPinState(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	conversation, err := m.pg.CreateConversation("mainagent", "pin through http", nil)
 	if err != nil {

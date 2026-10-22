@@ -37,18 +37,13 @@ func TestFindingPaginationParam(t *testing.T) {
 }
 
 func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	marker := fmt.Sprintf("__server_finding_groups_%d__", time.Now().UnixNano())
 	createdTaskIDs := []int64{}
 	defer func() {
-		_, _ = m.pg.Exec(`DELETE FROM findings WHERE vulnclass=$1`, marker)
+		_, _ = m.pg.Exec(`DELETE FROM findings WHERE vulnclass=?`, marker)
 		for _, taskID := range createdTaskIDs {
-			_ = m.pg.DeleteTask(taskID)
+			mustDeleteTaskRow(t, m, taskID)
 		}
 	}()
 
@@ -148,12 +143,7 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 }
 
 func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	task, err := m.CreateTask("deepen finding", "goal", nil, 0, 0)
 	if err != nil {
@@ -278,21 +268,18 @@ func TestDeepenFindingValidatesDescription(t *testing.T) {
 }
 
 func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("deepen rollback", "leave no orphan intent", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() {
-		_, _ = m.pg.Exec(`UPDATE tasks SET deleted_at=NULL WHERE id=$1`, taskID)
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
-	}()
+	t.Cleanup(func() {
+		if _, err := m.DeleteTask(task.ID, DeleteTaskOptions{}); err != nil {
+			t.Errorf("清理任务 %s 失败: %v", task.ID, err)
+		}
+		assertZero(t, m.pg, `SELECT COUNT(*) FROM tasks WHERE id=?`, taskID)
+	})
 	findingNodeID, err := task.Store.AddNode(db.KindFinding, map[string]any{"summary": "source"}, 5, "confirmed", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -306,15 +293,14 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var activitiesBefore int
-	if err := m.pg.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=$1`, task.Store.ID()).Scan(&activitiesBefore); err != nil {
+	if err := m.pg.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=?`, task.Store.ID()).Scan(&activitiesBefore); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.SetTaskStatus(task.ID, "done"); err != nil {
-		t.Fatal(err)
-	}
-	// Keep the in-memory handle and graph available while forcing the atomic
-	// admission UPDATE to reject this soft-deleted row.
-	if _, err := m.pg.Exec(`UPDATE tasks SET deleted_at=now() WHERE id=$1`, taskID); err != nil {
+	// TiDB 迁移后软删任务会被更早的 origin 校验拦成 409，走不到准入。这里改为直接
+	// 把持久化状态写成终态、**内存 handle 保持旧状态**：AddFindingFollowUpIntent 仍能
+	// 成功落 intent，随后的 compare-and-commit 准入必须失败，并把 intent 与审计活动
+	// 一起回滚——这正是本用例要保证的性质。
+	if err := m.pg.SetStatus(taskID, "done"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -337,7 +323,7 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 		t.Fatalf("failed admission left an orphan follow-up: before=%d after=%d nodes=%+v", len(before), len(after), after)
 	}
 	var activitiesAfter int
-	if err := m.pg.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=$1`, task.Store.ID()).Scan(&activitiesAfter); err != nil {
+	if err := m.pg.QueryRow(`SELECT COUNT(*) FROM activity WHERE exploration_id=?`, task.Store.ID()).Scan(&activitiesAfter); err != nil {
 		t.Fatal(err)
 	}
 	if activitiesAfter != activitiesBefore {

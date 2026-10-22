@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
@@ -17,16 +18,10 @@ import (
 // Exercise the actual SDK event -> hook -> execution -> result path. No real
 // model or command is used; the probe tool only returns a fixed string.
 func TestCaptureApprovalLifecycle(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	dsn, _, err := db.DSN()
-	if err != nil {
-		t.Skip("no test database configured")
-	}
-	d, err := db.Open(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
+	// 连库门控统一走 testDB：未配置数据源 → 诚实 Skip；配了却打不开 → 判红。
+	d := testDB(t)
+	// 本轮唯一标记：task_id 决定 intercept_pending 的归属，也是清理的唯一谓词。
+	tag := runTag(t)
 	ic := intercept.New(d)
 	priorTools, err := ic.GetEnabledTools()
 	if err != nil {
@@ -57,8 +52,8 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 				return intercept.Decision{Action: tc.action, Message: "probe review", ProfileID: 7}, nil
 			})
 			g := guard.NewWithInterceptor(ic)
-			taskID := "approval-lifecycle-" + tc.name
-			t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id=$1`, taskID) })
+			taskID := fmt.Sprintf("approval-%s-%s", tag, tc.name)
+			cleanupInterceptPending(t, d, taskID)
 			ctx := intercept.WithTaskContext(t.Context(), taskID, "test-agent", func(a db.Activity) {
 				if a.Kind != "intercept_request" || !tc.manual {
 					return

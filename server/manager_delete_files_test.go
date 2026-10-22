@@ -13,18 +13,13 @@ import (
 )
 
 func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{DeleteAssets: true})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{DeleteAssets: true})
 	})
 
 	host := fmt.Sprintf("seed-%s.example.test", task.ID)
@@ -172,25 +167,22 @@ func TestStageTaskFilesRollbackReportsRestoreFailure(t *testing.T) {
 }
 
 func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
 	dataDir := t.TempDir()
-	m, err := NewManager(dataDir, "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
+	m := newTestManagerIn(t, dataDir)
 
 	task, err := m.CreateTask("delete rollback", "delete rollback", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	taskID := mustTaskID(t, task.ID)
-	triggerName := fmt.Sprintf("test_fail_task_delete_%d", taskID)
-	functionName := triggerName + "_fn"
+	// 本用例的失败注入只关掉自己的 traffic 句柄（进程内对象），不会在共享 TiDB 上留下
+	// 任何库级对象；清理按精确主键删除任务并回读归零即可。
 	cleanupDB := func() {
-		_, _ = m.pg.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON tasks`, triggerName))
-		_, _ = m.pg.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, functionName))
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{DeleteAssets: true, DeleteTraffic: true, DeleteFiles: true})
+		m.traffic = nil
+		if _, err := m.DeleteTask(task.ID, DeleteTaskOptions{DeleteAssets: true, DeleteFiles: true}); err != nil {
+			t.Errorf("清理任务 %s 失败: %v", task.ID, err)
+		}
+		assertZero(t, m.pg, `SELECT COUNT(*) FROM tasks WHERE id=?`, taskID)
 	}
 	t.Cleanup(cleanupDB)
 
@@ -220,18 +212,18 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "1-0001", 1, host, "GET", "/", "https://"+host+"
 		t.Fatal(err)
 	}
 
-	if _, err := m.pg.Exec(fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $body$
-BEGIN RAISE EXCEPTION 'forced task delete failure'; END $body$`, functionName)); err != nil {
-		t.Fatal(err)
+	// 失败注入方式说明：这台 TiDB v8.5.8 实例不接受 CREATE TRIGGER（parser 直接
+	// 1064），拿不到 PG 时代那种"把 tasks DELETE 打断"的注入点。这里改在级联删除的
+	// **前置准备**阶段注入同一个失败：traffic 库一旦关闭，StageDeleteHostsExact 必然
+	// 报错，整条 cascade 连同事务一起失败，走的正是 manager 侧同一条
+	// rollbackTaskDelete 补偿路径 —— 被测不变量（数据库失败时已暂存的 task 文件与
+	// traffic 必须原样回来、任务行一行都不能少）与注入点无关。
+	if err := tr.Close(); err != nil {
+		t.Fatalf("关闭 traffic 句柄以注入级联失败: %v", err)
 	}
-	if _, err := m.pg.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE DELETE ON tasks
-FOR EACH ROW WHEN (OLD.id = %d) EXECUTE FUNCTION %s()`, triggerName, taskID, functionName)); err != nil {
-		t.Fatal(err)
-	}
-
 	_, err = m.DeleteTask(task.ID, DeleteTaskOptions{DeleteTraffic: true, DeleteFiles: true})
-	if err == nil || !strings.Contains(err.Error(), "forced task delete failure") {
-		t.Fatalf("delete err=%v, want injected PostgreSQL failure", err)
+	if err == nil {
+		t.Fatal("delete err=nil, want an injected cascade failure")
 	}
 	if got, err := m.pg.GetTask(taskID); err != nil || got == nil {
 		t.Fatalf("task row was lost after failed delete: task=%+v err=%v", got, err)
@@ -241,8 +233,14 @@ FOR EACH ROW WHEN (OLD.id = %d) EXECUTE FUNCTION %s()`, triggerName, taskID, fun
 	if got, err := os.ReadFile(trafficMarker); err != nil || string(got) != "original traffic" {
 		t.Fatalf("traffic tree was not restored: content=%q err=%v", got, err)
 	}
+	// 重新打开同一个 traffic 目录，确认失败的那次删除没有动过索引行。
+	reopened, err := traffic.Open(filepath.Join(dataDir, "traffic"), "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("重开 traffic: %v", err)
+	}
+	defer reopened.Close()
 	var trafficRows int
-	if err := tr.DB().QueryRow(`SELECT COUNT(*) FROM exchanges WHERE host=?`, host).Scan(&trafficRows); err != nil || trafficRows != 1 {
+	if err := reopened.DB().QueryRow(`SELECT COUNT(*) FROM exchanges WHERE host=?`, host).Scan(&trafficRows); err != nil || trafficRows != 1 {
 		t.Fatalf("traffic index was not restored: rows=%d err=%v", trafficRows, err)
 	}
 }

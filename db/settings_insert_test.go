@@ -11,11 +11,7 @@ import (
 // 可设"的保证必须落在唯一约束上，而不是上层的 if 判断：基线里 settings 的自然键是
 // uq_settings_key_hash（TEXT 不能直接建唯一索引，改由 key_hash 承载）。
 func TestInsertSettingIfAbsentDoesNotOverwrite(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB failed: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	// 用测试专属 key，绝不碰开发库里真实的 auth.password_hash。
 	key := fmt.Sprintf("test.insert_if_absent.%d", time.Now().UnixNano())

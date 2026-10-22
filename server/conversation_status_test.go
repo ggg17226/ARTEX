@@ -21,7 +21,7 @@ func TestConversationListRunningState(t *testing.T) {
 		clear(s.chatBusy)
 		s.chatMu.Unlock()
 		for _, id := range ids {
-			_, _ = s.m.pg.Exec(`DELETE FROM conversations WHERE id=$1`, id)
+			_, _ = s.m.pg.Exec(`DELETE FROM conversations WHERE id=?`, id)
 		}
 	})
 	check := func(want map[int64]bool) {

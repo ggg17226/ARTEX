@@ -1,29 +1,32 @@
 package db
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+)
 
 // TestProfileMaxTokensRoundTrip pins the output-cap columns through the whole
 // read/write surface: both column lists (list vs keyed loads) must carry them,
 // and an update must not drop them. A miscounted column list silently shifts
 // every later Scan target, so this is the test that catches it.
 func TestProfileMaxTokensRoundTrip(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
+	d := openTestDB(t)
 	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
 	// plain `defer d.Close()` would fire before them — the row-deleting cleanups
 	// would then run against a closed pool and silently leave test rows behind.
 	t.Cleanup(func() { d.Close() })
 
+	// llm_profiles 的 name 有唯一键（name_hash），共享库里名字必须每次运行都不同。
 	id, err := d.SaveProfile(&LLMProfile{
-		Name: "t-maxtok", Format: "openai", Model: "m", APIKey: "k",
+		Name:   fmt.Sprintf("t-maxtok-%d", time.Now().UnixNano()),
+		Format: "openai", Model: "m", APIKey: "k",
 		MaxTokens: 8192, MaxTokensField: "max_completion_tokens",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=?`, id) })
 
 	// Keyed single-row load (profileColsKey).
 	p, err := d.ProfileByID(id)
@@ -75,20 +78,20 @@ func TestProfileMaxTokensRoundTrip(t *testing.T) {
 // A profile saved without touching the new fields must read back as "no cap,
 // classic field name" — the pre-feature behaviour old rows also get.
 func TestProfileMaxTokensDefaults(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
+	d := openTestDB(t)
 	// Close via Cleanup, registered FIRST so it runs LAST: cleanups are LIFO, and a
 	// plain `defer d.Close()` would fire before them — the row-deleting cleanups
 	// would then run against a closed pool and silently leave test rows behind.
 	t.Cleanup(func() { d.Close() })
 
-	id, err := d.SaveProfile(&LLMProfile{Name: "t-maxtok-default", Format: "openai", Model: "m", APIKey: "k"})
+	id, err := d.SaveProfile(&LLMProfile{
+		Name:   fmt.Sprintf("t-maxtok-default-%d", time.Now().UnixNano()),
+		Format: "openai", Model: "m", APIKey: "k",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=?`, id) })
 
 	p, err := d.ProfileByID(id)
 	if err != nil || p == nil {

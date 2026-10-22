@@ -14,12 +14,7 @@ import (
 //
 // 这两个测试把 handler 的连接池关掉来制造读取失败，断言两处都 fail closed。
 func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	// 关掉池子，让后续 GetSetting 返回 error 而不是 sql.ErrNoRows。
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)
@@ -41,12 +36,7 @@ func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 }
 
 func TestAuthInitFailsClosedWhenDataSourceUnavailable(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}

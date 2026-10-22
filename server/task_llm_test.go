@@ -639,12 +639,7 @@ func TestTaskLLMStreamStopsWhenChainExhausted(t *testing.T) {
 }
 
 func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	profileID, err := m.pg.SaveProfile(&db.LLMProfile{
 		Name:   fmt.Sprintf("delete-quota-fallback-%d", time.Now().UnixNano()),
@@ -663,7 +658,7 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 		_ = m.pg.DeleteProfile(profileID)
 	})
 

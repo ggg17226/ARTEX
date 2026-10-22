@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1138,6 +1139,140 @@ func (m *Manager) SetTaskPaused(id string, paused bool) error {
 	return nil
 }
 
+// =====================================================================
+// 任务生命周期写事务（W5 任务四：原生 TiDB 8.5 方言）
+//
+// 旧实现是三条 `UPDATE … CASE … RETURNING` 单语句，TiDB 三条都不成立：没有
+// UPDATE … RETURNING、占位符是 `?` 而不是 `$n`；而「SET 表达式引用同语句里刚被
+// 改写过的列」这一写法在两家数据库里**求值口径相反**：
+//   - MySQL：SET 列表从左到右求值，后一个表达式读到前面已经赋值过的**新值**；
+//   - TiDB 8.5（含 8.5.8）：官方 UPDATE 文档 *MySQL compatibility* 明确写着相反
+//     结论 ——「TiDB always uses the original value of a column when evaluating
+//     expressions」（例：`UPDATE t SET a=a+1,b=a` 里 b 得到 1），即一律读**旧行**，
+//     与 PG 相同（同类未关闭 issue：pingcap/tidb#54038）。
+//
+// 原语句的 CASE 全部依赖旧列（queued_at/queue_mode 依赖旧 queued，queue_mode 还
+// 依赖旧 queue_mode），所以照抄成 MySQL 语法只有在「读旧值」的数据库下才与原语义
+// 一致，落到真实 MySQL 会静默改语义（queue_mode 读到刚写入的 queued）。把条件计算
+// 整体搬到 Go 端、按 FOR UPDATE 锁读的旧行算好之后，SQL 里不再有任何跨列引用，
+// MySQL（读新值）与 TiDB/PG（读旧值）两种口径下语义**都**正确，也不再依赖 RETURNING。
+// 统一改造机制：
+//
+//	BeginTx
+//	  → SELECT … FROM tasks WHERE id = ? AND deleted_at IS NULL FOR UPDATE  锁读当前读
+//	  → Go 端按旧行快照算出全部新值（CAS：status 必须仍是 expectedStatus）
+//	  → UPDATE tasks SET <每列只绑定自己那个算好的值>
+//	        WHERE id = ? AND deleted_at IS NULL [AND status = ?]
+//	  → 事务内回读落库值（本事务读得到自己的写入，替代 RETURNING）
+//	  → Commit
+//
+// 只有 Commit 返回 nil 才同步内存态；CAS 失败、执行失败、提交失败一律返回
+// error，内存保持原状态不变（调用方据此放弃本次准入 / 暂停）。
+//
+// 两条硬约束：
+//  1. 「当前时间」一律由 DB 侧 NOW(3) 产生（dbNow 哨兵），绝不在 Go 端取
+//     time.Now()：会话时区被强制成 UTC，DATETIME(3) 还会截断亚毫秒，用 Go 时钟
+//     写入再回读会给 queued_at 引入抖动 —— 而 queued_at 正是调度器的 FIFO 排序键；
+//  2. SET 的每个表达式只引用自己的绑定值，绝不引用同一语句里被改写过的列。这样
+//     无论数据库按 MySQL 的「左到右读新值」还是 TiDB/PG 的「一律读旧行」求值，
+//     落库结果都一样 —— 本机制的正确性不依赖任何一方的求值顺序。
+//
+// 锁 footprint 与旧的单条 UPDATE 一致：整个事务只锁 tasks 的同一行，不触碰其他
+// 表，因此不会新增锁序边（也不需要额外的业务门禁）。
+// =====================================================================
+
+// taskLifecycleRow 是生命周期写事务在行锁下读回的一行 tasks。
+type taskLifecycleRow struct {
+	status      string
+	paused      bool
+	queued      bool
+	queuedAt    sql.NullTime
+	queueMode   string
+	completedAt sql.NullTime
+	firstRunAt  sql.NullTime
+	deadlineAt  sql.NullTime
+}
+
+// taskLifecycleCols 是锁读与回读共用的列清单。COALESCE(queue_mode, 空串) 与旧 PG 版
+// 旧版 RETURNING 里的 COALESCE 同口径：历史行的 queue_mode 可能是 NULL。
+const taskLifecycleCols = `status, paused, queued, queued_at, COALESCE(queue_mode, ''),
+	       completed_at, first_run_at, deadline_at`
+
+// taskLifecycleQueryer 只用到 QueryRowContext，让锁读（FOR UPDATE 当前读）与回读
+// （同一事务内的普通读，靠 read-your-writes 看见自己的写入）共用一份列清单与 Scan 代码。
+type taskLifecycleQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func scanTaskLifecycle(ctx context.Context, q taskLifecycleQueryer, query string, id int64) (*taskLifecycleRow, error) {
+	row := new(taskLifecycleRow)
+	err := q.QueryRowContext(ctx, query, id).Scan(&row.status, &row.paused, &row.queued, &row.queuedAt,
+		&row.queueMode, &row.completedAt, &row.firstRunAt, &row.deadlineAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // 行不存在或已软删：与旧 UPDATE 的 WHERE 未命中同义
+	}
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// lockTaskLifecycle 以 SELECT … FOR UPDATE 锁住任务行并读回生命周期列。FOR UPDATE
+// 在 TiDB 下是当前读：别的事务刚提交的 status/paused/queued 一定看得见，CAS 才成立。
+func lockTaskLifecycle(ctx context.Context, tx *sql.Tx, id int64) (*taskLifecycleRow, error) {
+	return scanTaskLifecycle(ctx, tx, `SELECT `+taskLifecycleCols+`
+  FROM tasks WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, id)
+}
+
+// readTaskLifecycle 在同一事务内回读 UPDATE 的落库值，用来替代 PG 的 RETURNING：
+// 内存态拿到的必须是真正落库的那组 DATETIME(3)（NOW(3) 截断后的值）。
+//
+// 说明（措辞纪律）：这是**普通一致性读**，不是 FOR UPDATE 那种当前读。它之所以正确，
+// 是因为事务永远读得到自己的写入（read-your-writes），而 UPDATE 的 SET 已经覆盖了
+// taskLifecycleCols 的每一列 —— 回读列清单里没有「别人可能在本事务之后改过」的列。
+// 行锁此刻仍在手，别的事务无法插入其间。
+func readTaskLifecycle(ctx context.Context, tx *sql.Tx, id int64) (*taskLifecycleRow, error) {
+	return scanTaskLifecycle(ctx, tx, `SELECT `+taskLifecycleCols+`
+  FROM tasks WHERE id = ? AND deleted_at IS NULL`, id)
+}
+
+// dbNow 是 setColumns 的哨兵：该列的值必须由 DB 侧 NOW(3) 生成。
+type dbNow struct{}
+
+// setColumns 按「列 = 表达式」累积 UPDATE 的 SET 片段。nil → 字面 NULL，
+// dbNow{} → NOW(3)，其余按 "?" 绑定并按调用顺序收集 args —— 占位符顺序与 args
+// 顺序天然一致，语句里不残留任何 $n。
+type setColumns struct {
+	exprs []string
+	args  []any
+}
+
+func (s *setColumns) set(column string, value any) {
+	switch value.(type) {
+	case dbNow:
+		s.exprs = append(s.exprs, column+" = NOW(3)")
+	case nil:
+		s.exprs = append(s.exprs, column+" = NULL")
+	default:
+		s.exprs = append(s.exprs, column+" = ?")
+		s.args = append(s.args, value)
+	}
+}
+
+// query 拼出完整 UPDATE。WHERE 尾巴（含其占位符对应的参数）由调用方补齐。
+func (s *setColumns) query(table, where string, whereArgs ...any) (string, []any) {
+	return "UPDATE " + table + "\nSET " + strings.Join(s.exprs, ",\n    ") + "\nWHERE " + where,
+		append(s.args, whereArgs...)
+}
+
+// nullTimeArg 把 sql.NullTime 变成绑定值：无效 → NULL（原值写回时同样保持 NULL）。
+func nullTimeArg(v sql.NullTime) any {
+	if !v.Valid {
+		return nil
+	}
+	return v.Time
+}
+
 // ApplyTaskAdmission atomically commits the lifecycle fields controlled by the
 // concurrency scheduler. Keeping status, paused and queue metadata in one UPDATE
 // prevents a failed resume from leaving a task half-revived (for example running
@@ -1161,42 +1296,9 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 		mode = ""
 	}
 
-	var queuedAt, completedAt, firstRunAt, deadlineAt sql.NullTime
-	var committedMode string
-	err = m.pg.QueryRow(`UPDATE tasks
-	SET status=$2,
-	    completed_at=CASE
-	        WHEN $2 IN ('done','failed','timeout') THEN COALESCE(completed_at, now())
-	        ELSE NULL
-	    END,
-	    paused=false,
-	    queued=$3,
-	    queued_at=CASE
-	        WHEN NOT $3 THEN NULL
-	        WHEN $5 AND queued THEN COALESCE(queued_at, now())
-	        ELSE now()
-	    END,
-	    queue_mode=CASE
-	        WHEN NOT $3 THEN ''
-	        WHEN ($5 AND queued AND queue_mode='bootstrap') OR $4='bootstrap' THEN 'bootstrap'
-	        ELSE 'resume'
-	    END,
-	    first_run_at=CASE
-	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
-	        ELSE first_run_at
-	    END,
-	    deadline_at=CASE
-	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
-	        ELSE deadline_at
-	    END
-	WHERE id=$1 AND deleted_at IS NULL AND status=$6
-	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at`, n, status, queued, mode, preservePosition, expectedStatus).
-		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
-	}
+	committed, err := m.commitTaskAdmission(id, n, expectedStatus, status, queued, mode, preservePosition)
 	if err != nil {
-		return err
+		return err // 未提交：内存态一律不动，调用方看到本次准入失败
 	}
 
 	m.mu.Lock()
@@ -1204,28 +1306,116 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 		t.updateLifecycle(func(state *taskLifecycleState) {
 			state.Status = status
 			state.Paused = false
-			state.Queued = queued
-			state.QueueMode = committedMode
+			state.Queued = committed.queued
+			state.QueueMode = committed.queueMode
 			state.QueuedAt = 0
-			if queuedAt.Valid {
-				state.QueuedAt = queuedAt.Time.UnixNano()
+			if committed.queuedAt.Valid {
+				state.QueuedAt = committed.queuedAt.Time.UnixNano()
 			}
 			state.CompletedAt = 0
-			if completedAt.Valid {
-				state.CompletedAt = completedAt.Time.Unix()
+			if committed.completedAt.Valid {
+				state.CompletedAt = committed.completedAt.Time.Unix()
 			}
 			state.FirstRunAt = 0
-			if firstRunAt.Valid {
-				state.FirstRunAt = firstRunAt.Time.Unix()
+			if committed.firstRunAt.Valid {
+				state.FirstRunAt = committed.firstRunAt.Time.Unix()
 			}
 			state.DeadlineAt = 0
-			if deadlineAt.Valid {
-				state.DeadlineAt = deadlineAt.Time.Unix()
+			if committed.deadlineAt.Valid {
+				state.DeadlineAt = committed.deadlineAt.Time.Unix()
 			}
 		})
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+// commitTaskAdmission 在单个事务里提交准入命中的生命周期字段，并返回真正落库的那一行。
+// 计算口径逐条对齐旧 PG 版 CASE（CASE 里读到的 queued / queue_mode / completed_at
+// 都是**旧行**的值）：
+//
+//	status       → 新状态
+//	paused       → 一律清除（准入即用户可见的「继续跑」）
+//	completed_at → 进入终态：保留首次落戳，旧值为 NULL 才补 NOW(3)；离开终态：清空
+//	queued_at    → 不出队为 NULL；preservePosition 且旧行已在队则保住 FIFO 位置
+//	              （旧值为 NULL 时补 NOW(3)，等价 COALESCE(queued_at, now())）；
+//	              否则重新落尾
+//	queue_mode   → 不出队为空串；保住 bootstrap 仅当「保位 + 旧行在队 + 旧值 bootstrap」，
+//	              或本次请求就是 bootstrap；其余为 resume
+//	first_run_at /
+//	deadline_at  → 仅「从 timeout 复活到非终态」时清空，其余原值写回
+func (m *Manager) commitTaskAdmission(id string, n int64, expectedStatus, status string, queued bool, mode string, preservePosition bool) (*taskLifecycleRow, error) {
+	ctx := context.Background()
+	tx, err := m.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck // Commit 之后是 no-op
+
+	current, err := lockTaskLifecycle(ctx, tx, n)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.status != expectedStatus {
+		// 等价旧实现「UPDATE 的 WHERE 未命中 → sql.ErrNoRows」
+		return nil, fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
+	}
+
+	set := &setColumns{}
+	set.set("status", status)
+	set.set("paused", false)
+	set.set("queued", queued)
+	switch {
+	case !isTerminalStatus(status):
+		set.set("completed_at", nil)
+	case current.completedAt.Valid:
+		set.set("completed_at", nullTimeArg(current.completedAt))
+	default:
+		set.set("completed_at", dbNow{})
+	}
+	if queued {
+		if preservePosition && current.queued && current.queuedAt.Valid {
+			set.set("queued_at", nullTimeArg(current.queuedAt))
+		} else {
+			set.set("queued_at", dbNow{})
+		}
+		keepBootstrap := preservePosition && current.queued && current.queueMode == "bootstrap"
+		if keepBootstrap || mode == "bootstrap" {
+			set.set("queue_mode", "bootstrap")
+		} else {
+			set.set("queue_mode", "resume")
+		}
+	} else {
+		set.set("queued_at", nil)
+		set.set("queue_mode", "")
+	}
+	// 只有「从 timeout 复活到非终态」才重置执行时钟，其余一律原值写回。
+	if expectedStatus == "timeout" && !isTerminalStatus(status) {
+		set.set("first_run_at", nil)
+		set.set("deadline_at", nil)
+	} else {
+		set.set("first_run_at", nullTimeArg(current.firstRunAt))
+		set.set("deadline_at", nullTimeArg(current.deadlineAt))
+	}
+	set.set("updated_at", dbNow{})
+
+	query, args := set.query("tasks",
+		"id = ? AND deleted_at IS NULL AND status = ?", n, expectedStatus)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return nil, err
+	}
+	committed, err := readTaskLifecycle(ctx, tx, n)
+	if err != nil {
+		return nil, err
+	}
+	// 行锁内 WHERE 未命中理论不可达；真出现说明这一行不属于本次 CAS，必须判失败。
+	if committed == nil || committed.status != status {
+		return nil, fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return committed, nil
 }
 
 // ApplyTaskPause atomically removes a task from the admission queue and records
@@ -1239,15 +1429,7 @@ func (m *Manager) ApplyTaskPause(id string) error {
 	if err != nil {
 		return err
 	}
-	var mode string
-	err = m.pg.QueryRow(`UPDATE tasks
-		SET paused=true, queued=false, queued_at=NULL
-		WHERE id=$1 AND deleted_at IS NULL AND paused=false
-		  AND status NOT IN ('done','failed','timeout')
-		RETURNING COALESCE(queue_mode,'')`, n).Scan(&mode)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("task %s is unavailable for pause", id)
-	}
+	mode, err := m.commitTaskPause(id, n)
 	if err != nil {
 		return err
 	}
@@ -1264,6 +1446,40 @@ func (m *Manager) ApplyTaskPause(id string) error {
 	return nil
 }
 
+// commitTaskPause 在事务内锁定任务行，把用户暂停落库并返回**保留下来的** queue_mode。
+// 可暂停条件与旧 UPDATE 的 WHERE 同口径：行存在且未软删、paused=false、且尚未进入
+// 终态；任一不满足即「不可暂停」，与旧实现未命中返回 sql.ErrNoRows 等价。
+// queue_mode 不写回（原样保留），只清队列占用与 FIFO 位置。
+func (m *Manager) commitTaskPause(id string, n int64) (string, error) {
+	ctx := context.Background()
+	tx, err := m.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback() //nolint:errcheck // Commit 之后是 no-op
+
+	current, err := lockTaskLifecycle(ctx, tx, n)
+	if err != nil {
+		return "", err
+	}
+	if current == nil || current.paused || isTerminalStatus(current.status) {
+		return "", fmt.Errorf("task %s is unavailable for pause", id)
+	}
+	set := &setColumns{}
+	set.set("paused", true)
+	set.set("queued", false)
+	set.set("queued_at", nil)
+	set.set("updated_at", dbNow{})
+	query, args := set.query("tasks", "id = ? AND deleted_at IS NULL AND paused = ?", n, false)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return current.queueMode, nil
+}
+
 // EnqueueTask persists the concurrency hold and syncs the in-memory handle.
 func (m *Manager) EnqueueTask(id, mode string) error {
 	m.taskStateMu.Lock()
@@ -1275,20 +1491,7 @@ func (m *Manager) EnqueueTask(id, mode string) error {
 	if mode != "bootstrap" && mode != "resume" {
 		return fmt.Errorf("invalid queue mode %q", mode)
 	}
-	var queuedAt time.Time
-	var committedMode string
-	err = m.pg.QueryRow(`UPDATE tasks
-		SET queued=true,
-		    queued_at=CASE WHEN queued THEN COALESCE(queued_at, now()) ELSE now() END,
-		    queue_mode=CASE
-		        WHEN queue_mode='bootstrap' OR $2='bootstrap' THEN 'bootstrap'
-		        ELSE 'resume'
-		    END
-		WHERE id=$1 AND deleted_at IS NULL
-		RETURNING queued_at, queue_mode`, n, mode).Scan(&queuedAt, &committedMode)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("task %s is unavailable for enqueue", id)
-	}
+	queuedAt, committedMode, err := m.commitTaskEnqueue(id, n, mode)
 	if err != nil {
 		return err
 	}
@@ -1302,6 +1505,63 @@ func (m *Manager) EnqueueTask(id, mode string) error {
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+// commitTaskEnqueue 在事务内锁定任务行、占住并发额度，并返回落库后的
+// (queued_at, queue_mode)。口径对齐旧 PG 版 CASE（同样读旧行）：
+//
+//	queued_at  → 旧行已在队且有时间戳则保住 FIFO 位置，否则 NOW(3) 落尾
+//	             （等价 CASE WHEN queued THEN COALESCE(queued_at, now()) ELSE now()）
+//	queue_mode → 旧值或本次请求任一为 bootstrap 即 bootstrap，否则 resume
+func (m *Manager) commitTaskEnqueue(id string, n int64, mode string) (time.Time, string, error) {
+	ctx := context.Background()
+	tx, err := m.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	defer tx.Rollback() //nolint:errcheck // Commit 之后是 no-op
+
+	current, err := lockTaskLifecycle(ctx, tx, n)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	if current == nil {
+		return time.Time{}, "", fmt.Errorf("task %s is unavailable for enqueue", id)
+	}
+	set := &setColumns{}
+	set.set("queued", true)
+	if current.queued && current.queuedAt.Valid {
+		set.set("queued_at", nullTimeArg(current.queuedAt))
+	} else {
+		set.set("queued_at", dbNow{})
+	}
+	if current.queueMode == "bootstrap" || mode == "bootstrap" {
+		set.set("queue_mode", "bootstrap")
+	} else {
+		set.set("queue_mode", "resume")
+	}
+	set.set("updated_at", dbNow{})
+
+	query, args := set.query("tasks", "id = ? AND deleted_at IS NULL", n)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return time.Time{}, "", err
+	}
+	committed, err := readTaskLifecycle(ctx, tx, n)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	if committed == nil {
+		return time.Time{}, "", fmt.Errorf("task %s is unavailable for enqueue", id)
+	}
+	if !committed.queuedAt.Valid {
+		// enqueue 之后 queued_at 必然非空（要么保住旧值，要么 NOW(3)）；为空说明
+		// 这一行被别的写入方改坏，宁可判失败也不要把 0 当 FIFO 位置写进内存。
+		return time.Time{}, "", fmt.Errorf("task %s enqueue left queued_at NULL", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, "", err
+	}
+	return committed.queuedAt.Time, committed.queueMode, nil
 }
 
 // DequeueTask removes the concurrency hold. clearMode=false is used when a user

@@ -43,18 +43,9 @@ func restoreConcurrencySetting(t *testing.T, m *Manager) func() {
 }
 
 func TestAdmitAlreadyRunningTaskDoesNotQueueAfterLimitDecrease(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
-	oldEnabled, oldLimit := m.ConcurrencyLimit()
-	if oldLimit < 1 {
-		oldLimit = defaultConcurrencyLimit
-	}
-	defer m.SetConcurrency(oldEnabled, oldLimit)
+	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -68,8 +59,8 @@ func TestAdmitAlreadyRunningTaskDoesNotQueueAfterLimitDecrease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(running.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, running.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, holder.ID, DeleteTaskOptions{})
 	}()
 
 	s := newAdmissionTestServer(m, nil)
@@ -86,12 +77,7 @@ func TestAdmitAlreadyRunningTaskDoesNotQueueAfterLimitDecrease(t *testing.T) {
 }
 
 func TestAdmissionDoesNotOverwriteConcurrentTerminalStatus(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(false, defaultConcurrencyLimit); err != nil {
 		t.Fatal(err)
@@ -101,7 +87,7 @@ func TestAdmissionDoesNotOverwriteConcurrentTerminalStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer func() { mustDeleteTask(t, m, task.ID, DeleteTaskOptions{}) }()
 
 	// Model an Engine terminal commit after admission captured its in-memory
 	// snapshot but before the scheduler UPDATE. Direct DB use intentionally leaves
@@ -124,18 +110,9 @@ func TestAdmissionDoesNotOverwriteConcurrentTerminalStatus(t *testing.T) {
 }
 
 func TestAdmitKeepsQueuedBootstrapMode(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
-	oldEnabled, oldLimit := m.ConcurrencyLimit()
-	if oldLimit < 1 {
-		oldLimit = defaultConcurrencyLimit
-	}
-	defer m.SetConcurrency(oldEnabled, oldLimit)
+	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -149,8 +126,8 @@ func TestAdmitKeepsQueuedBootstrapMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(queuedTask.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, holder.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, queuedTask.ID, DeleteTaskOptions{})
 	}()
 	if err := m.EnqueueTask(queuedTask.ID, "bootstrap"); err != nil {
 		t.Fatal(err)
@@ -168,12 +145,7 @@ func TestAdmitKeepsQueuedBootstrapMode(t *testing.T) {
 }
 
 func TestTerminalTaskQueuedByAdmissionKeepsExecutionBarrier(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
@@ -188,8 +160,8 @@ func TestTerminalTaskQueuedByAdmissionKeepsExecutionBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, holder.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 	}()
 	intentID, err := task.Store.AddIntent(map[string]any{"summary": "follow-up"}, 10, nil, "human")
 	if err != nil {
@@ -217,12 +189,7 @@ func TestTerminalTaskQueuedByAdmissionKeepsExecutionBarrier(t *testing.T) {
 }
 
 func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
@@ -237,8 +204,8 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, holder.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 	}()
 	if _, err := m.StampTaskFirstRun(task.ID); err != nil {
 		t.Fatal(err)
@@ -304,12 +271,7 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 }
 
 func TestQueuedTaskCanPauseAndResumeAtFIFOTail(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
@@ -324,8 +286,8 @@ func TestQueuedTaskCanPauseAndResumeAtFIFOTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, holder.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 	}()
 	s := newAdmissionTestServer(m, nil)
 	if err := m.SetTaskPaused(task.ID, true); err != nil {
@@ -355,12 +317,7 @@ func TestQueuedTaskCanPauseAndResumeAtFIFOTail(t *testing.T) {
 }
 
 func TestReadyFIFOIsAdmittedBeforeNewTask(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 2); err != nil {
 		t.Fatal(err)
@@ -379,9 +336,9 @@ func TestReadyFIFOIsAdmittedBeforeNewTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(older.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(incoming.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, holder.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, older.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, incoming.ID, DeleteTaskOptions{})
 	}()
 	s := newAdmissionTestServer(m, nil)
 	if err := m.EnqueueTask(older.ID, "resume"); err != nil {
@@ -403,12 +360,7 @@ func TestReadyFIFOIsAdmittedBeforeNewTask(t *testing.T) {
 }
 
 func TestUnavailableTaskReleasesSlotForReadyQueue(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
@@ -423,8 +375,8 @@ func TestUnavailableTaskReleasesSlotForReadyQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(unavailable.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(ready.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, unavailable.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, ready.ID, DeleteTaskOptions{})
 	}()
 	s := newAdmissionTestServer(m, func(task *Task) bool { return task.ID != unavailable.ID })
 	s.engine.started.Store(unavailable.ID, true)
@@ -443,12 +395,7 @@ func TestUnavailableTaskReleasesSlotForReadyQueue(t *testing.T) {
 }
 
 func TestUnavailableTaskWaitsForActiveLLMCallBeforeParking(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	defer restoreConcurrencySetting(t, m)()
 	if err := m.SetConcurrency(true, 1); err != nil {
 		t.Fatal(err)
@@ -463,8 +410,8 @@ func TestUnavailableTaskWaitsForActiveLLMCallBeforeParking(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(active.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(waiting.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, active.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, waiting.ID, DeleteTaskOptions{})
 	}()
 
 	available := map[string]bool{active.ID: true, waiting.ID: true}
@@ -498,20 +445,15 @@ func TestUnavailableTaskWaitsForActiveLLMCallBeforeParking(t *testing.T) {
 }
 
 func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("failed rerun admission", "restore intent", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
 	defer func() {
-		_, _ = m.pg.Exec(`UPDATE tasks SET deleted_at=NULL WHERE id=$1`, taskID)
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		_, _ = m.pg.Exec(`UPDATE tasks SET deleted_at=NULL WHERE id=?`, taskID)
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 	}()
 	intentID, err := task.Store.AddIntent(map[string]any{"summary": "retry"}, 1, nil, "planner")
 	if err != nil {
@@ -523,7 +465,7 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 	if err := m.SetTaskStatus(task.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.pg.Exec(`UPDATE tasks SET deleted_at=now() WHERE id=$1`, taskID); err != nil {
+	if _, err := m.pg.Exec(`UPDATE tasks SET deleted_at=now() WHERE id=?`, taskID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -543,12 +485,7 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 }
 
 func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	profileID, err := m.pg.SaveProfile(&db.LLMProfile{
 		Name:   fmt.Sprintf("invalid-resolution-%d", time.Now().UnixNano()),
@@ -568,7 +505,7 @@ func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 		_ = m.pg.DeleteProfile(profileID)
 	}()
 
@@ -585,12 +522,7 @@ func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
 // An Agent binding outranks the task's LLM chain; roles left unbound keep using
 // the chain, so binding one role does not move the others off it.
 func TestTaskLLMResolutionPrefersAgentBindingOverTaskChain(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	stamp := time.Now().UnixNano()
 	boundID, err := m.pg.SaveProfile(&db.LLMProfile{
@@ -617,7 +549,7 @@ func TestTaskLLMResolutionPrefersAgentBindingOverTaskChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, task.ID, DeleteTaskOptions{})
 		_ = m.pg.SetAgentLLMProfile("worker", nil)
 		_ = m.pg.DeleteProfile(boundID)
 		_ = m.pg.DeleteProfile(chainID)
@@ -653,16 +585,15 @@ func TestTaskLLMResolutionPrefersAgentBindingOverTaskChain(t *testing.T) {
 }
 
 func TestTaskLLMResolutionReportsDatabaseFailure(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("resolution storage failure", "return server error", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 下面 Close() 之后 manager 再没有任何可用连接，常规清理删不动 —— 早先的写法就是
+	// 这样每轮泄漏一行 tasks。这里改成"另开一条连接在 Cleanup 里删"，既不泄漏，
+	// 也不改变本用例要断言的前提（调用时 task 行必须还在，否则只会得到 404）。
+	deferDeleteTask(t, task.ID)
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -699,12 +630,7 @@ func TestTokenStatsWithoutTaskReturnsStableShape(t *testing.T) {
 }
 
 func TestBatchControlLimitCountsDeduplicatedIDs(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	s := newAdmissionTestServer(m, nil)
 
 	request := func(handler http.HandlerFunc, path string, pathValues map[string]string, payload any) *httptest.ResponseRecorder {
@@ -774,17 +700,12 @@ func TestBatchControlLimitCountsDeduplicatedIDs(t *testing.T) {
 }
 
 func TestPauseTaskToolPersistsAndDequeuesTask(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("orchestrated pause", "persist queued pause", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer func() { mustDeleteTask(t, m, task.ID, DeleteTaskOptions{}) }()
 	if err := m.EnqueueTask(task.ID, "bootstrap"); err != nil {
 		t.Fatal(err)
 	}
@@ -811,17 +732,12 @@ func TestPauseTaskToolPersistsAndDequeuesTask(t *testing.T) {
 }
 
 func TestPauseTaskToolUsesOrchestratorCancellationCause(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("orchestrated pause cause", "keep audit reason", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer func() { mustDeleteTask(t, m, task.ID, DeleteTaskOptions{}) }()
 
 	s := newAdmissionTestServer(m, nil)
 	execCtx := s.engine.execContextFor(context.Background(), task.ID)

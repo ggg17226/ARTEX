@@ -6,17 +6,13 @@ import "testing"
 // for the SSE remediation: Main/Plan/Worker filtering, before-cursor paging without
 // gaps/overlap, hasMore, and the task-level snapshot cursor. Mirrors docs §11.1.
 func TestActivityPageSessions(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("test", "分页历史")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	es := d.Exploration(expID)
 
 	intentA, err := es.AddIntent(map[string]any{"summary": "intent A"}, 5, nil, "planner")
@@ -127,17 +123,13 @@ func TestActivityPageSessions(t *testing.T) {
 // TestListByKindPage covers the paged worker(intent) list that lets the session list
 // reach past the old fixed 300 cap (docs §8 / §11.1 item 10).
 func TestListByKindPage(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	expID, err := d.CreateExploration("test", "意图分页")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	es := d.Exploration(expID)
 
 	const total = 25

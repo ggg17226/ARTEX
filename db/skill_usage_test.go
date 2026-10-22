@@ -9,18 +9,14 @@ import (
 // and the recent-call list. Rows are namespaced by a unique skill name so the
 // shared dev DB stays usable and the test cleans up after itself.
 func TestSkillUsageLedger(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	const (
 		skillA  = "zz-test-skill-a"
 		missing = "zz-test-skill-missing"
 	)
 	cleanup := func() {
-		_, _ = d.Exec(`DELETE FROM skill_usage WHERE skill IN ($1,$2)`, skillA, missing)
+		_, _ = d.Exec(`DELETE FROM skill_usage WHERE skill IN (?,?)`, skillA, missing)
 	}
 	cleanup()
 	defer cleanup()

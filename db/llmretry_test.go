@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -10,24 +11,23 @@ import (
 // columns at once. Also pins the "empty api key on update keeps the row usable"
 // path, since that UPDATE has its own parameter numbering.
 func TestProfileRetryRoundTrip(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	want := RetryOverride{
 		Connect: RetryRule{Attempts: 5, IntervalMS: 2000},
 		Empty:   RetryRule{Attempts: -1},
 		Stream:  RetryRule{IntervalMS: 250},
 	}
+	// 名字必须每次运行都不同：llm_profiles 上 name 有唯一键（name_hash），
+	// 共享库里第二次运行撞 1062。
+	name := fmt.Sprintf("t-retry-roundtrip-%d", time.Now().UnixNano())
 	id, err := d.SaveProfile(&LLMProfile{
-		Name: "t-retry-roundtrip", Format: "openai", Model: "m", APIKey: "k", Retry: want,
+		Name: name, Format: "openai", Model: "m", APIKey: "k", Retry: want,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+	t.Cleanup(func() { mustCleanup(t, d, `DELETE FROM llm_profiles WHERE id=?`, id) })
 
 	got, err := d.ProfileByID(id)
 	if err != nil || got == nil {
@@ -67,20 +67,17 @@ func TestProfileRetryRoundTrip(t *testing.T) {
 // Out-of-range values are clamped on the way in, so the DB CHECK constraint is
 // never what the user hears about.
 func TestProfileRetryClampedOnSave(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	id, err := d.SaveProfile(&LLMProfile{
-		Name: "t-retry-clamp", Format: "openai", Model: "m", APIKey: "k",
+		Name:   fmt.Sprintf("t-retry-clamp-%d", time.Now().UnixNano()),
+		Format: "openai", Model: "m", APIKey: "k",
 		Retry: RetryOverride{Connect: RetryRule{Attempts: -99, IntervalMS: -5}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+	t.Cleanup(func() { mustCleanup(t, d, `DELETE FROM llm_profiles WHERE id=?`, id) })
 	got, err := d.ProfileByID(id)
 	if err != nil || got == nil {
 		t.Fatalf("ProfileByID: %v", err)
@@ -93,21 +90,21 @@ func TestProfileRetryClampedOnSave(t *testing.T) {
 // The global policy round-trips through settings, and an unset key reads back as
 // "everything on its built-in default".
 func TestLLMRetryPolicyRoundTrip(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	before, hadBefore, err := d.GetSetting(settingLLMRetryPolicy)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 全局 settings 行必须原样还回去：这台库里跑的是真实业务数据，
+	// 恢复失败要判红（吞错等于把策略永久留在测试写进去的值上）。
 	t.Cleanup(func() {
 		if hadBefore {
-			d.SetSetting(settingLLMRetryPolicy, before)
+			if err := d.SetSetting(settingLLMRetryPolicy, before); err != nil {
+				t.Errorf("恢复 %s 失败: %v", settingLLMRetryPolicy, err)
+			}
 		} else {
-			d.Exec(`DELETE FROM settings WHERE key=$1`, settingLLMRetryPolicy)
+			mustCleanup(t, d, "DELETE FROM settings WHERE `key`=?", settingLLMRetryPolicy)
 		}
 	})
 
@@ -136,7 +133,7 @@ func TestLLMRetryPolicyRoundTrip(t *testing.T) {
 	}
 
 	// 键不存在 = 全默认。
-	if _, err := d.Exec(`DELETE FROM settings WHERE key=$1`, settingLLMRetryPolicy); err != nil {
+	if _, err := d.Exec("DELETE FROM settings WHERE `key`=?", settingLLMRetryPolicy); err != nil {
 		t.Fatal(err)
 	}
 	if got := d.LLMRetryPolicy(); got != (LLMRetryPolicy{}) {

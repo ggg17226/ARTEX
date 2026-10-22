@@ -141,11 +141,21 @@ func TestClosureTaskEndToEndVerification(t *testing.T) {
 	if audit.EntitiesDeleted["exploration_nodes"] != 1 {
 		t.Fatalf("expected 1 node deleted, got %d", audit.EntitiesDeleted["exploration_nodes"])
 	}
-	if audit.EntitiesUpdated["findings.node_id"] != 1 {
-		t.Fatalf("expected 1 finding.node_id updated to null, got %d", audit.EntitiesUpdated["findings.node_id"])
+	// 同一行既要置空 task_id 又要置空 node_id 时，级联执行器**只发一条 UPDATE**
+	// （splitFindingNullify：两条重叠 UPDATE 的先后值不可预期），审计因此把这一行
+	// 记在合并键 findings.task_id+node_id 下，而不是两个单列键各记一次。
+	// 这里既核对合并键的计数，也直接回读那一行确认两列真的都为 NULL。
+	if audit.EntitiesUpdated["findings.task_id+node_id"] != 1 {
+		t.Fatalf("expected 1 finding nullified on both columns, got %d (%v)",
+			audit.EntitiesUpdated["findings.task_id+node_id"], audit.EntitiesUpdated)
 	}
-	if audit.EntitiesUpdated["findings.task_id"] != 1 {
-		t.Fatalf("expected 1 finding.task_id updated to null, got %d", audit.EntitiesUpdated["findings.task_id"])
+	var nullColumns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM findings
+		WHERE id = ? AND task_id IS NULL AND node_id IS NULL`, findingIDInt).Scan(&nullColumns); err != nil {
+		t.Fatalf("回读 findings 失败: %v", err)
+	}
+	if nullColumns != 1 {
+		t.Fatalf("finding %d 的 task_id/node_id 未双双置空", findingIDInt)
 	}
 
 	// 4. 断言全库零孤儿

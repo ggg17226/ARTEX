@@ -19,10 +19,7 @@ import (
 // Deliberately does NOT touch is_default — flipping the active profile would be a
 // side effect on the shared dev database.
 func TestPoolProfilesOrder(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB failed: %v", err)
-	}
+	d := openTestDB(t)
 	t.Cleanup(func() {
 		if err := d.Close(); err != nil {
 			t.Errorf("close DB failed: %v", err)
@@ -86,10 +83,7 @@ func TestDeleteProfileContextHonorsCancellation(t *testing.T) {
 }
 
 func TestConfigStores(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB failed: %v", err)
-	}
+	d := openTestDB(t)
 	t.Cleanup(func() {
 		if err := d.Close(); err != nil {
 			t.Errorf("close DB failed: %v", err)

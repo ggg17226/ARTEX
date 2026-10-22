@@ -12,12 +12,7 @@ import (
 )
 
 func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 
 	source, err := m.CreateTaskWithOptions("detail source", "source goal", db.TaskCreateOptions{})
 	if err != nil {
@@ -29,8 +24,8 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.DeleteTask(current.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(source.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, current.ID, DeleteTaskOptions{})
+		mustDeleteTask(t, m, source.ID, DeleteTaskOptions{})
 	})
 
 	plannerStep, err := source.Store.AppendActivity(db.Activity{

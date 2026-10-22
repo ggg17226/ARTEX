@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db/schema"
+	"github.com/Autumn-27/artex/db/tidb"
 )
 
 const FindingRetestAgentKey = "retester"
@@ -246,10 +247,42 @@ func snapshotValue(value any, jsonPayload bool) any {
 	return string(raw)
 }
 
+// retestCreateMaxAttempts 是一次发起复测的尝试上限：撞去重唯一索引后要在**新事务**里重来。
+const retestCreateMaxAttempts = 3
+
+// retestActiveIndex 是 finding_retests 上「同一漏洞只允许一条活跃复测」的唯一索引
+// （生成列 active_finding_id）。发起复测只可能在这条索引上撞 1062。
+const retestActiveIndex = "uq_finding_retests_active"
+
 // CreateFindingRetest atomically snapshots the source, creates its conversation
 // and persists the first message. A finding row lock deduplicates simultaneous
 // clicks across clients; an existing active run is returned without dispatching.
+//
+// 去重的最终保证是数据库唯一索引，而不是应用层互斥。PG 时代 READ COMMITTED 的锁读
+// 会在拿到行锁后**重读最新版本**，并发点击的第二个事务必然看见赢家行；TiDB 的锁读
+// 沿用自己事务的快照、不在拿锁后重读别人刚提交的行，于是并发点击会一起穿过
+// 「没有活跃复测」的前置检查，最后在 uq_finding_retests_active 上撞 1062。
+// 这里按本仓库既有的 TiDB 惯例处理（CompanyStore.UpsertCompany、资产引擎同构）：
+// 冲突即整笔回滚（连 conversation 一起回滚，不留孤儿会话），在**新事务**里重来一轮 ——
+// 第二轮回读必然看见赢家行，按 created=false 返回，绝不把 1062 抛给调用方。
 func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes string) (*FindingRetest, *Conversation, bool, error) {
+	var lastErr error
+	for attempt := 0; attempt < retestCreateMaxAttempts; attempt++ {
+		r, c, created, err := d.createFindingRetestOnce(ctx, findingID, notes)
+		if err == nil {
+			return r, c, created, nil
+		}
+		if !tidb.IsDuplicateKey(err) || !strings.Contains(err.Error(), retestActiveIndex) {
+			return nil, nil, false, err
+		}
+		lastErr = err
+	}
+	return nil, nil, false, fmt.Errorf("finding_retests: 复测去重在 %d 次尝试后仍在竞态中: %w",
+		retestCreateMaxAttempts, lastErr)
+}
+
+// createFindingRetestOnce 是单次尝试：锁来源漏洞 → 查活跃复测 → 快照 + 会话 + 首条消息。
+func (d *DB) createFindingRetestOnce(ctx context.Context, findingID int64, notes string) (*FindingRetest, *Conversation, bool, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, false, err

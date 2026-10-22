@@ -388,6 +388,17 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 // createTaskInTx 是单次创建尝试：TiDB 没有 RETURNING，自增主键一律 LastInsertId()，
 // 状态/时间等由数据库默认值产出后再回读一次（同一事务内，读到的是自己的写入）。
 func (d *DB) createTaskInTx(ctx context.Context, tx *sql.Tx, description, goal string, opts TaskCreateOptions) (*Task, error) {
+	// 全序预锁（审查 I-R02）：Business Gate（外层 runTaskWriteTx 已持）→ **既存源任务
+	// 按物理 PK 升序** FOR UPDATE → 分类物理行 FOR UPDATE → 才写新行。
+	//
+	// 源任务是**别人的既存行**，本事务必须抢占它的锁；新建的 exploration/task 是本次
+	// 自增出来的新行，别的事务还看不见，不构成需要排序的既存锁。旧实现把源任务锁留在
+	// insertTaskRelations（分类锁**之后**、且按调用方传入顺序逐条加锁），于是同时存在
+	// "分类 → 既存任务"和"高 source → 低 source"两条反向边。
+	sources, err := lockTaskSourceRowsAscending(ctx, tx, opts.SourceTaskIDs)
+	if err != nil {
+		return nil, err
+	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO explorations(description, goal, status, created_at, updated_at) VALUES(?, ?, 'open', NOW(3), NOW(3))`,
 		description, goal)
@@ -423,13 +434,22 @@ VALUES(?, 'fact', ?, 0, 'origin', 'system', NOW(3), NOW(3))`, expID, string(orig
 		if *opts.CategoryID <= 0 {
 			return nil, fmt.Errorf("%w: category id must be positive", ErrTaskCategoryInvalid)
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT name FROM task_categories WHERE id = ?`, *opts.CategoryID).
+		// 创建同样是"引用分类的写者"（审查 I-01）：这句必须是锁定读。普通 SELECT 在
+		// TiDB 下读本事务快照，DeleteTaskCategory 能在"读到分类名"与"INSERT tasks"
+		// 之间提交，新任务就带着一个没有任何外键能挡住的悬空 category_id。
+		//
+		// 锁序（审查 I-R02 的统一契约）：Business Gate → 既存源任务 PK 升序 → **这里**
+		// 分类物理行 → INSERT。分类行锁是它与 DeleteTaskCategory 的串行点；本事务在
+		// 这里拿锁之前已经把所有既存 source 任务锁完，因此不会形成"分类 → 既存任务"的
+		// 反向边，与 SetTaskCategory（任务 → 分类）同向。
+		if err := tx.QueryRowContext(ctx, `SELECT name FROM task_categories WHERE id = ? FOR UPDATE`, *opts.CategoryID).
 			Scan(&categoryName); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrTaskCategoryNotFound
 			}
 			return nil, err
 		}
+		notifyTaskCategoryWriterHook("create_task", *opts.CategoryID)
 	}
 	var active *int64
 	if len(opts.LLMProfileIDs) > 0 {
@@ -469,7 +489,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', 0, 0, '', NOW(3), NOW(3))`,
 	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM tasks WHERE id = ?`, taskID).Scan(&t.CreatedAt); err != nil {
 		return nil, err
 	}
-	if err := insertTaskRelations(ctx, tx, taskID, opts.SourceTaskIDs); err != nil {
+	if err := insertTaskRelations(ctx, tx, taskID, sources); err != nil {
 		return nil, err
 	}
 	if err := insertTaskCompanies(ctx, tx, taskID, opts.CompanyIDs); err != nil {
@@ -592,22 +612,60 @@ WHERE a.id = ?`, assetID).Scan(&name)
 	return "任务创建时关联企业：" + name
 }
 
-func insertTaskRelations(ctx context.Context, tx *sql.Tx, taskID int64, sourceIDs []int64) error {
-	seen := map[int64]bool{}
+// lockTaskSourceRowsAscending 按**物理 PK 升序**锁住本主要创建的-task 的既存源任务行，
+// 并核验它们仍然存活（审查 I-R02 的全序预锁契约）。
+//
+// 返回**去重并升序**后的 source id 集合，供调用方按同一顺序写关系行。
+//
+// 为什么必须前置到分类锁之前：源任务是别人的既存行，需要抢它的锁；一旦让分类锁先落进
+// 锁图，本事务就带着"分类 → 既存任务"这条反向边，与 DeleteTaskCategory
+// （任务 PK 升序 → 分类）以及任何"先任务后分类"的写者方向相反。
+// 为什么必须升序：两个并发创建各拿一批 source，逆序加锁会交叉等待死锁。
+func lockTaskSourceRowsAscending(ctx context.Context, tx *sql.Tx, sourceIDs []int64) ([]int64, error) {
+	if len(sourceIDs) == 0 {
+		return nil, nil
+	}
+	ordered := make([]int64, 0, len(sourceIDs))
+	seen := make(map[int64]struct{}, len(sourceIDs))
 	for _, sourceID := range sourceIDs {
-		if sourceID <= 0 || sourceID == taskID || seen[sourceID] {
-			return fmt.Errorf("invalid or duplicate source task id %d", sourceID)
+		if sourceID <= 0 {
+			return nil, fmt.Errorf("invalid or duplicate source task id %d", sourceID)
 		}
-		seen[sourceID] = true
-		// 源任务必须存活；它的行也顺带锁住，杜绝"关系指向一个正在消失的任务"。
-		var exists int64
+		if _, dup := seen[sourceID]; dup {
+			return nil, fmt.Errorf("invalid or duplicate source task id %d", sourceID)
+		}
+		seen[sourceID] = struct{}{}
+		ordered = append(ordered, sourceID)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, sourceID := range ordered {
+		// FOR UPDATE 同时是 TiDB 下的当前读：软删标记刚被别的事务写上时必须看见，
+		// 否则会把关系挂到一个正在消失的任务上（与原实现的存活核验同义）。
+		var alive bool
 		err := tx.QueryRowContext(ctx,
-			`SELECT id FROM tasks WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, sourceID).Scan(&exists)
+			`SELECT deleted_at IS NULL FROM tasks WHERE id = ? FOR UPDATE`, sourceID).Scan(&alive)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("source task %d not found", sourceID)
+			return nil, fmt.Errorf("source task %d not found", sourceID)
 		}
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if !alive {
+			return nil, fmt.Errorf("source task %d not found", sourceID)
+		}
+	}
+	return ordered, nil
+}
+
+// insertTaskRelations 只写关系行。
+//
+// 源任务的**行锁与存活核验**已经由 lockTaskSourceRowsAscending 在分类锁之前按 PK 升序
+// 完成（审查 I-R02）。这里**绝不**再对 source 任务做 `FOR UPDATE`：那等于把既存任务锁
+// 重新排到分类锁之后，把已经拉直的全序再拧成反向边。
+func insertTaskRelations(ctx context.Context, tx *sql.Tx, taskID int64, sourceIDs []int64) error {
+	for _, sourceID := range sourceIDs {
+		if sourceID <= 0 || sourceID == taskID {
+			return fmt.Errorf("invalid or duplicate source task id %d", sourceID)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO task_relations(task_id, source_task_id, created_at) VALUES(?, ?, NOW(3))`,

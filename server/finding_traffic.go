@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,9 +65,10 @@ func (s *Server) seedFindingTrafficTools() {
 		if len(properties[name]) == 0 {
 			return
 		}
-		_, err = s.m.pg.Exec(`UPDATE tools SET schema=jsonb_set(schema,ARRAY['properties',$2::text],$3::jsonb,true),updated_at=now()
-WHERE key=$1 AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $2)`, key, name, string(properties[name]))
-		if err != nil {
+		// 旧 PG 版是一句 jsonb_set + `NOT (properties ? name)` 守卫；TiDB 没有
+		// jsonb_set，也没有裸 `?` 成员判定（在 MySQL 里 `?` 直接是占位符），改成
+		// 行锁内的 Go 端补挂：属性已存在就整行不动，属性缺失才插入。
+		if _, err := s.addToolSchemaPropertyIfAbsent(key, name, properties[name]); err != nil {
 			log.Printf("[evidence] upgrade tool %s: %v", key, err)
 			return
 		}
@@ -77,6 +79,58 @@ WHERE key=$1 AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $2)
 		}
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// addToolSchemaPropertyIfAbsent 只在 schema.properties 里**没有**该属性时把它挂上去。
+// 等价旧 PG 版 `jsonb_set(schema, ARRAY['properties', name], value, true)` 加
+// `NOT (COALESCE(schema->'properties','{}') ? name)` 守卫：
+//
+//   - 属性已存在（多半是用户在页面上改过 description/default）→ 整行不动；
+//   - properties 缺失或为 null → 按 jsonb_set 的 create_missing=true 语义新建对象；
+//   - properties 存在但不是对象（数据异常）→ 记日志跳过，绝不整片覆盖用户数据。
+//
+// 读、核验、改写全在 mutateToolRow 的同一事务 + 同一行锁里完成，因此"检查时通过、
+// 写入时被并发覆盖"的窗口不存在（旧的单语句 jsonb_set 天然没有这个窗口，锁行等价）。
+// 整份 schema 用 json.Number 语义解码后再序列化，数字字面量原样保留。
+func (s *Server) addToolSchemaPropertyIfAbsent(key, property string, value json.RawMessage) (bool, error) {
+	return mutateToolRow(s.m.pg, key, func(ctx context.Context, tx *sql.Tx, row *toolRow) (bool, error) {
+		doc, err := decodeToolSchema(row.schema, key)
+		if err != nil {
+			return false, err
+		}
+		var properties map[string]any
+		switch current := doc["properties"].(type) {
+		case nil:
+			// create_missing 语义：路径缺失（或为 JSON null）时才新建这一层对象。
+			properties = map[string]any{}
+			doc["properties"] = properties
+		case map[string]any:
+			if _, exists := current[property]; exists {
+				return false, nil
+			}
+			properties = current
+		default:
+			log.Printf("[evidence] tool %s: properties 不是对象，跳过补挂 %s", key, property)
+			return false, nil
+		}
+		var propertyDoc any
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.UseNumber()
+		if err := decoder.Decode(&propertyDoc); err != nil {
+			return false, fmt.Errorf("tools %s: 待补挂的 %s 不是合法 JSON: %w", key, property, err)
+		}
+		properties[property] = propertyDoc
+		raw, err := json.Marshal(doc)
+		if err != nil {
+			return false, err
+		}
+		set := &setColumns{}
+		set.set("`schema`", string(raw))
+		if err := writeToolColumns(ctx, tx, row.rowID, set); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
 }
 
 func (s *Server) registerFindingTraffic(mux *http.ServeMux) {

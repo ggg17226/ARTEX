@@ -9,16 +9,14 @@ import (
 )
 
 func TestCompareAndSetIntentStateAllowsSingleWinner(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	expID, err := d.CreateExploration("intent CAS", "only one controller wins")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	// 原 `defer d.Exec("DELETE FROM explorations…")` 吞错且只删父行：intent/边/activity
+	// 会永久残留（审查 R-02-R），改为创建即登记的完整逆拓扑清理并判红。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	store := d.Exploration(expID)
 	intentID, err := store.AddIntent(map[string]any{"summary": "controlled"}, 1, nil, "planner")
 	if err != nil {
@@ -59,16 +57,14 @@ func TestCompareAndSetIntentStateAllowsSingleWinner(t *testing.T) {
 }
 
 func TestCancelIntentPreservesTokenMeteringWithoutDoubleCount(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	expID, err := d.CreateExploration("cancel token rollup", "preserve consumed tokens")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	// 原 `defer d.Exec("DELETE FROM explorations…")` 吞错且只删父行：intent/边/activity
+	// 会永久残留（审查 R-02-R），改为创建即登记的完整逆拓扑清理并判红。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	store := d.Exploration(expID)
 	intentID, err := store.AddIntent(map[string]any{"summary": "cancelled"}, 1, nil, "planner")
 	if err != nil {
@@ -94,7 +90,7 @@ func TestCancelIntentPreservesTokenMeteringWithoutDoubleCount(t *testing.T) {
 		if appendErr != nil {
 			t.Fatal(appendErr)
 		}
-		if _, updateErr := d.Exec(`UPDATE activity SET created_at=$1 WHERE id=$2`, at, activityID); updateErr != nil {
+		if _, updateErr := d.Exec(`UPDATE activity SET created_at=? WHERE id=?`, at, activityID); updateErr != nil {
 			t.Fatal(updateErr)
 		}
 	}
@@ -168,11 +164,15 @@ func TestCancelIntentPreservesTokenMeteringWithoutDoubleCount(t *testing.T) {
 		t.Fatalf("cancelled intent leaked into sessions: %+v", sessions)
 	}
 	var rollups, datedRollups int
-	if err := d.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (
-			WHERE metadata->>'token_day'=TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')
-		) FROM activity
-		WHERE exploration_id=$1 AND worker='token-ledger' AND kind='result'
-		  AND metadata->>'cancelled_intent_id'=$2`, expID, fmt.Sprint(intentID)).Scan(&rollups, &datedRollups); err != nil {
+	// 原 PG 写法 COUNT(*) FILTER (WHERE metadata->>'token_day' = TO_CHAR(created_at AT
+	// TIME ZONE 'UTC','YYYY-MM-DD')) 在 TiDB 侧：FILTER 换 SUM(CASE WHEN...)，
+	// ->> 换 JSON_VALID 守卫的 JSON_UNQUOTE(JSON_EXTRACT(...))，TO_CHAR/AT TIME ZONE
+	// 换 DATE_FORMAT（会话时区被 DSN 固定成 +00:00，created_at 本身就是 UTC）。
+	if err := d.QueryRow(`SELECT COUNT(*),
+			SUM(CASE WHEN `+expJSONTextCond("metadata", "$.token_day")+` = DATE_FORMAT(created_at, '%Y-%m-%d') THEN 1 ELSE 0 END)
+		FROM activity
+		WHERE exploration_id=? AND worker='token-ledger' AND kind='result'
+		  AND `+expJSONTextCond("metadata", "$.cancelled_intent_id")+`=?`, expID, fmt.Sprint(intentID)).Scan(&rollups, &datedRollups); err != nil {
 		t.Fatal(err)
 	}
 	if rollups != 3 || datedRollups != rollups {
@@ -227,16 +227,14 @@ func assertDailyTokenBucketsEqual(t *testing.T, got, want map[string]DailyTokenB
 }
 
 func TestCancelIntentPreservesOutputsYieldedByAnotherIntent(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	expID, err := d.CreateExploration("shared intent output", "preserve shared facts and findings")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	// 原 `defer d.Exec("DELETE FROM explorations…")` 吞错且只删父行：intent/边/activity
+	// 会永久残留（审查 R-02-R），改为创建即登记的完整逆拓扑清理并判红。
+	t.Cleanup(func() { cleanupExploration(t, d, expID) })
 	store := d.Exploration(expID)
 	first, err := store.AddIntent(map[string]any{"summary": "first"}, 1, nil, "planner")
 	if err != nil {

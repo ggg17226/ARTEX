@@ -129,7 +129,7 @@ func (s *Store) StageFindingsExport(ctx context.Context, findings []*db.DBFindin
 			f.TrafficCount = len(list.Bindings)
 			f.EvidenceVersion = list.Version
 			f.ReportEvidenceVersion = list.ReportVersion
-			if err = tx.QueryRow(`SELECT report FROM findings WHERE id=$1`, f.ID).Scan(&f.Report); err != nil {
+			if err = tx.QueryRow(`SELECT report FROM findings WHERE id=?`, f.ID).Scan(&f.Report); err != nil {
 				return err
 			}
 			for _, b := range list.Bindings {
@@ -344,14 +344,30 @@ func (s *Store) WithInstalledSnapshots(ctx context.Context, snapshots []db.Traff
 	})
 }
 
+// markUnreferenced / deleteUnreferenced 是 GC 的两条元数据语句。
+//
+// 迁移说明（TiDB 8.5 / MySQL 语法）：
+//   - 占位符统一 `?`（go-sql-driver），PG 时代的 `$1` 会让驱动直接报参数数量不匹配；
+//   - 不再给目标表起别名（原 `traffic_evidence_snapshots s`）。MySQL 的
+//     `UPDATE t alias SET ...` / `DELETE FROM t alias WHERE ...` 属于多表 DML 的
+//     表引用写法，和子查询里再引用同一张表混在一起时容易踩到
+//     "You can't specify target table for update in FROM clause" 一类限制，
+//     这里去别名后直接用全表名限定关联列，两条语句都在 TiDB 8.5.8 上
+//     经 EXPLAIN 验证为合法的 anti semi join 计划（NOT EXISTS 被改写成
+//     anti join，语义与 PG 原语句一致）。
+const (
+	markUnreferencedSQL = `UPDATE traffic_evidence_snapshots SET unreferenced_at=?
+WHERE unreferenced_at IS NULL AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=traffic_evidence_snapshots.id)`
+	deleteUnreferencedSQL = `DELETE FROM traffic_evidence_snapshots WHERE unreferenced_at<?
+AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=traffic_evidence_snapshots.id)`
+)
+
 func (s *Store) Collect(ctx context.Context, now time.Time) error {
 	return s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`UPDATE traffic_evidence_snapshots s SET unreferenced_at=$1
-WHERE unreferenced_at IS NULL AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id)`, now); err != nil {
+		if _, err := tx.Exec(markUnreferencedSQL, now); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM traffic_evidence_snapshots s WHERE unreferenced_at<$1
-AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id)`, now.Add(-24*time.Hour)); err != nil {
+		if _, err := tx.Exec(deleteUnreferencedSQL, now.Add(-24*time.Hour)); err != nil {
 			return err
 		}
 		rows, err := tx.Query(`SELECT req_hash FROM traffic_evidence_snapshots UNION SELECT resp_hash FROM traffic_evidence_snapshots`)

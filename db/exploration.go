@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -251,8 +252,11 @@ type ExplorationStore struct {
 }
 
 // CreateExploration creates a new exploration root and returns its id.
+//
+// TiDB 不允许给 TEXT 列声明 DDL 默认值，explorations.status 因此是 NOT NULL 无默认值：
+// 严格模式下插入必须显式给出初始状态 'open'，否则报 Error 1364。
 func (d *DB) CreateExploration(description, goal string) (int64, error) {
-	res, err := d.Exec(`INSERT INTO explorations(description, goal) VALUES (?, ?)`, description, goal)
+	res, err := d.Exec(`INSERT INTO explorations(description, goal, status) VALUES (?, ?, 'open')`, description, goal)
 	if err != nil {
 		return 0, err
 	}
@@ -274,6 +278,12 @@ func (s *ExplorationStore) Root() (description, goal string, err error) {
 // AddNode writes a typed reasoning node with optional anchors to asset ids.
 // The node id comes from LastInsertId (TiDB has no RETURNING); the anchor rows are
 // idempotent on uq_exploration_anchors, so re-anchoring the same asset never fails.
+//
+// 引用完整性（TiDB 基线不建外键）：anchors 先经 validateAnchorAssetsTx 逐个核对确实
+// 存在于 assets，再落任何一行。旧写法照单全收，一条幻觉 asset id 就写出一条悬空锚点，
+// 之后这条任务的 DeleteTask 会因为"锁不到锚点引用的资产行"判定成员漂移而**永久删不掉**
+// （与已修复的 RecordFindingTx 属同一缺陷类，错误口径同为 ErrForeignKeyViolation）。
+// 校验放在 INSERT exploration_nodes **之前**：非法入参连节点行都不该产生。
 func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
 	tx, err := s.db.Begin()
@@ -281,6 +291,9 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err := validateAnchorAssetsTx(context.Background(), tx, anchors); err != nil {
+		return 0, err
+	}
 	res, err := tx.Exec(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -293,6 +306,11 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 		return 0, err
 	}
 	for _, a := range anchors {
+		if a <= 0 {
+			// 非正数不可能是合法 assets.id（validate 已跳过），这里也不再写一条
+			// asset_id=0 的锚点行：那同样是一条谁也锁不到的悬空引用。
+			continue
+		}
 		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES (?, ?)
 ON DUPLICATE KEY UPDATE node_id = node_id`, id, a); err != nil {
 			return 0, err
@@ -333,13 +351,24 @@ func (s *ExplorationStore) OriginFactID() (int64, error) {
 // task may read any asset via search); it only preserves the reasoning trail.
 // Idempotent: the duplicate check lands on uq_exploration_anchors (TiDB has no
 // ON CONFLICT), and the self-assignment keeps the row untouched on a repeat.
+//
+// 引用完整性同 AddNode：资产存在性校验与 INSERT 包在**同一个事务**里（TiDB 没有外键，
+// 校验与写入分两次提交会留下"校验通过但资产已被删"的窗口；同事务至少让两者对同一快照
+// 生效，失败整体回滚）。缺失即返回 ErrForeignKeyViolation；调用方（agent 工具、worker
+// 播种）本就忽略该错误，因此行为只是退化为"不再产生悬空锚点"，不会中断推理流程。
 func (s *ExplorationStore) Anchor(nodeID, assetID int64) error {
 	if nodeID <= 0 || assetID <= 0 {
 		return nil
 	}
-	_, err := s.db.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES (?, ?)
+	ctx := context.Background()
+	return s.db.execInTx(func(tx *sql.Tx) error {
+		if err := validateAnchorAssetsTx(ctx, tx, []int64{assetID}); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES (?, ?)
 ON DUPLICATE KEY UPDATE node_id = node_id`, nodeID, assetID)
-	return err
+		return err
+	})
 }
 
 // Link adds a typed exploration edge (idempotent on uq_exploration_edges).

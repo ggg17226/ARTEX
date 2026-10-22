@@ -145,17 +145,12 @@ func TestTaskLifecycleRechecksDeleteBarrierAfterConcLock(t *testing.T) {
 }
 
 func TestAbortTaskDeleteUsesPersistedPauseAndQueueState(t *testing.T) {
-	t.Skip("PostgreSQL-backed tests are disabled during the native TiDB migration")
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
-	}
-	defer m.Close()
+	m := newTestManager(t)
 	task, err := m.CreateTask("delete abort state", "restore persisted barrier", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer func() { mustDeleteTask(t, m, task.ID, DeleteTaskOptions{}) }()
 	s := &Server{m: m, engine: NewEngine(m)}
 
 	// An engine-only pause is not authoritative. The committed task is running,

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -556,9 +557,9 @@ func TestTaskArchive_CoreConflictFailsClosedWithFullRollback(t *testing.T) {
 	if _, err := d.QueueTaskArchiveRestore(archiveID); err != nil {
 		t.Fatalf("queue restore: %v", err)
 	}
-	claimed, err := d.ClaimTaskArchiveJob(t.Context())
-	if err != nil || claimed == nil || claimed.ID != archiveID || claimed.State != Restoring {
-		t.Fatalf("restore claim = %+v, %v", claimed, err)
+	// 只领取自己那条恢复记录：队首是别人的就跳过，绝不先改写别人的排队任务（RR-I03）。
+	if claimed := claimOwnArchiveJob(t, t.Context(), d, archiveID, RestoreQueued, Restoring); claimed.State != Restoring {
+		t.Fatalf("restore claim state = %q, want %q", claimed.State, Restoring)
 	}
 	if _, err := d.RestoreTaskArchive(archiveID, snapshot, 600); err == nil {
 		t.Fatal("conflicting core graph restore must be refused")
@@ -619,11 +620,7 @@ func TestTaskArchive_CoreConflictFailsClosedWithFullRollback(t *testing.T) {
 // =====================================================================
 
 func TestTaskArchive_EndToEndRoundTrip(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	if err := d.EnsureLLMRecordsTable(); err != nil {
 		t.Fatal(err)
 	}
@@ -698,9 +695,9 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, 0, "quota_exhausted", "balance exh
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := d.ClaimTaskArchiveJob(t.Context())
-	if err != nil || claimed == nil || claimed.ID != archive.ID || claimed.State != Archiving {
-		t.Fatalf("claim = %+v, %v", claimed, err)
+	// 只领取自己那条归档记录（RR-I03）：全局 FIFO 领取会先改写别人的队首再报 id 不符。
+	if claimed := claimOwnArchiveJob(t, t.Context(), d, archive.ID, ArchiveQueued, Archiving); claimed.State != Archiving {
+		t.Fatalf("archive claim state = %q, want %q", claimed.State, Archiving)
 	}
 	var llmRecords bytes.Buffer
 	snapshot, err := d.SnapshotTaskArchiveWithLLMRecords(task.ID, &llmRecords)
@@ -757,9 +754,9 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, 0, "quota_exhausted", "balance exh
 	if _, err := d.QueueTaskArchiveRestore(archive.ID); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err = d.ClaimTaskArchiveJob(t.Context())
-	if err != nil || claimed == nil || claimed.State != Restoring {
-		t.Fatalf("restore claim = %+v, %v", claimed, err)
+	// 同样只领取自己那条恢复记录（RR-I03）。
+	if claimed := claimOwnArchiveJob(t, t.Context(), d, archive.ID, RestoreQueued, Restoring); claimed.State != Restoring {
+		t.Fatalf("restore claim state = %q, want %q", claimed.State, Restoring)
 	}
 	warnings, err := d.RestoreTaskArchiveWithLLMRecords(
 		archive.ID, snapshot, int64((10 * time.Minute).Seconds()), bytes.NewReader(llmRecords.Bytes()),
@@ -820,11 +817,7 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, 0, "quota_exhausted", "balance exh
 }
 
 func TestTaskArchive_BlockersIgnoreQueuedDependents(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	source, err := d.CreateTaskWithOptions("archive blocker source", "source", TaskCreateOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -865,11 +858,7 @@ func TestTaskArchive_BlockersIgnoreQueuedDependents(t *testing.T) {
 }
 
 func TestTaskArchive_RecoverInterruptedRequiresManualRetry(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB: %v", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 	task, err := d.CreateTaskWithOptions("interrupted archive", "must not restart automatically", TaskCreateOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -885,7 +874,9 @@ func TestTaskArchive_RecoverInterruptedRequiresManualRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Exec(`UPDATE task_archives SET state=?,phase='snapshot_database',progress=10 WHERE id=?`, queued.ID, Archiving); err != nil {
+	// 占位符按出现顺序绑定：state=? 在前、id=? 在后，实参必须同序
+	// （原先写反成 (queued.ID, Archiving)，TiDB 会把 'archiving' 当整数塞给 id 而报 1292）。
+	if _, err := d.Exec(`UPDATE task_archives SET state=?,phase='snapshot_database',progress=10 WHERE id=?`, Archiving, queued.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.RecoverTaskArchiveJobs(); err != nil {
@@ -995,10 +986,7 @@ type archiveSevenTableFixture struct {
 
 func newArchiveSevenTableFixture(t *testing.T) *archiveSevenTableFixture {
 	t.Helper()
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Fatalf("open TiDB: %v", err)
-	}
+	d := openTestDB(t)
 	t.Cleanup(func() {
 		if err := d.Close(); err != nil {
 			t.Errorf("close DB: %v", err)
@@ -1010,11 +998,22 @@ func newArchiveSevenTableFixture(t *testing.T) *archiveSevenTableFixture {
 	tag := fmt.Sprintf("p08-04-%d", time.Now().UnixNano()%1e9)
 	fixture := &archiveSevenTableFixture{d: d}
 
+	// —— 复审 RR-I01 ——
+	// 旧实现直到**全部**实体创建完成之后才注册业务 cleanup：source 建好、target 失败时，
+	// 已经落库的 source（连它的 exploration 与 origin 节点）就永久留在共享库里；
+	// 收尾里所有删除错误又只 t.Logf，残留永远不可能让用例变红。
+	// 现在改成：**每成功创建一个实体就立刻登记**逆拓扑回收（重复登记由 once 兜底，
+	// 真正的回收只跑一次，且只按此刻已经拿到的物理 id 删），删除错误一律 t.Errorf，
+	// 收尾必须按自有主键把七表全部回读归零。
+	recycler := newArchiveFixtureRecycler(t, fixture)
+	recycle := recycler.register
+
 	source, err := d.CreateTaskWithOptions(tag+" source", "archive fixture source", TaskCreateOptions{})
 	if err != nil {
 		t.Fatalf("create source task: %v", err)
 	}
 	fixture.source = source
+	recycle()
 	task, err := d.CreateTaskWithOptions(tag+" target", "archive fixture target", TaskCreateOptions{
 		SourceTaskIDs: []int64{source.ID},
 	})
@@ -1022,6 +1021,7 @@ func newArchiveSevenTableFixture(t *testing.T) *archiveSevenTableFixture {
 		t.Fatalf("create task: %v", err)
 	}
 	fixture.task = task
+	recycle()
 
 	// 资产由 target 与 source 共同持有：归档压缩不会删除它，因此恢复时一定复用同一个
 	// asset id，冲突用例才能稳定地撞上 uq_task_asset_links。
@@ -1030,27 +1030,33 @@ func newArchiveSevenTableFixture(t *testing.T) *archiveSevenTableFixture {
 	if err != nil {
 		t.Fatalf("upsert asset for task: %v", err)
 	}
+	fixture.assetID = assetID
+	recycle()
 	if _, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: domain, TaskID: source.ID}); err != nil {
 		t.Fatalf("co-own asset with source task: %v", err)
 	}
-	fixture.assetID = assetID
+	recycle()
 
 	store := d.Exploration(task.ExplorationID)
 	fact, err := store.AddNode(KindFact, map[string]any{"summary": "archived fact", "asset_ids": []int64{assetID}}, 1, "confirmed", "worker", nil)
 	if err != nil {
 		t.Fatalf("add fact node: %v", err)
 	}
+	fixture.nodeIDs = []int64{fact}
+	recycle()
 	intent, err := store.AddNode(KindIntent, map[string]any{"summary": "archived intent"}, 2, "open", "worker", nil)
 	if err != nil {
 		t.Fatalf("add intent node: %v", err)
 	}
+	fixture.nodeIDs = []int64{fact, intent}
+	recycle()
 	if err := store.Link(fact, archiveFixtureEdgeRel, intent); err != nil {
 		t.Fatalf("link nodes: %v", err)
 	}
 	if err := store.Anchor(fact, assetID); err != nil {
 		t.Fatalf("anchor asset: %v", err)
 	}
-	fixture.nodeIDs = []int64{fact, intent}
+	recycle()
 
 	// UpsertRootDomain 已经在资产的唯一写出口里原子双写了这条 (task_id,asset_id) link
 	// （db/assets.go writeAsset → ensureTaskAssetLinkTx）。夹具绝不能再 INSERT 一份，
@@ -1067,12 +1073,14 @@ WHERE task_id=? AND asset_id=?`, archiveFixtureLinkSource, archiveFixtureLinkSum
 		t.Fatalf("task_asset_links dual write left %d rows for (task %d, asset %d), want exactly 1",
 			affected, task.ID, assetID)
 	}
+	recycle()
 
 	profileID, err := d.SaveProfile(&LLMProfile{Name: tag + "-profile", Format: "openai", Model: "archive-model"})
 	if err != nil {
 		t.Fatalf("create llm profile: %v", err)
 	}
 	fixture.profileID = profileID
+	recycle()
 	// 列清单、占位符与实参严格 8/8/8，并且必须绑定真实的 profileID——写死 0 会让
 	// restoreTaskLLMProfiles 因为 llm_profiles 里查不到该配置而整行跳过。
 	if _, err := d.Exec(`INSERT INTO task_llm_profiles(task_id,profile_id,position,status,last_error,exhausted_at,created_at,updated_at)
@@ -1080,6 +1088,7 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, int64(1), "quota_exhausted", "bala
 		archiveFixtureExhaustedAt, archiveFixtureExhaustedAt.Add(-time.Hour), archiveFixtureExhaustedAt); err != nil {
 		t.Fatalf("insert task_llm_profiles: %v", err)
 	}
+	recycle()
 
 	findingID, err := d.AddFinding(task.ID, fact, tag+"-vuln", "archive finding", SeverityCritical,
 		"summary", "evidence", "worker", []int64{assetID})
@@ -1087,6 +1096,7 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, int64(1), "quota_exhausted", "bala
 		t.Fatalf("add finding: %v", err)
 	}
 	fixture.findingID = findingID
+	recycle()
 
 	fixture.snapshotCaptured = time.Now().UTC().Unix()
 	fixture.snapshotURL = "https://" + tag + ".example.test/vuln"
@@ -1099,6 +1109,7 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, int64(1), "quota_exhausted", "bala
 	}
 	snapshot.ID = TrafficSnapshotID(snapshot)
 	fixture.snapshotID = snapshot.ID
+	recycle()
 	if err := d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
 		return AddFindingTrafficTx(tx, findingID, []PreparedTrafficEvidence{{
 			Ref:      TrafficRef{TrafficID: tag + "-traffic", Role: "proof", Note: "archive fixture"},
@@ -1107,6 +1118,7 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, int64(1), "quota_exhausted", "bala
 	}); err != nil {
 		t.Fatalf("bind traffic evidence: %v", err)
 	}
+	recycle()
 
 	fixture.sessionKey = tag + "@archive"
 	if _, err := d.Exec(`INSERT INTO side_question_sessions
@@ -1115,30 +1127,59 @@ VALUES(?,?,?,?,?,?,?,?)`, task.ID, profileID, int64(1), "quota_exhausted", "bala
 		archiveFixtureSessionSnapshot, archiveFixtureSessionGeneration, archiveFixtureSessionMemory); err != nil {
 		t.Fatalf("insert side_question_sessions: %v", err)
 	}
-	// 两条旁路请求：13 列 / 13 个 VALUES 项 / 13 个占位符 / 13 个实参，逐一对齐。
+	recycle()
+	// 两条旁路请求：14 列 / 14 个 VALUES 项 / 14 个占位符 / 14 个实参，逐一对齐。
 	// 第二条使用自己的 client_id，并按它自己的 canonical identity 重算 identity 与
 	// identity_hash，否则两行会撞 uq_side_requests_identity 唯一索引。
 	if _, err := d.Exec(`INSERT INTO side_question_requests
-(id,session_key,generation,client_id,identity,identity_hash,question,answer,status,model,sequence,usage,context_info)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "req-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
+(id,session_key,generation,client_id,identity,identity_hash,question,answer,status,error,model,sequence,`+"`usage`"+`,context_info)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, "req-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
 		archiveFixtureRequestClient,
 		requestIdentityPayload(fixture.sessionKey, archiveFixtureRequestClient),
 		requestIdentityHash(fixture.sessionKey, archiveFixtureRequestClient),
-		"why?", "because", "done", `{"model":"archive-model"}`, int64(0), `{"calls":1}`, `{"nodes":0}`); err != nil {
+		"why?", "because", "done", "", `{"model":"archive-model"}`, int64(0), `{"calls":1}`, `{"nodes":0}`); err != nil {
 		t.Fatalf("insert side_question_requests: %v", err)
 	}
+	recycle()
 	if _, err := d.Exec(`INSERT INTO side_question_requests
-(id,session_key,generation,client_id,identity,identity_hash,question,answer,status,model,sequence,usage,context_info)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "req2-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
+(id,session_key,generation,client_id,identity,identity_hash,question,answer,status,error,model,sequence,`+"`usage`"+`,context_info)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, "req2-"+tag, fixture.sessionKey, int64(archiveFixtureRequestGeneration),
 		archiveFixtureRequestClient2,
 		requestIdentityPayload(fixture.sessionKey, archiveFixtureRequestClient2),
 		requestIdentityHash(fixture.sessionKey, archiveFixtureRequestClient2),
-		"again?", "again", "done", `{"model":"archive-model"}`, int64(1), `{"calls":2}`, `{"nodes":1}`); err != nil {
+		"again?", "again", "done", "", `{"model":"archive-model"}`, int64(1), `{"calls":2}`, `{"nodes":1}`); err != nil {
 		t.Fatalf("insert second side_question_requests: %v", err)
 	}
-
-	t.Cleanup(func() { archiveFixtureCleanup(t, fixture) })
+	// 最后一次登记：准备阶段全部成功时也照旧登记（once 兜底，回收只跑一次）。
+	recycle()
 	return fixture
+}
+
+// archiveFixtureRecycler 把"每个实体创建成功后登记一次逆拓扑回收"变成机械动作
+// （复审 RR-I01）。
+//
+// t.Cleanup 按登记顺序 LIFO 执行、登记几次就跑几次，因此真正的回收用 sync.Once 兜底：
+// 无论在哪一步 t.Fatalf 提前退出，**此刻已经落库**的那几个实体都会被收走，
+// 而不是像旧实现那样"没走到最后一行就没有任何业务 cleanup"。
+type archiveFixtureRecycler struct {
+	t       *testing.T
+	fixture *archiveSevenTableFixture
+	once    sync.Once
+}
+
+func newArchiveFixtureRecycler(t *testing.T, fixture *archiveSevenTableFixture) *archiveFixtureRecycler {
+	t.Helper()
+	recycler := &archiveFixtureRecycler{t: t, fixture: fixture}
+	// 立刻登记一次：连第一个实体都还没建出来时的提前失败也有收尾。
+	recycler.register()
+	return recycler
+}
+
+// register 在**每一个**实体创建成功之后调用。
+func (r *archiveFixtureRecycler) register() {
+	r.t.Cleanup(func() {
+		r.once.Do(func() { archiveFixtureCleanup(r.t, r.fixture) })
+	})
 }
 
 // requestIdentityPayload 用与线上写路径同一个 canonical 口径算出 identity 载荷。
@@ -1152,51 +1193,301 @@ func requestIdentityHash(sessionKey, clientID string) []byte {
 	return sum[:]
 }
 
+// archiveFixtureValidIDs 只留下**正数**且去重后的自有 id（复审 RR-I01）。
+//
+// 准备阶段是在每一步中途都可能失败的：task 还没建出来时 taskID 就是 0，asset 还没
+// 拿到时 assetID 也是 0，snapshotID 还是空串。旧实现把整条语句用**一个** ready 标志
+// 兜住，只要有一个父 id 有效就整条 SQL 照发，于是谓词里混进 `IN (0, 7)`、
+// `OR snapshot_id=”`、`OR asset_id=0` 这类分支 —— 共享库里凡是 task_id=0 /
+// asset_id=0 / snapshot_id=” 的旧行或无外键孤儿都会被当成"本夹具的东西"删掉。
+// 一个父 id 有效，从来不等于另一个未取得的 id 可以进删除范围。
+//
+// 现在每条谓词都只按**自己**已经拿到的有效标识构造；一个有效 id 都没有，整条语句
+// 连发都不发。
+func archiveFixtureValidIDs(values ...int64) []int64 {
+	out := make([]int64, 0, len(values))
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, dup := seen[value]; dup {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func archiveFixtureIDArgs(values []int64) []any {
+	args := make([]any, 0, len(values))
+	for _, value := range values {
+		args = append(args, value)
+	}
+	return args
+}
+
+// archiveFixtureCleanup 逆拓扑回收本夹具**已经拿到有效物理 id** 的全部实体。
+//
+// 复审 RR-I01 的三条硬要求：
+//  1. **逐谓词**过滤有效自有标识：每个 DELETE 只用正数 id / 非空字符串，复合条件一律
+//     拆成独立语句，杜绝 `IN (0, …)`、`OR snapshot_id=”`、`OR asset_id=0`；
+//  2. 删除错误一律 t.Errorf 标红；
+//  3. **每一张实际被清理的表都自动带一条同谓词的终态归零回读**（add() 成对登记，
+//     漏配在结构上不可能发生），另加父根（tasks/explorations/llm_profiles）回读。
 func archiveFixtureCleanup(t *testing.T, fixture *archiveSevenTableFixture) {
 	t.Helper()
 	d := fixture.d
-	taskID, sourceID, expID := fixture.task.ID, fixture.source.ID, fixture.task.ExplorationID
-	statements := []struct {
+	var taskID, sourceID, expID, sourceExpID int64
+	if fixture.task != nil {
+		taskID, expID = fixture.task.ID, fixture.task.ExplorationID
+	}
+	if fixture.source != nil {
+		sourceID, sourceExpID = fixture.source.ID, fixture.source.ExplorationID
+	}
+	// 每条谓词都从这里取有效集合：为空 ⇒ 该支路一条 SQL 都不发。
+	tasks := archiveFixtureValidIDs(taskID, sourceID)
+	exps := archiveFixtureValidIDs(expID, sourceExpID)
+	nodes := archiveFixtureValidIDs(fixture.nodeIDs...)
+	assets := archiveFixtureValidIDs(fixture.assetID)
+	archiveFixtureCleanupWith(t, d, fixture, tasks, exps, nodes, assets)
+}
+
+// archiveFixtureCleanupWith 是 archiveFixtureCleanup 的执行体：入参已经是**逐字段
+// 过滤过**的有效自有标识集合，本函数只负责按逆拓扑拼 SQL、执行、逐表回读。
+//
+// 与表名一样按参数顺序登记，DELETE 顺序 = 回收顺序 = 七表夹具准备顺序的逆序。
+func archiveFixtureCleanupWith(t *testing.T, d *DB, fixture *archiveSevenTableFixture, tasks, exps, nodes, assets []int64) {
+	t.Helper()
+
+	// add 成对登记一条 DELETE 与它**完全同谓词**的终态归零回读：
+	// "清了哪张表、按什么条件清"与"回读哪张表、按什么条件断言归零"永远是同一条谓词，
+	// 不会再出现旧实现那种"删了 llm_records / exploration_anchors，终态列表里却没有
+	// 这两张表"的漏网（复审 RR-I01 B）。
+	type step struct {
+		label string
 		query string
 		args  []any
-	}{
-		// 判据里额外带上 snapshot_id / asset_id：压缩或恢复失败留下的孤儿关系，其父行
-		// 已经不在，只靠父行子查询永远删不掉，会污染后续用例。
-		{`DELETE FROM finding_traffic_bindings WHERE finding_id IN (SELECT id FROM findings WHERE task_id IN (?,?)) OR snapshot_id=?`, []any{taskID, sourceID, fixture.snapshotID}},
-		{`DELETE FROM traffic_evidence_snapshots WHERE id=?`, []any{fixture.snapshotID}},
-		{`DELETE FROM side_question_requests WHERE session_key=?`, []any{fixture.sessionKey}},
-		{`DELETE FROM side_question_sessions WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
-		{`DELETE FROM llm_records WHERE COALESCE(task_id,'') IN (?,?)`, []any{fmt.Sprint(taskID), fmt.Sprint(sourceID)}},
-		{`DELETE FROM llm_usage WHERE COALESCE(task_id,'') IN (?,?) OR exploration_id=?`, []any{fmt.Sprint(taskID), fmt.Sprint(sourceID), expID}},
-		{`DELETE FROM skill_usage WHERE task_id IN (?,?) OR exploration_id=?`, []any{taskID, sourceID, expID}},
-		{`DELETE FROM tool_usage WHERE task_id IN (?,?) OR exploration_id=?`, []any{taskID, sourceID, expID}},
-		{`DELETE FROM task_archives WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
-		{`DELETE FROM findings WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
-		{`DELETE FROM task_asset_links WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
-		{`DELETE FROM task_llm_profiles WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
-		{`DELETE FROM task_scope WHERE task_id IN (?,?)`, []any{taskID, sourceID}},
-		{`DELETE FROM task_relations WHERE task_id IN (?,?) OR source_task_id IN (?,?)`, []any{taskID, sourceID, taskID, sourceID}},
-		{`DELETE FROM activity WHERE exploration_id=?`, []any{expID}},
-		{`DELETE FROM task_constraints WHERE exploration_id=?`, []any{expID}},
-		{`DELETE FROM exploration_anchors WHERE node_id IN (SELECT id FROM exploration_nodes WHERE exploration_id=?) OR asset_id=?`, []any{expID, fixture.assetID}},
-		{`DELETE FROM exploration_edges WHERE exploration_id=?`, []any{expID}},
-		{`DELETE FROM exploration_nodes WHERE exploration_id=?`, []any{expID}},
-		{`DELETE FROM assets WHERE id=?`, []any{fixture.assetID}},
 	}
-	for _, statement := range statements {
+	var deletes, probes []step
+	add := func(table, where string, args ...any) {
+		label := table + " WHERE " + where
+		deletes = append(deletes, step{label: label, query: `DELETE FROM ` + table + ` WHERE ` + where, args: args})
+		probes = append(probes, step{label: label, query: `SELECT count(*) FROM ` + table + ` WHERE ` + where, args: args})
+	}
+	// 按有效 id 列表展开一个 `col IN (?,?,…)`；一个有效 id 都没有就整条不发。
+	addIn := func(table, column string, ids []int64) {
+		if len(ids) == 0 {
+			return
+		}
+		add(table, column+` IN (`+inPlaceholders(len(ids))+`)`, archiveFixtureIDArgs(ids)...)
+	}
+	addTextIn := func(table, column string, ids []int64) {
+		if len(ids) == 0 {
+			return
+		}
+		args := make([]any, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, fmt.Sprint(id))
+		}
+		add(table, `COALESCE(`+column+`,'') IN (`+inPlaceholders(len(ids))+`)`, args...)
+	}
+	// 父行子查询支路：压缩/恢复失败留下的孤儿关系没有父行可回指，只能顺着**自有**
+	// 的父 id 找。同样只在父 id 有效时才拼这一条。
+	addNodeSubquery := func(table, nodeColumn, column string, ids []int64) {
+		if len(ids) == 0 {
+			return
+		}
+		args := make([]any, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		add(table, nodeColumn+" IN (SELECT id FROM exploration_nodes WHERE exploration_id IN ("+
+			inPlaceholders(len(ids))+"))", args...)
+	}
+	// 额外的终态回读（对象由产品 API 删除，不是这里的 DELETE 语句）。
+	addProbe := func(label, query string, args ...any) {
+		probes = append(probes, step{label: label, query: query, args: args})
+	}
+
+	// —— ① 投递关系：先按自有的 findingID 精确清，再按 snapshot_id 清孤儿 ——
+	if fixture.findingID > 0 {
+		add("finding_traffic_bindings", `finding_id=?`, fixture.findingID)
+	}
+	if len(tasks) > 0 {
+		// 自有 findingID 之外，压缩可能为同一任务的其他 finding 建过绑定：顺着**自有
+		// 任务 id** 的子查询收口，父行子查询里的 IN 列表只含正数 id。
+		args := archiveFixtureIDArgs(tasks)
+		add("finding_traffic_bindings", `finding_id IN (SELECT id FROM findings WHERE task_id IN (`+
+			inPlaceholders(len(tasks))+`))`, args...)
+	}
+	if fixture.snapshotID != "" {
+		add("finding_traffic_bindings", `snapshot_id=?`, fixture.snapshotID)
+		add("traffic_evidence_snapshots", `id=?`, fixture.snapshotID)
+	}
+	if fixture.sessionKey != "" {
+		add("side_question_requests", `session_key=?`, fixture.sessionKey)
+	}
+	addIn("side_question_sessions", "task_id", tasks)
+	addTextIn("llm_records", "task_id", tasks)
+	// —— ② 用量表：task 维度与 exploration 维度**各自独立**成句（旧实现把它们 OR 在
+	// 一条 SQL 里，于是一边有效就连带把另一边的 0 也发了出去）——
+	addTextIn("llm_usage", "task_id", tasks)
+	addIn("llm_usage", "exploration_id", exps)
+	addIn("skill_usage", "task_id", tasks)
+	addIn("skill_usage", "exploration_id", exps)
+	addIn("tool_usage", "task_id", tasks)
+	addIn("tool_usage", "exploration_id", exps)
+	addIn("task_archives", "task_id", tasks)
+	addIn("findings", "task_id", tasks)
+	addIn("task_asset_links", "task_id", tasks)
+	addIn("task_llm_profiles", "task_id", tasks)
+	addIn("task_scope", "task_id", tasks)
+	addIn("task_relations", "task_id", tasks)
+	addIn("task_relations", "source_task_id", tasks)
+	addIn("activity", "exploration_id", exps)
+	addIn("task_constraints", "exploration_id", exps)
+	// —— ③ 锚点是无外键的关系表：按自有 nodeID / 自有 exploration 的节点 / 自有 asset
+	// 三条**互不 OR** 的谓词分别回收，每条都各自带回读 ——
+	addIn("exploration_anchors", "node_id", nodes)
+	addNodeSubquery("exploration_anchors", "node_id", "exploration_id", exps)
+	addIn("exploration_anchors", "asset_id", assets)
+	addIn("exploration_edges", "exploration_id", exps)
+	addIn("exploration_nodes", "exploration_id", exps)
+	addIn("assets", "id", assets)
+
+	for _, statement := range deletes {
 		if _, err := d.Exec(statement.query, statement.args...); err != nil {
-			t.Logf("archive fixture cleanup %q: %v", statement.query, err)
+			t.Errorf("archive fixture cleanup %s: %v", statement.label, err)
 		}
 	}
-	if err := d.DeleteTask(taskID); err != nil {
-		t.Logf("delete task: %v", err)
+
+	// 任务根行走产品自己的级联入口（DeleteTask 比裸 DELETE 多清一批下游表）。
+	// 集合来自 archiveFixtureValidIDs：只有**正数自有** id 才会进来，准备阶段还没建出来
+	// 的那一侧根本不会出现在这里（复审 RR-I01 A 的零值污染）。
+	for _, id := range tasks {
+		if err := d.DeleteTask(id); err != nil {
+			t.Errorf("delete task %d: %v", id, err)
+		}
 	}
-	if err := d.DeleteTask(sourceID); err != nil {
-		t.Logf("delete source task: %v", err)
+	if fixture.profileID > 0 {
+		if err := d.DeleteProfile(fixture.profileID); err != nil {
+			t.Errorf("delete profile %d: %v", fixture.profileID, err)
+		}
 	}
-	if err := d.DeleteProfile(fixture.profileID); err != nil {
-		t.Logf("delete profile: %v", err)
+
+	// —— 终态回读：本夹具拿到的每一个物理 id 都必须彻底归零（复审 RR-I01）——
+	// deletes 里每一条都已经自动配了同谓词回读，这里只补父根。
+	addInProbe := func(label, column string, ids []int64) {
+		if len(ids) == 0 {
+			return
+		}
+		addProbe(label, `SELECT count(*) FROM tasks WHERE `+column+` IN (`+inPlaceholders(len(ids))+`)`,
+			archiveFixtureIDArgs(ids)...)
 	}
+	addInProbe("tasks(id)", "id", tasks)
+	// 探索根表按**自己的主键**回读。这里绝不能沿用"下游表按 exploration_id"的写法：
+	// explorations 表没有 exploration_id 这一列，写错只会在真库上炸成 Unknown column，
+	// 而这条回读恰恰是"探索根到底还在不在"的唯一证据。
+	if len(exps) > 0 {
+		addProbe("explorations(id)", `SELECT count(*) FROM explorations WHERE id IN (`+
+			inPlaceholders(len(exps))+`)`, archiveFixtureIDArgs(exps)...)
+	}
+	if fixture.findingID > 0 {
+		addProbe("finding_traffic_bindings(finding_id)",
+			`SELECT count(*) FROM finding_traffic_bindings WHERE finding_id=?`, fixture.findingID)
+	}
+	if fixture.snapshotID != "" {
+		addProbe("traffic_evidence_snapshots(id)",
+			`SELECT count(*) FROM traffic_evidence_snapshots WHERE id=?`, fixture.snapshotID)
+	}
+	if fixture.sessionKey != "" {
+		addProbe("side_question_requests(session_key)",
+			`SELECT count(*) FROM side_question_requests WHERE session_key=?`, fixture.sessionKey)
+	}
+	if fixture.profileID > 0 {
+		addProbe("llm_profiles(id)", `SELECT count(*) FROM llm_profiles WHERE id=?`, fixture.profileID)
+	}
+
+	for _, probe := range probes {
+		mustAssertOwnedGone(t, d, "归档夹具 "+probe.label, probe.query, probe.args...)
+	}
+}
+
+// requireNoQueuedArchiveJobs 在测试**开始**时核验归档队列里没有排队记录
+// （复审 RR-I03）。
+//
+// 归档 worker 是全局单队列 FIFO（archive_queued / restore_queued / delete_queued 混排），
+// 测试夹具一旦在脏队列上跑"领取"，无论怎么检查都已经晚了。这里只接受两种结局：
+// 队列干净 ⇒ 继续；否则诚实 SKIP 并写清楚原因，绝不盲目领全局队首。
+func requireNoQueuedArchiveJobs(t *testing.T, d *DB) {
+	t.Helper()
+	var queued int
+	if err := d.QueryRow(`SELECT count(*) FROM task_archives
+WHERE state IN ('archive_queued','restore_queued','delete_queued')`).Scan(&queued); err != nil {
+		t.Fatalf("统计归档排队记录失败: %v", err)
+	}
+	if queued > 0 {
+		t.Skipf("共享库归档队列里已有 %d 条别人的排队记录：全局领取会先改写它们的 state/phase/progress，"+
+			"本夹具 cleanup 并不拥有那些记录，撤不回。请等外部 worker 清空队列，或在独占干净库上运行（RR-I03）", queued)
+	}
+}
+
+// claimOwnArchiveJob 只领取**本夹具自己**那条排队记录（复审 RR-I03）。
+//
+// 为什么不能再直接用全局 ClaimTaskArchiveJob：它按 requested_at,id 取全表队首，
+// **先**把队首 UPDATE 成 archiving/restoring/deleting 并 commit，调用方**之后**才可能
+// 看见 claimed.ID != 自己的 id。共享库里只要有一条别人的记录排在前面，那次调用就已经
+// 改掉别人任务的状态、进度与 error，"检查"永远追不上"写入"。
+//
+// 本函数把判定与推进放进同一个事务，保持与生产完全相同的状态推进 SQL：
+//  1. 与生产一模一样的队首 `SELECT … FOR UPDATE`；
+//  2. 队首不是本夹具的 id、或状态不是预期的排队态 ⇒ **不发任何 UPDATE**，直接回滚并
+//     t.Skipf（对别人一个字节都不改，也不做"回滚别人原状态"这种伪补偿）；
+//  3. 队首正是本夹具记录 ⇒ 在同一事务里执行生产同一条推进语句并提交。
+//
+// "读到队首是自己"与"改写队首"之间因此不存在任何窗口。
+func claimOwnArchiveJob(t *testing.T, ctx context.Context, d *DB, wantID int64, wantQueued, wantActive string) *TaskArchive {
+	t.Helper()
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("archive claim begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
+	var id int64
+	var queuedState string
+	err = tx.QueryRowContext(ctx, `SELECT id,state FROM task_archives
+WHERE state IN ('archive_queued','restore_queued','delete_queued')
+ORDER BY requested_at,id LIMIT 1 FOR UPDATE`).Scan(&id, &queuedState)
+	if errors.Is(err, sql.ErrNoRows) {
+		_ = tx.Rollback()
+		t.Skipf("归档队列此刻为空，而本夹具刚排队的 id=%d 也不在里面：有外部 worker 正在消费同一个队列，"+
+			"本用例不与它竞争，诚实跳过（RR-I03）", wantID)
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("archive claim peek head: %v", err)
+	}
+	if id != wantID || queuedState != wantQueued {
+		_ = tx.Rollback()
+		t.Skipf("归档队首是 id=%d(state=%s)，不是本夹具的 id=%d(state=%s)：全局 FIFO 领取会先把这条**别人的**记录"+
+			"UPDATE 成活跃态并 commit，之后才让调用方看见 id 不符。本函数一条 UPDATE 都不发，直接跳过（RR-I03）",
+			id, queuedState, wantID, wantQueued)
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE task_archives
+SET state=?,phase='starting',progress=1,error='' WHERE id=?`, wantActive, id); err != nil {
+		t.Fatalf("archive claim advance: %v", err)
+	}
+	item, err := scanTaskArchive(tx.QueryRowContext(ctx, `SELECT `+taskArchiveCols+` FROM task_archives WHERE id=?`, id))
+	if err != nil {
+		t.Fatalf("archive claim rescan: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("archive claim commit: %v", err)
+	}
+	return item
 }
 
 // archiveAndCompactFixture 暂停任务、排队归档、领取任务并导出冷包，最后完成热库压缩。
@@ -1211,9 +1502,9 @@ func archiveAndCompactFixture(t *testing.T, fixture *archiveSevenTableFixture) (
 	if err != nil {
 		t.Fatalf("queue archive: %v", err)
 	}
-	claimed, err := d.ClaimTaskArchiveJob(t.Context())
-	if err != nil || claimed == nil || claimed.ID != archive.ID || claimed.State != Archiving {
-		t.Fatalf("archive claim = %+v, %v", claimed, err)
+	// 只领取自己那条记录：队首不是它就跳过，绝不改写别人的排队任务（复审 RR-I03）。
+	if claimed := claimOwnArchiveJob(t, t.Context(), d, archive.ID, ArchiveQueued, Archiving); claimed.State != Archiving {
+		t.Fatalf("archive claim state = %q, want %q", claimed.State, Archiving)
 	}
 	snapshot, err := d.SnapshotTaskArchive(fixture.task.ID)
 	if err != nil {
@@ -1231,9 +1522,9 @@ func restoreArchiveFixture(t *testing.T, fixture *archiveSevenTableFixture, arch
 	if _, err := fixture.d.QueueTaskArchiveRestore(archiveID); err != nil {
 		t.Fatalf("queue restore: %v", err)
 	}
-	claimed, err := fixture.d.ClaimTaskArchiveJob(t.Context())
-	if err != nil || claimed == nil || claimed.ID != archiveID || claimed.State != Restoring {
-		t.Fatalf("restore claim = %+v, %v", claimed, err)
+	// 同样只领取自己那条记录（复审 RR-I03）。
+	if claimed := claimOwnArchiveJob(t, t.Context(), fixture.d, archiveID, RestoreQueued, Restoring); claimed.State != Restoring {
+		t.Fatalf("restore claim state = %q, want %q", claimed.State, Restoring)
 	}
 	warnings, err := fixture.d.RestoreTaskArchive(archiveID, snapshot, 600)
 	if err != nil {

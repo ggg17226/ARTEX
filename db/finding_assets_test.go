@@ -9,29 +9,33 @@ import (
 // cleanupTreeFixtures 删除一个用例造出来的资产与发现。必须用 defer 注册(而不是
 // t.Cleanup):t.Cleanup 跑在测试函数返回之后,那时 defer d.Close() 已经把连接关了,
 // 清理会静默失败并把脏数据留在共享开发库里。
-func cleanupTreeFixtures(d *DB, taskID int64, rootDomains ...string) {
-	d.Exec(`DELETE FROM assets WHERE root_domain = ANY($1::text[])`, rootDomains) //nolint:errcheck
-	d.DeleteFindingsByTask(taskID)                                                //nolint:errcheck
+func cleanupTreeFixtures(t *testing.T, d *DB, taskID int64, rootDomains ...string) {
+	if len(rootDomains) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(rootDomains)), ",")
+		args := make([]any, 0, len(rootDomains))
+		for _, root := range rootDomains {
+			args = append(args, root)
+		}
+		// TiDB 基线不建外键：先断开这些资产的 link/anchor/finding_assets 引用，再删本体。
+		deleteAssetsByWhere(t, d, "WHERE root_domain IN ("+placeholders+")", args...)
+	}
+	d.DeleteFindingsByTask(taskID) //nolint:errcheck
 }
 
 // seedTreeAsset inserts one asset row.
+//
+// TiDB 方言：占位符 `?`、没有 RETURNING（自增 id 由 LastInsertId 取回）。另外 assets
+// 的 company_source / task_ids / bound_domains / open_ports / record_value /
+// technologies / auth / params / extra 都是 NOT NULL 且 TEXT 无 DDL 默认值，strict
+// 模式下必须逐列显式给值 —— 这套默认由同包的 assetRawInsert 统一铺好，用例传进来的
+// 同名列覆盖默认。
 func seedTreeAsset(t *testing.T, d *DB, kind string, cols map[string]any) int64 {
 	t.Helper()
-	names := []string{"type"}
-	values := []any{kind}
-	placeholders := []string{"$1"}
+	values := map[string]any{"type": kind}
 	for k, v := range cols {
-		values = append(values, v)
-		names = append(names, k)
-		placeholders = append(placeholders, "$"+strconv.Itoa(len(values)))
+		values[k] = v
 	}
-	q := "INSERT INTO assets(" + strings.Join(names, ",") + ") VALUES (" +
-		strings.Join(placeholders, ",") + ") RETURNING id"
-	var id int64
-	if err := d.QueryRow(q, values...).Scan(&id); err != nil {
-		t.Fatalf("seed %s asset: %v", kind, err)
-	}
-	return id
+	return assetRawInsert(t, d, values)
 }
 
 func nodeByKey(tree *FindingAssetTree, key string) *FindingAssetNode {
@@ -49,11 +53,7 @@ func nodeByKey(tree *FindingAssetTree, key string) *FindingAssetNode {
 // finding stay out, and a finding whose asset row is gone lands in the
 // unassigned bucket.
 func TestBuildFindingAssetTree(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	tk, err := d.CreateTask("资产树测试", "目标", nil, 0, 0)
 	if err != nil {
@@ -63,7 +63,7 @@ func TestBuildFindingAssetTree(t *testing.T) {
 
 	const root = "tree-test.example"
 	const sub = "api.tree-test.example"
-	defer cleanupTreeFixtures(d, tk.ID, root)
+	defer cleanupTreeFixtures(t, d, tk.ID, root)
 	rootID := seedTreeAsset(t, d, "root_domain", map[string]any{"domain": root, "root_domain": root})
 	subID := seedTreeAsset(t, d, "subdomain", map[string]any{"domain": sub, "root_domain": root})
 	svcID := seedTreeAsset(t, d, "service", map[string]any{
@@ -155,11 +155,7 @@ func TestBuildFindingAssetTree(t *testing.T) {
 // TestFindingAssetScopeFilter verifies选中一个节点 narrows the findings list to
 // that node's whole subtree, and that the unassigned sentinel works too.
 func TestFindingAssetScopeFilter(t *testing.T) {
-	d, err := Open(testDSN(t))
-	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
-	}
-	defer d.Close()
+	d := openTestDB(t)
 
 	tk, err := d.CreateTask("资产筛选测试", "目标", nil, 0, 0)
 	if err != nil {
@@ -170,7 +166,7 @@ func TestFindingAssetScopeFilter(t *testing.T) {
 	const root = "scope-test.example"
 	const sub = "api.scope-test.example"
 	const other = "other-scope-test.example"
-	defer cleanupTreeFixtures(d, tk.ID, root, other)
+	defer cleanupTreeFixtures(t, d, tk.ID, root, other)
 	rootID := seedTreeAsset(t, d, "root_domain", map[string]any{"domain": root, "root_domain": root})
 	subID := seedTreeAsset(t, d, "subdomain", map[string]any{"domain": sub, "root_domain": root})
 	otherID := seedTreeAsset(t, d, "root_domain", map[string]any{"domain": other, "root_domain": other})
