@@ -15,13 +15,26 @@ package db
 //     lockorder.TxRunner.Run(TxRunnerOptions{RequiresBusinessGate: true})：
 //     本地业务门禁 → 连接池准入 → BeginTx → DB 侧 `locks('business_relations')`
 //     FOR UPDATE → 业务载荷 → 单次 Commit，失败整体回滚 + 指数退避整体重放。
-//     锚点在全序中的位置（严格升序，不得调换）：
+//     锚点在全序中的位置（Gate 之后的实际取锁顺序，实测如此）：
 //
 //     Business Gate（本地 + locks 行）
 //       → maintenance 专属锚点 row（本 seed 的 leaf 级互斥，仅本写者持有）
 //       → settings 幂等 flag 行（row_id 物理 PK）
 //       → agents 行（id 物理 PK）
 //       → agent_prompts 追加（父行已在上面持锁，父先子后）
+//
+//     注意最后一段与 lockorder.TableOrder 的**数值序**是相反的（maintenance=32 <
+//     settings=42，但 agents=2）：这是刻意的，不是笔误（R33 合并前审查 Minor-2）。
+//     之所以不成环：
+//       - 本 seed 是一次性启动写者，整个载荷在 Business Gate 内，Gate 先于任何实体锁；
+//         其余写者要么持同一把 Gate（互斥），要么根本不碰 agents / settings /
+//         maintenance 这三张表的行；
+//       - 要严格升序就只能"先锁 agents 再读 flag"，那会在 flag 已置位的快路径上无故
+//         锁一行 agents（启动期热路径），并让"已 seed 过"的判定依赖一次多余的实体锁；
+//       - 全仓没有"先锁 agents → 再锁 settings / maintenance"的反向写者，
+//         因此 32 ↔ 42 ↔ 2 之间不存在环。
+//     若将来真的出现这样的反向路径，正确的修法是重排本 seed 的顺序（agents → settings
+//     → maintenance），而不是给 Gate 开例外。
 //
 //     Gate 先于任何实体锁是 §3.2.2 的硬要求；专属锚点在 Gate **之后**，所以它
 //     只用于把「同一 seed 的两次尝试」在 DB 层再串行一次（并覆盖 Runner 重放之间

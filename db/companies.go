@@ -222,51 +222,58 @@ func (s *CompanyStore) CreateCompanyWithScope(name, logo string, inputs []ScopeI
 	if err := validateParsedScopeBounds(rules); err != nil {
 		return 0, 0, 0, invalid, validationErrors, err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, 0, 0, invalid, validationErrors, err
-	}
-	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 只返回 ErrTxDone
-	if err := lockCompanyScopeMutation(tx); err != nil {
-		return 0, 0, 0, invalid, validationErrors, err
-	}
+	// 写者协议：企业创建同样是 company_scope 写者（插入初始范围 + 归属重算），
+	// 与任务绑定资产写入必须在同一把全局 Business Gate 上互斥，理由与
+	// AddScopeInputsChecked / UpdateScopeInputsChecked 完全相同（R33 P1-C）。
+	err = s.db.runTaskWriteTx(func(ctx context.Context, tx *sql.Tx) error {
+		if err := lockCompanyScopeMutation(tx); err != nil {
+			return err
+		}
 
-	nkey := companyNKey(name)
-	identity, hash := canonicalIdentityPair(schema.NKeyIdentity(nkey))
-	var logoVal any
-	if logo != "" {
-		logoVal = logo
-	}
-	// 旧实现是 ON CONFLICT (nkey) DO NOTHING RETURNING id + ErrNoRows 判定重名；
-	// TiDB 没有该写法，重名改由 uq_companies_nkey_hash 上的 1062 表达（M09 / M14 同一口径）。
-	res, err := tx.Exec(`
+		nkey := companyNKey(name)
+		identity, hash := canonicalIdentityPair(schema.NKeyIdentity(nkey))
+		var logoVal any
+		if logo != "" {
+			logoVal = logo
+		}
+		// 旧实现是 ON CONFLICT (nkey) DO NOTHING RETURNING id + ErrNoRows 判定重名；
+		// TiDB 没有该写法，重名改由 uq_companies_nkey_hash 上的 1062 表达（M09 / M14 同一口径）。
+		res, err := tx.Exec(`
 INSERT INTO companies(name, nkey, nkey_identity, nkey_hash, logo)
 VALUES (?, ?, ?, ?, ?)`, name, nkey, identity, hash, logoVal)
-	if err != nil {
-		if tidb.IsDuplicateKey(err) {
-			return 0, 0, 0, invalid, validationErrors, ErrCompanyNameConflict
-		}
-		return 0, 0, 0, invalid, validationErrors, err
-	}
-	if id, err = res.LastInsertId(); err != nil {
-		return 0, 0, 0, invalid, validationErrors, fmt.Errorf("companies: LastInsertId after INSERT: %w", err)
-	}
-	if id < 1 {
-		return 0, 0, 0, invalid, validationErrors, fmt.Errorf("companies: inserted pk %d out of range", id)
-	}
-
-	added, skipped, needsAttribution, err := insertScopeRulesTx(tx, id, rules, reason)
-	if err != nil {
-		return 0, 0, 0, invalid, validationErrors, err
-	}
-	if needsAttribution {
-		warning, err := recomputeAttributionTx(tx)
 		if err != nil {
-			return 0, 0, 0, invalid, validationErrors, err
+			if tidb.IsDuplicateKey(err) {
+				return ErrCompanyNameConflict
+			}
+			return err
 		}
-		logAttributionWarning(warning)
-	}
-	if err := tx.Commit(); err != nil {
+		if id, err = res.LastInsertId(); err != nil {
+			return fmt.Errorf("companies: LastInsertId after INSERT: %w", err)
+		}
+		if id < 1 {
+			return fmt.Errorf("companies: inserted pk %d out of range", id)
+		}
+
+		var (
+			addedN, skippedN int
+			needsAttribution bool
+			insertErr        error
+		)
+		addedN, skippedN, needsAttribution, insertErr = insertScopeRulesTx(tx, id, rules, reason)
+		if insertErr != nil {
+			return insertErr
+		}
+		added, skipped = addedN, skippedN
+		if needsAttribution {
+			warning, err := recomputeAttributionTx(tx)
+			if err != nil {
+				return err
+			}
+			logAttributionWarning(warning)
+		}
+		return nil
+	})
+	if err != nil {
 		return 0, 0, 0, invalid, validationErrors, err
 	}
 	return id, added, skipped, invalid, validationErrors, nil
@@ -341,52 +348,65 @@ func (s *CompanyStore) DeleteCompany(id int64) error {
 //	                删除 company_scope / task_scope，删除 companies 根行，
 //	                最后 AssertNoOrphansForCompany 断言零悬挂引用
 //	Re-attribution → 其余企业的范围规则可以接管刚刚失去归属的资产
+//
+// 写者协议（R33 合并前审查 Important-1 / P1-C 根治）：本函数必须持**全局 Business Gate**，
+// 而不只是 companies 屏障。两条独立理由，缺一条都还是 bug：
+//
+//  1. 锁序环。级联执行器在同一事务里 UPDATE tasks（TableOrder 1），而所有任务写者
+//     （CreateTask / runTaskChildWriter / RegisterTaskAssetScopes）的顺序都是
+//     「Gate → tasks 行锁 → companies 屏障 → assets」。只取 companies 屏障时，
+//     本函数与「持 tasks 等 companies」的一方构成 tasks ↔ companies 环（实测 1213）。
+//     Gate 是全局排他且**先于任何实体锁**获取（tx_runner 第 1 步 vs 第 3 步 BeginTx），
+//     因此它一旦覆盖本函数，环在结构上就不存在了。
+//  2. 归档恢复的 company 存活核验。恢复事务持 Gate，但只对 companies 做**快照读**
+//     （rowExists，见 task_archives_restore.go）。它看不到本函数在“读到企业还在”与
+//     “写回 tasks.company_id”之间提交的删除；TiDB 没有外键，这一窗口会写回悬空的
+//     company_id。本函数持 Gate 后，恢复事务的整个窗口被 Gate 排除，快照必是新鲜的；
+//     反之若给恢复侧加 companies 行锁，就会在“持 tasks 行锁后取 companies”方向制造
+//     上面那个环 —— 所以正确的修法是这里持 Gate，而不是恢复侧加锁。
 func (s *CompanyStore) DeleteCompanyWithAssets(id int64, deleteAssets bool) (assetsDeleted int64, err error) {
 	if id <= 0 {
 		return 0, ErrCompanyNotFound
 	}
-	ctx := context.Background()
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 只返回 ErrTxDone
-	if err := lockCompanyScopeMutation(tx); err != nil {
-		return 0, err
-	}
-	closure, err := ComputeCompanyClosure(ctx, tx, uint64(id))
-	if err != nil {
-		if errors.Is(err, ErrForeignKeyViolation) {
-			return 0, ErrCompanyNotFound
+	err = s.db.runTaskWriteTx(func(ctx context.Context, tx *sql.Tx) error {
+		if err := lockCompanyScopeMutation(tx); err != nil {
+			return err
 		}
-		return 0, err
-	}
-	if deleteAssets {
-		// TiDB 基线不建外键：裸 `DELETE FROM assets WHERE company_id = ?` 会把
-		// task_asset_links / exploration_anchors / finding_assets 里指向这些资产的行
-		// 留在库里成为悬空引用（对应任务的 DeleteTask 会因此永久判定成员漂移）。
-		// 这里复用资产侧唯一实现：同一事务内「锁候选 → 清引用 → 按 PK 删本体」。
-		assetsDeleted, err = deleteAssetsByCompanyIDTx(ctx, tx, id)
+		closure, err := ComputeCompanyClosure(ctx, tx, uint64(id))
 		if err != nil {
-			return 0, err
+			if errors.Is(err, ErrForeignKeyViolation) {
+				return ErrCompanyNotFound
+			}
+			return err
 		}
-	}
-	audit, err := ExecuteCompanyCascade(ctx, tx, closure)
+		if deleteAssets {
+			// TiDB 基线不建外键：裸 `DELETE FROM assets WHERE company_id = ?` 会把
+			// task_asset_links / exploration_anchors / finding_assets 里指向这些资产的行
+			// 留在库里成为悬空引用（对应任务的 DeleteTask 会因此永久判定成员漂移）。
+			// 这里复用资产侧唯一实现：同一事务内「锁候选 → 清引用 → 按 PK 删本体」。
+			assetsDeleted, err = deleteAssetsByCompanyIDTx(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+		}
+		audit, err := ExecuteCompanyCascade(ctx, tx, closure)
+		if err != nil {
+			return err
+		}
+		if audit.EntitiesDeleted["companies"] == 0 {
+			// 闭包之后、删除之前企业被并发清理：按既有契约报"不存在"，绝不返回静默成功。
+			return ErrCompanyNotFound
+		}
+		// This path has no per-request warning channel, so the log is the only place
+		// the operator can learn about unparseable ip rows here.
+		warning, err := recomputeAttributionTx(tx)
+		if err != nil {
+			return err
+		}
+		logAttributionWarning(warning)
+		return nil
+	})
 	if err != nil {
-		return 0, err
-	}
-	if audit.EntitiesDeleted["companies"] == 0 {
-		// 闭包之后、删除之前企业被并发清理：按既有契约报"不存在"，绝不返回静默成功。
-		return 0, ErrCompanyNotFound
-	}
-	// This path has no per-request warning channel, so the log is the only place
-	// the operator can learn about unparseable ip rows here.
-	warning, err := recomputeAttributionTx(tx)
-	if err != nil {
-		return 0, err
-	}
-	logAttributionWarning(warning)
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return assetsDeleted, nil
@@ -486,42 +506,51 @@ func (s *CompanyStore) AddScopeInputsChecked(companyID int64, inputs []ScopeInpu
 	if err := ValidateCompanyScopeInputBounds(inputs); err != nil {
 		return 0, 0, 0, nil, err
 	}
-	rules, invalid, errors := parseScopeInputs(inputs)
+	rules, invalid, validationErrors := parseScopeInputs(inputs)
 	if err := validateParsedScopeBounds(rules); err != nil {
-		return 0, 0, invalid, errors, err
+		return 0, 0, invalid, validationErrors, err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, 0, invalid, errors, err
-	}
-	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 只返回 ErrTxDone
-	if err := lockCompanyScopeMutation(tx); err != nil {
-		return 0, 0, invalid, errors, err
-	}
-	if err := ensureCompanyExistsTx(tx, companyID); err != nil {
-		return 0, 0, invalid, errors, err
-	}
-	if len(rules) == 0 {
-		if err := tx.Commit(); err != nil {
-			return 0, 0, invalid, errors, err
+	// 写者协议：范围写者必须持**全局 Business Gate**（R33 合并前审查 P1-C 的根治）。
+	//
+	// 任务绑定的资产写入（runTaskBoundUpsert 的 taskID>0 分支）持 Gate，但**不持**
+	// companies 屏障：它在 Gate 内做「读 company_scope 解析归属 → 写 assets.company_id」。
+	// 范围写者若不持 Gate，就能在"解析"与"落库"之间提交，让资产按已经作废的旧范围落库，
+	// 而本侧的 recomputeAttribution 早已跑完，这条旧归属再没有人纠正。
+	// Gate 覆盖后两类写者互斥；companies 屏障继续保留，用于与**不持 Gate** 的裸资产写者
+	// （withCompanyScopeMutation）串行化，两者一起构成完整的写者屏障。
+	err = s.db.runTaskWriteTx(func(ctx context.Context, tx *sql.Tx) error {
+		if err := lockCompanyScopeMutation(tx); err != nil {
+			return err
 		}
-		return 0, 0, invalid, errors, nil
-	}
-	added, skipped, needsAttribution, err := insertScopeRulesTx(tx, companyID, rules, reason)
-	if err != nil {
-		return 0, 0, invalid, errors, err
-	}
-	if needsAttribution {
-		warning, err := recomputeAttributionTx(tx)
-		if err != nil {
-			return 0, 0, invalid, errors, fmt.Errorf("重新计算企业归属失败: %w", err)
+		if err := ensureCompanyExistsTx(tx, companyID); err != nil {
+			return err
 		}
-		logAttributionWarning(warning)
+		if len(rules) == 0 {
+			return nil
+		}
+		var (
+			addedN, skippedN int
+			needsAttribution bool
+			insertErr        error
+		)
+		addedN, skippedN, needsAttribution, insertErr = insertScopeRulesTx(tx, companyID, rules, reason)
+		if insertErr != nil {
+			return insertErr
+		}
+		added, skipped = addedN, skippedN
+		if needsAttribution {
+			warning, err := recomputeAttributionTx(tx)
+			if err != nil {
+				return fmt.Errorf("重新计算企业归属失败: %w", err)
+			}
+			logAttributionWarning(warning)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, invalid, validationErrors, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, 0, invalid, errors, err
-	}
-	return added, skipped, invalid, errors, nil
+	return added, skipped, invalid, validationErrors, nil
 }
 
 func parseScopeInputs(inputs []ScopeInput) (rules []ParsedScope, invalid int, validationErrors []string) {
@@ -615,7 +644,7 @@ func computeScopeInsertArgs(companyID int64, rule ParsedScope, reason string) (b
 
 	var (
 		identDomain, identNet, identVal []byte
-		hashDomain, hashNet, hashVal   []byte
+		hashDomain, hashNet, hashVal    []byte
 		valDomain, valNet, valVal       *string
 	)
 
@@ -712,20 +741,20 @@ type companyAttribution struct {
 // links are immutable under scope edits. Precedence is domain, IP/CIDR, then
 // normalized exact ICP; keyword rules never attribute assets.
 func (s *CompanyStore) RecomputeAttribution() error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 只返回 ErrTxDone
-	if err := lockCompanyScopeMutation(tx); err != nil {
-		return err
-	}
-	warning, err := recomputeAttributionTx(tx)
-	if err != nil {
-		return err
-	}
-	logAttributionWarning(warning)
-	return tx.Commit()
+	// 写者协议：全量重算会改写 assets.company_id，必须与任务绑定资产写入串行，
+	// 否则"重算扫过的资产集合"与"重算后又落库的资产"交错，新资产可能带着本次重算
+	// 已经作废的归属留在库里（R33 P1-C）。Gate + companies 屏障一起取。
+	return s.db.runTaskWriteTx(func(_ context.Context, tx *sql.Tx) error {
+		if err := lockCompanyScopeMutation(tx); err != nil {
+			return err
+		}
+		warning, err := recomputeAttributionTx(tx)
+		if err != nil {
+			return err
+		}
+		logAttributionWarning(warning)
+		return nil
+	})
 }
 
 // recomputeAttributionTx rebuilds scope-derived ownership. It returns a warning
@@ -1060,32 +1089,37 @@ func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeI
 	if err := validateParsedScopeBounds(rules); err != nil {
 		return 0, invalid, errs, err
 	}
-	tx, err := s.db.Begin()
+	// 写者协议：与 AddScopeInputsChecked 同源同因 —— 范围写者持全局 Business Gate，
+	// 才能在"任务绑定写入读范围解析归属"这件事上与任务写者互斥（R33 P1-C）。
+	err = s.db.runTaskWriteTx(func(ctx context.Context, tx *sql.Tx) error {
+		if err := lockCompanyScopeMutation(tx); err != nil {
+			return err
+		}
+		if err := ensureCompanyExistsTx(tx, companyID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM company_scope WHERE company_id = ?`, companyID); err != nil {
+			return err
+		}
+		var (
+			addedN  int
+			replErr error
+		)
+		addedN, _, _, replErr = insertScopeRulesTx(tx, companyID, rules, reason)
+		if replErr != nil {
+			return replErr
+		}
+		added = addedN
+		// Rebuild even for an empty replacement because removing the old rules may
+		// detach scope-derived assets or expose a lower-precedence company match.
+		warning, err := recomputeAttributionTx(tx)
+		if err != nil {
+			return fmt.Errorf("重新计算企业归属失败: %w", err)
+		}
+		logAttributionWarning(warning)
+		return nil
+	})
 	if err != nil {
-		return 0, invalid, errs, err
-	}
-	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 只返回 ErrTxDone
-	if err := lockCompanyScopeMutation(tx); err != nil {
-		return 0, invalid, errs, err
-	}
-	if err := ensureCompanyExistsTx(tx, companyID); err != nil {
-		return 0, invalid, errs, err
-	}
-	if _, err := tx.Exec(`DELETE FROM company_scope WHERE company_id = ?`, companyID); err != nil {
-		return 0, invalid, errs, err
-	}
-	added, _, _, err = insertScopeRulesTx(tx, companyID, rules, reason)
-	if err != nil {
-		return 0, invalid, errs, err
-	}
-	// Rebuild even for an empty replacement because removing the old rules may
-	// detach scope-derived assets or expose a lower-precedence company match.
-	warning, err := recomputeAttributionTx(tx)
-	if err != nil {
-		return 0, invalid, errs, fmt.Errorf("重新计算企业归属失败: %w", err)
-	}
-	logAttributionWarning(warning)
-	if err := tx.Commit(); err != nil {
 		return 0, invalid, errs, err
 	}
 	return added, invalid, errs, nil

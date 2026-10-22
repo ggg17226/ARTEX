@@ -1232,6 +1232,18 @@ func assetTaskIDsOf(taskID int64) []int64 {
 //   - s.tx == nil 且无 TaskID：走资产引擎自己的 1062/1205/1213 重试循环，并在每次尝试
 //     的事务内先取企业/范围写者屏障（withCompanyScopeMutation），归属解析改用当前读。
 //
+// 企业归属解析的屏障口径（R33 合并前审查 P1-C 的结论）：带 TaskID 的分支**不单独取**
+// companies 屏障，而是依赖它已经持有的 Business Gate。两边是互斥的同一组写者：
+//   - 任务写者（本函数、CreateTask、RegisterTaskAssetScopes）持 Gate，顺序恒为
+//     Gate → tasks 行锁 → assets；
+//   - 企业/范围写者（AddScopeInputsChecked / UpdateScopeInputsChecked /
+//     DeleteCompanyWithAssets）现在也持 Gate，再取 companies 屏障。
+//
+// 因此本事务内 company_scope 不可能被并发改写，归属解析的快照在本事务生命周期内始终有效。
+// 反过来，若在这里补 companies 屏障，就会形成「持 tasks 行锁等 companies」与
+// 「持 companies 屏障等 tasks 行锁」的环（1213）——所以正确做法是让范围写者持 Gate，
+// 而不是让资产写入再拿一把屏障。
+//
 // 归属 link 的双写不在这里做，而在 writeAsset 这个**唯一写入出口**里完成：嵌套副作用
 // （subdomain 顺带 upsert root_domain / IP 等）复用同一个 s.tx，同样会经过出口，
 // 因此"task_ids 记了、link 没跟上"的分支被结构性排除。
@@ -2393,12 +2405,19 @@ func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
 //
 // TiDB 8.5 不支持 JSON_TABLE，"移除单个元素" 与 "是否独占" 判定在 Go 内存里完成，
 // 并且整段跑在同一事务内（避免读改写窗口里的归属漂移）。
+//
+// 写者协议（R33 合并前审查 Important-2）：s.tx == nil 的独立入口必须走
+// runTaskWriteTx 持全局 Business Gate —— 与 attach/detach（新建 link）、任务删除、
+// 企业级联删除、归档恢复互斥。原来的裸 execInTx 只有事务边界、没有 Gate：
+// "快照分类 → 锁资产行 → 按 asset_id 清引用" 之间，持 Gate 的并发 attach 刚插进来的
+// link 会被这条清理按 asset_id 一并抹掉（资产随后被判独占删除），而 attach 侧已提交
+// 的 task_ids 位从此没有任何 link 支撑。持 Gate 后该类交错不可能发生。
 func (s *AssetStore) DeleteByTaskID(taskID int64) (int64, error) {
 	if s.tx != nil {
 		return s.deleteByTaskIDTx(s.tx, taskID)
 	}
 	var deleted int64
-	err := s.db.execInTx(func(tx *sql.Tx) error {
+	err := s.db.runTaskWriteTx(func(_ context.Context, tx *sql.Tx) error {
 		var err error
 		deleted, err = s.deleteByTaskIDTx(tx, taskID)
 		return err

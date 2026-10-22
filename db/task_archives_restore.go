@@ -1105,6 +1105,14 @@ WHERE archive.id=? FOR UPDATE`, archiveID).Scan(&taskID, &expID, &state); err !=
 		}
 	}
 	companyID, _ := jsonInt64(taskRow["company_id"])
+	// 企业存活核验用快照读是**刻意的**，与上面的分类核验（锁定读）不同：
+	// 企业侧的删除者 DeleteCompanyWithAssets 现在持全局 Business Gate（R33 审查
+	// Important-1），而本事务同样在 Gate 内（runArchiveRestoreTx 的
+	// RequiresBusinessGate），两者互斥 —— 本事务的快照不可能在"读到企业还在"与
+	// "写回 company_id"之间被一次删除插进来。
+	// 反过来说，这里**不要**改成 `SELECT ... FOR UPDATE`：本事务此刻已持任务行锁，
+	// 再去锁 companies 行，就与"持 companies 屏障 → UPDATE tasks"的级联删除构成
+	// tasks ↔ companies 环。用 Gate 而不是行锁，才是无环的那条路。
 	if companyID > 0 && !rowExists(tx, "companies", companyID) {
 		taskRow["company_id"] = nil
 		warnings = append(warnings, fmt.Sprintf("任务企业 %d 已删除，企业关联已跳过", companyID))
@@ -1672,6 +1680,9 @@ func restoreArchiveAssets(ctx context.Context, tx *sql.Tx, taskID int64, raw jso
 		if !ok || oldID <= 0 {
 			return nil, nil, errors.New("archived asset has invalid id")
 		}
+		// 与任务级恢复同一条口径：本事务持 Gate，企业删除者（DeleteCompanyWithAssets）
+		// 也持 Gate，因此这里的快照读不会与删除交错；改用 companies 行锁反而会与
+		// 级联删除的「companies 屏障 → assets」方向成环（R33 审查 Important-1）。
 		if companyID, ok := jsonInt64(rawAny(row["company_id"])); ok && companyID > 0 && !rowExists(tx, "companies", companyID) {
 			row["company_id"] = json.RawMessage("null")
 			row["company_source"] = json.RawMessage(`"explicit"`)

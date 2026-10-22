@@ -282,6 +282,12 @@ func (d *DB) DeleteNotificationChannel(ctx context.Context, id int64) error {
 		// 已持锁却删不到行：与"渠道不存在"同义（并发删除的赢家已先提交）。
 		return ErrNotificationChannelNotFound
 	}
+	// 按 channel_id 的**范围删除**（而非资产侧那种"按物理主键分批"）在这里是安全且
+	// 有意的（R33 审查 Minor-3）：上面那条渠道行锁已经把"插入新投递"的唯一入口
+	// （lockNotificationChannelsForInsert 的 FOR UPDATE 重验）挡在事务外 —— 没有并发
+	// 写者能在本事务持锁期间改出指向 id 的新投递行，因此不存在"漏删"的目录漂移。
+	// 反之若改成先查 id 再按 PK 删，就会退化成"快照列 id → 逐条删"，把已被锁排除的
+	// 竞态重新请回来。投递表没有别的删除入口能绕过这把锁。
 	if _, err := tx.ExecContext(ctx, `DELETE FROM notification_deliveries WHERE channel_id = ?`, id); err != nil {
 		return err
 	}
@@ -509,6 +515,18 @@ func (d *DB) fanOutPendingEvents(ctx context.Context, limit int, ownership fanOu
 		hookChannelIDs = append(hookChannelIDs, ch.ID)
 	}
 	notifyFanOutDeliveryHook("channels_read", hookChannelIDs)
+	// 锁序说明（R33 审查 Minor-1，刻意保留的偏差）：本事务先锁 notification_events
+	// (TableOrder 37)、后锁 notification_channels (35)，与全局升序相反的**字面**顺序。
+	// 之所以不成环：
+	//   - 反向路径只有"锁 channels 再锁 events"这一种；全仓没有这样的写者 ——
+	//     UpdateNotificationChannel / DeleteNotificationChannel 只碰 channels 与其
+	//     deliveries(36)；事件侧其余写点只有两条 INSERT 与一条标记 fanned_out 的
+	//     UPDATE，都不预锁渠道；
+	//   - 投递行的真正串行点是"插入前按渠道行锁重验"（lockNotificationChannelsForInsert），
+	//     渠道的**内容**快照读在前、加锁重验在后，两者之间的偏差由 35 行锁 + 存活复核闭合。
+	// 若要改成严格升序，就必须在领取事件前锁全部启用渠道；那会把"少数几条渠道"的
+	// 写锁窗口拉长到整个事件领取 + 匹配阶段，收益是零（无环），代价是渠道管理操作
+	// 被 fan-out 阻塞。因此保留字面偏差，用注释固化论证。
 	claimQuery := `SELECT id, kind, finding_id, snapshot FROM notification_events
 WHERE NOT fanned_out`
 	claimArgs := make([]any, 0, 2)
